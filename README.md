@@ -40,11 +40,17 @@ it isn't already present. (Best with a vision-capable model.)
 ## What Retrace adds over Codex
 
 - **Bring any provider.** `/model` → *Add custom model* connects OpenAI-, Anthropic-,
-  GLM-, Qwen-, DeepSeek-, Kimi-, MiniMax-, Grok-compatible endpoints. `/model add`
-  enables more models from your connected providers.
-- **Live capability probing.** `/model probe` detects each model's thinking format,
-  validated reasoning-effort levels, prompt-cache support, streaming shape, and real
-  context window — against the live endpoint, not a hardcoded table.
+  GLM-, Qwen-, DeepSeek-, Kimi-, MiniMax-, Grok-compatible endpoints.
+- **`"/model add"`** — enable more models from the providers you've already connected.
+  It **re-fetches each provider's current catalog first**, so any models the provider
+  has added since you connected show up too — then presents a multi-select with your
+  already-enabled models pre-checked. Check new ones to enable them (each is probed
+  live first); uncheck to disable. The picker spans **all** providers at once.
+- **`"/model probe"`** — re-run live capability detection for a model. Opens a picker
+  of every registered model; the one you pick is queried against its live endpoint to
+  detect its thinking format, validated reasoning-effort levels, prompt-cache support,
+  streaming shape, and real context window, then the catalog hot-reloads. Use it after
+  a provider upgrades a model or when a model's capabilities look wrong.
 - **Always-streaming.** Tokens and reasoning stream live; `/thinking show|hide`
   controls whether the reasoning block is displayed.
 - **Weak-model helper.** `/agent-check` re-checks each answer and auto-retries until
