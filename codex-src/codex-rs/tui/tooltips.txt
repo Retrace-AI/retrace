@@ -1,0 +1,31 @@
+Run /model, choose "Add custom model", and enter a provider URL and API key to add models.
+Use /model add to enable more models from your connected providers.
+Use /model probe to live-detect a model's thinking, effort levels, cache, and streaming.
+Switch models or reasoning effort any time with /model; your choice persists across sessions.
+Use /thinking show or /thinking hide to control whether the model's reasoning is displayed.
+Use /agent-check on for weaker models — Retrace re-checks each answer and retries until it's complete.
+Use /provider to connect, list, or remove API providers and their models.
+Add total-cached-tokens to your status line with /statusline to see prompt-cache savings.
+Press Shift+Tab to cycle modes; Ask and Readonly Research sandbox the workspace automatically.
+In Ask or Readonly Research mode, a needed write asks for approval and runs once you allow it.
+Use /compact when the conversation gets long to summarize history and free up context.
+Start a fresh idea with /new; the previous session stays in history.
+Use /permissions to control when Retrace asks for confirmation.
+Run /review to get a code review of your current changes.
+Use /skills to list available skills or ask Retrace to use one.
+Use /status to see the current model, approvals, and token usage.
+Use /statusline to configure which items appear in the status line.
+Use /fork to branch the current chat into a new thread.
+Use /side to start a side conversation in a temporary fork without polluting the main thread.
+Use /init to create an AGENTS.md with project-specific guidance.
+Use /mcp to list configured MCP tools.
+Use /personality to customize how Retrace communicates.
+Use /rename to rename your threads for easier thread resuming.
+You can run any shell command from Retrace using ! (e.g. !ls).
+Type / to open the command popup; Tab autocompletes slash commands.
+When the composer is empty, press Esc to step back and edit your last message; Enter confirms.
+Press Tab to queue a message when a task is running; otherwise it sends immediately (except !).
+[tui.keymap] in ~/.retrace/config.toml lets you rebind supported shortcuts.
+Paste an image with Ctrl+V to attach it to your next message.
+Use /copy or press Ctrl+O to copy the latest agent response as Markdown.
+Reasoning effort and model live in your status line — add model-with-reasoning via /statusline.

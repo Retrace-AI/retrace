@@ -1,0 +1,10 @@
+---
+source: tui/src/app/tests.rs
+expression: rendered
+---
+╭─────────────────────────────────────────────╮
+│ >_ retrace-tui (v<VERSION>)                 │
+│                                             │
+│ model:     gpt-5.4 xhigh   /model to change │
+│ directory: /tmp/project                     │
+╰─────────────────────────────────────────────╯

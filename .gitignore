@@ -11,9 +11,11 @@ target/
 dist/
 *.tar.gz
 
-# Local source checkout (built separately; see README "Build from source")
-codex-src/
 
 # OS / editor
 .DS_Store
 *.swp
+
+# Build cache inside the vendored fork source
+codex-src/**/target/
+codex-src/codex-rs/target/

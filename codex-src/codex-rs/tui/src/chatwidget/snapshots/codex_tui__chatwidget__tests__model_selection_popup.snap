@@ -1,0 +1,19 @@
+---
+source: tui/src/chatwidget/tests/popups_and_settings.rs
+expression: popup
+---
+  Select Model and Effort
+  /model add enables more models from your providers; /model probe re-detects
+
+  1. Add custom model   Connect a new provider: enter its URL and API key,
+                        then pick models
+  2. gpt-5.5 (default)  Frontier model for complex coding, research, and real-
+                        world work.
+  3. gpt-5.4            Strong model for everyday coding.
+  4. gpt-5.4-mini       Small, fast, and cost-efficient model for simpler
+                        coding tasks.
+  5. gpt-5.3-codex      Coding-optimized model.
+› 6. gpt-5.2 (current)  Optimized for professional work and long-running
+                        agents.
+
+  Press enter to confirm or esc to go back

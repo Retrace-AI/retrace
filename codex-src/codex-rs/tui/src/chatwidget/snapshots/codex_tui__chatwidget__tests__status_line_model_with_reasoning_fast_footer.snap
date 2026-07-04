@@ -1,0 +1,9 @@
+---
+source: tui/src/chatwidget/tests/status_and_layout.rs
+expression: normalized_backend_snapshot(terminal.backend())
+---
+"                                                                                "
+"                                                                                "
+"› Ask Retrace to do anything                                                    "
+"                                                                                "
+"  [Build] · gpt-5.4 xhigh fast · Context 0% used · /tmp/project                 "
