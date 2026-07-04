@@ -23,8 +23,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: codex-src/codex-rs
       - name: Build release binary
         working-directory: codex-src/codex-rs
+        # Realtime voice (libwebrtc/webrtc-sys) is intentionally NOT built:
+        # its bundled C++ fails against the runners' newer macOS SDK libc++.
+        # It lives behind the off-by-default `voice` feature.
         run: cargo build --release -p codex-cli --bin retrace
       - name: Assemble tarball
         run: |
