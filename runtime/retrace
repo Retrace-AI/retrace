@@ -9,6 +9,20 @@ if [[ -f "$RETRACE_HOME/env.zsh" ]]; then
   source "$RETRACE_HOME/env.zsh"
 fi
 
+# Product/company brand shown in the agent's base prompt. Asked once on first
+# run (default "Retrace"); the private/company build pre-writes this file so
+# employees are never prompted. Override any time with RETRACE_AGENT_NAME.
+RETRACE_NAME_FILE="$RETRACE_HOME/agent_name"
+if [[ -z "${RETRACE_AGENT_NAME:-}" ]]; then
+  if [[ ! -f "$RETRACE_NAME_FILE" && -t 0 ]]; then
+    print -n "Product/brand name for this agent [Retrace]: "
+    read -r _rn </dev/tty || _rn=""
+    [[ -z "$_rn" ]] && _rn="Retrace"
+    print -r -- "$_rn" > "$RETRACE_NAME_FILE"
+  fi
+  export RETRACE_AGENT_NAME="$(cat "$RETRACE_NAME_FILE" 2>/dev/null || echo Retrace)"
+fi
+
 RETRACE_PACKAGED_BIN="$RETRACE_HOME/pkg/node_modules/.bin/codex"
 RETRACE_PATCHED_BIN="$RETRACE_HOME/bin/retrace-bin"
 if [[ -z "${RETRACE_BIN:-}" ]]; then
