@@ -1,0 +1,13 @@
+# Retrace starter config. Copy to ~/.retrace/config.toml.
+# No secrets live here — provider keys are stored separately and added via
+# `retrace` -> /model -> "Add custom model".
+
+approval_policy = "on-request"
+sandbox_mode = "workspace-write"
+
+# The retrace launcher rewrites the provider base_url to the local proxy port
+# at startup, so you normally do not edit model_providers by hand.
+
+[tui]
+status_line = ["model-with-reasoning", "permissions", "context-remaining", "context-window-size", "total-input-tokens", "total-output-tokens", "total-cached-tokens", "task-progress"]
+status_line_use_colors = true

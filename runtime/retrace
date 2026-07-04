@@ -1,0 +1,92 @@
+#!/usr/bin/env zsh
+set -euo pipefail
+
+export FLYCTL_INSTALL="${FLYCTL_INSTALL:-$HOME/.fly}"
+export PATH="$FLYCTL_INSTALL/bin:$PATH"
+
+RETRACE_HOME="${RETRACE_HOME:-$HOME/.retrace}"
+if [[ -f "$RETRACE_HOME/env.zsh" ]]; then
+  source "$RETRACE_HOME/env.zsh"
+fi
+
+RETRACE_PACKAGED_BIN="$RETRACE_HOME/pkg/node_modules/.bin/codex"
+RETRACE_PATCHED_BIN="$RETRACE_HOME/bin/retrace-bin"
+if [[ -z "${RETRACE_BIN:-}" ]]; then
+  if [[ -x "$RETRACE_PATCHED_BIN" ]]; then
+    RETRACE_BIN="$RETRACE_PATCHED_BIN"
+  else
+    RETRACE_BIN="$RETRACE_PACKAGED_BIN"
+  fi
+fi
+RETRACE_PROXY="$RETRACE_HOME/responses-chat-proxy.mjs"
+RETRACE_READY_FILE="$(mktemp "${TMPDIR:-/tmp}/retrace-port.XXXXXX")"
+RETRACE_LOG="$RETRACE_HOME/proxy.log"
+RETRACE_SANDBOX="${RETRACE_SANDBOX:-danger-full-access}"
+RETRACE_MODEL="${RETRACE_MODEL:-}"
+RETRACE_ARGS=()
+RETRACE_SERPER_SEARCH="${RETRACE_SERPER_SEARCH:-0}"
+
+for arg in "$@"; do
+  if [[ "$arg" == "--search" ]]; then
+    RETRACE_SERPER_SEARCH=1
+    continue
+  fi
+  RETRACE_ARGS+=("$arg")
+done
+
+if [[ ! -x "$RETRACE_BIN" ]]; then
+  print -u2 "retrace: missing retrace binary at $RETRACE_BIN"
+  exit 1
+fi
+
+if [[ ! -f "$RETRACE_HOME/api_key" ]]; then
+  print -u2 "retrace: missing API key file at $RETRACE_HOME/api_key"
+  exit 1
+fi
+
+cleanup() {
+  local exit_status=$?
+  if [[ -n "${RETRACE_PROXY_PID:-}" ]]; then
+    kill "$RETRACE_PROXY_PID" >/dev/null 2>&1 || true
+  fi
+  rm -f "$RETRACE_READY_FILE"
+  exit "$exit_status"
+}
+trap cleanup EXIT INT TERM
+
+RETRACE_API_KEY_FILE="$RETRACE_HOME/api_key" \
+RETRACE_MODEL_CATALOG_JSON="$RETRACE_HOME/models.json" \
+RETRACE_REGISTRY_JSON="$RETRACE_HOME/registry.json" \
+RETRACE_READY_FILE="$RETRACE_READY_FILE" \
+RETRACE_PROXY_PORT=0 \
+RETRACE_SERPER_SEARCH="$RETRACE_SERPER_SEARCH" \
+node "$RETRACE_PROXY" >>"$RETRACE_LOG" 2>&1 &
+RETRACE_PROXY_PID=$!
+
+for _ in {1..100}; do
+  [[ -s "$RETRACE_READY_FILE" ]] && break
+  sleep 0.05
+done
+
+if [[ ! -s "$RETRACE_READY_FILE" ]]; then
+  print -u2 "retrace: proxy did not start; see $RETRACE_LOG"
+  exit 1
+fi
+
+RETRACE_PORT="$(tr -d '\n' < "$RETRACE_READY_FILE")"
+export CODEX_HOME="$RETRACE_HOME"
+export RETRACE_LOCAL_API_KEY="local-proxy"
+
+RETRACE_MODEL_ARGS=()
+if [[ -n "$RETRACE_MODEL" ]]; then
+  RETRACE_MODEL_ARGS=(--model "$RETRACE_MODEL")
+fi
+
+"$RETRACE_BIN" \
+  --sandbox "$RETRACE_SANDBOX" \
+  "${RETRACE_MODEL_ARGS[@]}" \
+  -c "mcp_servers.supabase.url=\"https://mcp.supabase.com/mcp\"" \
+  -c "mcp_servers.supabase.enabled=false" \
+  -c "model_catalog_json=\"$RETRACE_HOME/models.json\"" \
+  -c "model_providers.lumenatech.base_url=\"http://127.0.0.1:${RETRACE_PORT}/v1\"" \
+  "${RETRACE_ARGS[@]}"

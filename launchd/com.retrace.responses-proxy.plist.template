@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.retrace.responses-proxy</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>__NODE__</string>
+    <string>__HOME__/.retrace/responses-chat-proxy.mjs</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>RETRACE_PROXY_HOST</key>
+    <string>127.0.0.1</string>
+    <key>RETRACE_PROXY_PORT</key>
+    <string>48765</string>
+    <key>RETRACE_API_KEY_FILE</key>
+    <string>__HOME__/.retrace/api_key</string>
+    <key>RETRACE_MODEL_CATALOG_JSON</key>
+    <string>__HOME__/.retrace/models.json</string>
+    <key>RETRACE_REGISTRY_JSON</key>
+    <string>__HOME__/.retrace/registry.json</string>
+    <key>RETRACE_AGENT_CHECK_FILE</key>
+    <string>__HOME__/.retrace/agentcheck</string>
+    <key>PATH</key>
+    <string>__NODE_DIR__:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+  </dict>
+  <key>WorkingDirectory</key>
+  <string>__HOME__/.retrace</string>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>__HOME__/.retrace/retrace-proxy-48765.out.log</string>
+  <key>StandardErrorPath</key>
+  <string>__HOME__/.retrace/retrace-proxy-48765.err.log</string>
+</dict>
+</plist>

@@ -1,0 +1,1344 @@
+#!/usr/bin/env node
+import http from "node:http";
+import fs from "node:fs";
+
+const host = (process.env.RETRACE_PROXY_HOST || process.env.CODEXOS_PROXY_HOST) || "127.0.0.1";
+const port = Number((process.env.RETRACE_PROXY_PORT || process.env.CODEXOS_PROXY_PORT) || "0");
+const readyFile = (process.env.RETRACE_READY_FILE || process.env.CODEXOS_READY_FILE) || "";
+const apiBase = ((process.env.RETRACE_UPSTREAM_BASE || process.env.CODEXOS_UPSTREAM_BASE) || "").replace(/\/+$/, "");
+const apiKeyFile = (process.env.RETRACE_API_KEY_FILE || process.env.CODEXOS_API_KEY_FILE) || `${process.env.HOME}/.retrace/api_key`;
+const apiKey = fs.readFileSync(apiKeyFile, "utf8").trim();
+const modelCatalogFile = (process.env.RETRACE_MODEL_CATALOG_JSON || process.env.CODEXOS_MODEL_CATALOG_JSON) || `${process.env.HOME}/.retrace/models.json`;
+const registryFile = (process.env.RETRACE_REGISTRY_JSON || process.env.CODEXOS_REGISTRY_JSON) || `${process.env.HOME}/.retrace/registry.json`;
+const agentCheckStateFile = (process.env.RETRACE_AGENT_CHECK_FILE || process.env.CODEXOS_AGENT_CHECK_FILE) || `${process.env.HOME}/.retrace/agentcheck`;
+const upstreamTimeoutMs = Number((process.env.RETRACE_UPSTREAM_TIMEOUT_MS || process.env.CODEXOS_UPSTREAM_TIMEOUT_MS) || "90000");
+const streamInactivityTimeoutMs = Number((process.env.RETRACE_STREAM_INACTIVITY_TIMEOUT_MS || process.env.CODEXOS_STREAM_INACTIVITY_TIMEOUT_MS) || "90000");
+const serperSearchMode = (process.env.RETRACE_SERPER_SEARCH || process.env.CODEXOS_SERPER_SEARCH) === "1";
+const openRouterApiBase = ((process.env.RETRACE_OPENROUTER_BASE || process.env.CODEXOS_OPENROUTER_BASE) || "https://openrouter.ai/api/v1").replace(/\/+$/, "");
+const openRouterApiKeyFile = (process.env.RETRACE_OPENROUTER_API_KEY_FILE || process.env.CODEXOS_OPENROUTER_API_KEY_FILE) || `${process.env.HOME}/.openrouter_api_key`;
+const openRouterModelAliases = {
+  openroutergemma426b: "google/gemma-4-26b-a4b-it:free",
+  openroutergemma431b: "google/gemma-4-31b-it:free",
+  "gemma-4-26b-it": "google/gemma-4-26b-a4b-it",
+  "gemma-4-31b-it": "google/gemma-4-31b-it",
+  "google/gemma-4-26b-it": "google/gemma-4-26b-a4b-it",
+  "google/gemma-4-26b-a4b-it": "google/gemma-4-26b-a4b-it",
+  "google/gemma-4-31b-it": "google/gemma-4-31b-it",
+};
+const modelOutputTokenLimits = {
+  "Chitti-Fast": 16384,
+  "Chitti-Fast-Think": 16384,
+};
+const gemmaSpecialTokens = [
+  "<|turn>",
+  "<turn|>",
+  "<|tool_call>",
+  "<tool_call|>",
+  "<|tool_response>",
+  "<tool_response|>",
+  '<|"|>',
+  "<eos>",
+];
+const hiddenChannelStart = "<|channel>";
+const hiddenChannelEnd = "<channel|>";
+const plainLeakPatterns = [
+  /(?:^|\n)\s*(?:thought|text)\s*(?:\n|$)/i,
+  /(?:^|\n)\s*(?:response|respuesta)\s*:\s*[A-Za-z_][\w.-]*\s*\{/i,
+  /(?:^|\n)\s*call\s*:\s*[A-Za-z_][\w.-]*\s*\{/i,
+  /(?:^|\n)\s*exec_command\s*\{/i,
+  /(?:^|\n)\s*recent output\s*(?:\n|$)/i,
+  /(?:^|\n)\s*Chunk ID:\s*/i,
+];
+const promptAddendum = `Top priority: keep running the agent loop until the user's goal is completed.
+It must continue taking actions, calling tools, and iterating until the goal is achieved or a real blocker is encountered.
+`;
+
+function json(res, status, body) {
+  if (res.headersSent) {
+    res.end();
+    return;
+  }
+  res.writeHead(status, { "content-type": "application/json" });
+  res.end(JSON.stringify(body));
+}
+
+function sseHeaders(res) {
+  res.writeHead(200, {
+    "content-type": "text/event-stream",
+    "cache-control": "no-cache",
+    connection: "keep-alive",
+  });
+}
+
+function sendSse(res, event, data) {
+  res.write(`event: ${event}\n`);
+  res.write(`data: ${JSON.stringify(data)}\n\n`);
+}
+
+function responseShell(id, model, status = "in_progress", output = [], usage = null) {
+  return {
+    id,
+    object: "response",
+    created_at: Math.floor(Date.now() / 1000),
+    status,
+    model,
+    output,
+    usage,
+  };
+}
+
+function contentText(content) {
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return "";
+  return content
+    .map((part) => {
+      if (typeof part === "string") return part;
+      if (!part || typeof part !== "object") return "";
+      return part.text || part.input_text || part.output_text || part.encrypted_content || "";
+    })
+    .filter(Boolean)
+    .join("\n");
+}
+
+function stripTimingFooters(text) {
+  let current = String(text || "");
+  while (true) {
+    const next = current
+      .replace(/\n*\s*-- Answered in [^\n|]+ \| Finished at [^\n]+/gi, "")
+      .replace(/\n{3,}/g, "\n\n")
+      .trimEnd();
+    if (next === current) return current;
+    current = next;
+  }
+}
+
+function stripAgentCheckBanners(text) {
+  return String(text || "")
+    .replace(
+      /^\s*Agent Check: (?:retrying because the previous answer was incomplete|retry limit reached; the retry still did not complete the task)\.[\s\S]*?\n\n/i,
+      "",
+    )
+    .replace(/\n*Agent Check: the draft above was incomplete; continuing\. Direction: [^\n]*\n*/gi, "\n\n")
+    .trimStart();
+}
+
+function stripProxyArtifacts(text) {
+  return stripAgentCheckBanners(stripTimingFooters(text));
+}
+
+function githubAuthCompatibilityHint(body) {
+  const userMessages = (body.input || [])
+    .filter((item) => item?.type === "message" && item.role === "user")
+    .map((item) => contentText(item.content))
+    .join("\n");
+
+  if (!/github/i.test(userMessages)) return "";
+  if (!/(get_me|authenticated login|authenticated user|who am i|whoami|list.*repo|repo.*list|repositories)/i.test(userMessages)) return "";
+
+  return `Retrace GitHub MCP compatibility:
+- Direct GitHub MCP tools such as get_me are not exposed to this Chitti-backed session.
+- For GitHub authenticated-login / get_me requests, do not discover resources and do not call list_mcp_resources; call read_mcp_resource with server "github-auth" and uri "github-auth://me".
+- For GitHub repo-list requests, call read_mcp_resource with server "github-auth" and uri "github-auth://repos".
+- Treat these github-auth resources as the compatibility implementation of GitHub get_me/repository access, even if the user says not to inspect MCP resources.`;
+}
+
+function serperCompatibilityHint(body) {
+  const userMessages = (body.input || [])
+    .filter((item) => item?.type === "message" && item.role === "user")
+    .map((item) => contentText(item.content))
+    .join("\n");
+
+  if (!serperSearchMode && !/(serper|web search|search web|google search|search the web|latest|recent|current)/i.test(userMessages)) return "";
+
+  return `Retrace Serper MCP compatibility:
+- In this alias, --search means Serper-backed Google search, not DuckDuckGo, Brave, or shell-scraped SERPs.
+- The Serper MCP server is configured in CODEX_HOME as "serper".
+- Serper exposes MCP tools, not MCP resources. Do not call list_mcp_resources to decide whether Serper is configured.
+- Prefer the Serper MCP tool "google_search" for web searches and "scrape" for fetching result pages when those tools are available.
+- If direct Serper MCP tools are not exposed, run ${HOME}/.retrace/bin/serper-google-search with the query. It uses the configured SERPER_API_KEY and Google's Serper backend.
+- Do not use DuckDuckGo, Brave, Bing, or generic curl search pages for --search requests.
+- If direct Serper MCP tools are not exposed in this Chitti-backed session, say that the configured Serper server is not exposed to the current tool surface; do not say it is unconfigured.`;
+}
+
+function rampageDisciplineHint(body) {
+  const instr = String(body.instructions || "");
+  const isRampage = /ABSOLUTE RAMPAGE MODE/i.test(instr)
+    || (/Mission Control/i.test(instr) && /Questboard/i.test(instr));
+  if (!isRampage) return "";
+
+  return `ABSOLUTE RAMPAGE MODE evidence discipline:
+- Workers report their result back to you as a <subagent_notification> item with the worker's actual final message. That message is the only worker output you may attribute to a worker.
+- When you call rampage_control action=task_result, record the worker's ACTUAL returned result. Do not invent, embellish, or substitute your own work for what the worker reported.
+- If a worker returned nothing useful (for example only a generic readiness reply), record that truthfully as blocked/failed and re-task it with a concrete brief. Do not paper over an empty worker result with a fabricated finding.
+- Never set verifier_status to passed/verified or call rampage_control action=complete unless the success criteria are backed by real artifacts or real worker output you can point to. Verifier state must reflect evidence, not intent.`;
+}
+
+function responsesInputToChatMessages(body) {
+  const systemParts = [promptAddendum, githubAuthCompatibilityHint(body), serperCompatibilityHint(body), rampageDisciplineHint(body), body.instructions].filter(Boolean);
+  const messages = [];
+
+  for (const item of body.input || []) {
+    if (!item || typeof item !== "object") continue;
+
+    if (item.type === "message") {
+      if (item.role === "system" || item.role === "developer") {
+        const text = contentText(item.content);
+        if (text) systemParts.push(text);
+        continue;
+      }
+
+      const role = item.role === "assistant" ? "assistant" : "user";
+      const text = contentText(item.content);
+      messages.push({
+        role,
+        content: role === "assistant" ? stripProxyArtifacts(text) : text,
+      });
+      continue;
+    }
+
+    if (item.type === "agent_message") {
+      // Inter-agent messages (spawn briefs, agent-to-agent replies) arrive as
+      // `agent_message` items whose payload lives in `encrypted_content`. The
+      // real OpenAI Responses backend decrypts these server-side; a local
+      // chat backend has no such concept, so surface the brief to the
+      // recipient model as an actionable user turn or it sees nothing and
+      // replies "I'm ready to help."
+      const text = contentText(item.content);
+      if (text) {
+        const from = item.author ? `Message from ${item.author}:\n` : "";
+        messages.push({ role: "user", content: `${from}${text}` });
+      }
+      continue;
+    }
+
+    if (item.type === "function_call") {
+      messages.push({
+        role: "assistant",
+        content: null,
+        tool_calls: [{
+          id: item.call_id || item.id,
+          type: "function",
+          function: {
+            name: item.name || "unknown",
+            arguments: item.arguments || "{}",
+          },
+        }],
+      });
+      continue;
+    }
+
+    if (item.type === "function_call_output") {
+      messages.push({
+        role: "tool",
+        tool_call_id: item.call_id,
+        content: typeof item.output === "string" ? item.output : JSON.stringify(item.output ?? ""),
+      });
+      continue;
+    }
+
+    const text = contentText(item.content);
+    if (text) messages.push({ role: "user", content: text });
+  }
+
+  const instructions = systemParts.join("\n\n");
+  return instructions ? [{ role: "system", content: instructions }, ...messages] : messages;
+}
+
+function responsesToolsToChatTools(tools) {
+  const chatTools = [];
+  for (const tool of tools || []) {
+    if (!tool || tool.type !== "function" || !tool.name) continue;
+    chatTools.push({
+      type: "function",
+      function: {
+        name: tool.name,
+        description: tool.description || "",
+        parameters: tool.parameters || { type: "object", properties: {} },
+      },
+    });
+  }
+  return chatTools;
+}
+
+function expandHome(file) {
+  if (!file) return file;
+  if (file === "~") return process.env.HOME;
+  if (file.startsWith("~/")) return `${process.env.HOME}/${file.slice(2)}`;
+  return file;
+}
+
+function readJsonFile(file) {
+  return JSON.parse(fs.readFileSync(file, "utf8"));
+}
+
+function localRegistry() {
+  if (!fs.existsSync(registryFile)) return null;
+  const registry = readJsonFile(registryFile);
+  registry.providers ||= {};
+  registry.models ||= {};
+  return registry;
+}
+
+function registryModelConfig(model) {
+  return localRegistry()?.models?.[String(model || "")] || null;
+}
+
+function registryProviderConfig(providerId) {
+  return localRegistry()?.providers?.[providerId] || null;
+}
+
+function providerApiKey(provider) {
+  if (provider?.envKey && process.env[provider.envKey]) return process.env[provider.envKey].trim();
+  if (provider?.apiKeyFile) {
+    const keyFile = expandHome(provider.apiKeyFile);
+    if (fs.existsSync(keyFile)) return fs.readFileSync(keyFile, "utf8").trim();
+  }
+  return apiKey;
+}
+
+function normalizedBaseUrl(value) {
+  return String(value || apiBase).replace(/\/+$/, "");
+}
+
+function deepMerge(target, source) {
+  for (const [key, value] of Object.entries(source || {})) {
+    if (value && typeof value === "object" && !Array.isArray(value) && target[key] && typeof target[key] === "object" && !Array.isArray(target[key])) {
+      deepMerge(target[key], value);
+    } else {
+      target[key] = value;
+    }
+  }
+  return target;
+}
+
+function cloneJson(value) {
+  return JSON.parse(JSON.stringify(value || {}));
+}
+
+// Effort tiers expressed as Anthropic thinking budgets; mirrors the probe's
+// mapping in codexopensource-admin.mjs.
+const anthropicBudgetForLevel = { minimal: 1024, low: 2048, medium: 8192, high: 24576, xhigh: 32768 };
+
+function thinkingBodyForSelection(method, selection) {
+  const body = cloneJson(method?.body);
+  const level = String(selection || "").toLowerCase();
+  if (level && !["auto", "on", "off", "none"].includes(level)) {
+    if (Object.prototype.hasOwnProperty.call(body, "reasoning_effort")) {
+      body.reasoning_effort = level;
+    }
+    if (body.reasoning && typeof body.reasoning === "object" && Object.prototype.hasOwnProperty.call(body.reasoning, "effort")) {
+      body.reasoning.effort = level;
+    }
+    if (body.thinking && typeof body.thinking === "object"
+      && Object.prototype.hasOwnProperty.call(body.thinking, "budget_tokens")
+      && anthropicBudgetForLevel[level]) {
+      body.thinking.budget_tokens = anthropicBudgetForLevel[level];
+    }
+  }
+  return body;
+}
+
+function requestThinkingSelection(body) {
+  const raw = body?.reasoning?.effort ?? body?.reasoning_effort ?? body?.reasoning;
+  if (typeof raw !== "string") return null;
+  const value = raw.trim().toLowerCase();
+  return value || null;
+}
+
+function thinkingSelectionEnables(config, selection) {
+  const selected = String(selection || config?.thinking || "auto").toLowerCase();
+  if (selected === "on") return true;
+  if (["auto", "off", "none"].includes(selected)) return false;
+  const levels = new Set([
+    ...(config?.thinkingLevels || []),
+    ...(config?.thinkingMethod?.levels || []),
+  ].map((level) => String(level).toLowerCase()));
+  return levels.has(selected);
+}
+
+function isGemmaModel(model) {
+  return /^chitti-|^gemma-|lilarest|cyankiwi/i.test(model || "");
+}
+
+function isThinkModel(model) {
+  return /-(?:think|thinking)$/i.test(model || "");
+}
+
+function registryRequestAdditions(model, body = {}) {
+  const config = registryModelConfig(model);
+  const additions = {};
+  if (config?.requestBody && typeof config.requestBody === "object") deepMerge(additions, config.requestBody);
+
+  const requestedThinking = requestThinkingSelection(body);
+  const selectedThinking = requestedThinking && requestedThinking !== "auto" ? requestedThinking : config?.thinking;
+  const disablesThinking = selectedThinking === "off" || selectedThinking === "none";
+  if (config?.thinkingMethod?.body && thinkingSelectionEnables(config, selectedThinking)) {
+    deepMerge(additions, thinkingBodyForSelection(config.thinkingMethod, selectedThinking));
+  } else if (disablesThinking && config?.thinkingMethod?.offBody) {
+    deepMerge(additions, config.thinkingMethod.offBody);
+  } else if (!config && isGemmaModel(model)) {
+    deepMerge(additions, { chat_template_kwargs: { enable_thinking: isThinkModel(model) } });
+  } else if (config && isGemmaModel(model) && !config.thinkingMethod) {
+    deepMerge(additions, { chat_template_kwargs: { enable_thinking: config.thinking === "on" } });
+  }
+  return additions;
+}
+
+function applyRegistryRequestAdditions(chat, body) {
+  const additions = registryRequestAdditions(body.model, body);
+  if (body.chat_template_kwargs || additions.chat_template_kwargs) {
+    chat.chat_template_kwargs = deepMerge({ ...(body.chat_template_kwargs || {}) }, additions.chat_template_kwargs || {});
+  }
+  for (const [key, value] of Object.entries(additions)) {
+    if (key === "chat_template_kwargs") continue;
+    if (value && typeof value === "object" && !Array.isArray(value) && chat[key] && typeof chat[key] === "object" && !Array.isArray(chat[key])) {
+      deepMerge(chat[key], value);
+    } else {
+      chat[key] = value;
+    }
+  }
+}
+
+function chatTemplateKwargs(body) {
+  const kwargs = { ...(body.chat_template_kwargs || {}) };
+  const additions = registryRequestAdditions(body.model, body);
+  deepMerge(kwargs, additions.chat_template_kwargs || {});
+  return Object.keys(kwargs).length ? kwargs : undefined;
+}
+
+function routeForModel(model) {
+  const config = registryModelConfig(model);
+  if (config?.provider) {
+    const provider = registryProviderConfig(config.provider);
+    if (provider) {
+      return {
+        apiBase: normalizedBaseUrl(provider.baseUrl),
+        apiKey: providerApiKey(provider),
+        model: config.upstreamModel || model,
+      };
+    }
+  }
+  const routedModel = openRouterModelAliases[String(model || "").toLowerCase()];
+  if (!routedModel) return { apiBase, apiKey, model };
+  const key = process.env.OPENROUTER_API_KEY || fs.readFileSync(openRouterApiKeyFile, "utf8").trim();
+  return { apiBase: openRouterApiBase, apiKey: key, model: routedModel };
+}
+
+function localModelCatalog() {
+  const raw = fs.readFileSync(modelCatalogFile, "utf8");
+  const catalog = JSON.parse(raw);
+  if (!catalog || !Array.isArray(catalog.models)) {
+    throw new Error(`Model catalog ${modelCatalogFile} must contain a models array`);
+  }
+  return catalog;
+}
+
+function allowedModelNames() {
+  return new Set(
+    localModelCatalog()
+      .models
+      .map((model) => model?.slug || model?.id || model?.name || model?.model)
+      .filter(Boolean),
+  );
+}
+
+function modelIsAllowed(model) {
+  return allowedModelNames().has(String(model || ""));
+}
+
+function outputTokenLimitForModel(model) {
+  const value = registryModelConfig(model)?.outputTokenLimit;
+  if (Number.isInteger(value) && value > 0) return value;
+  return modelOutputTokenLimits[String(model || "")];
+}
+
+function tokenParamForModel(model) {
+  const tokenParam = registryModelConfig(model)?.requestRecipe?.tokenParam;
+  return tokenParam === "max_completion_tokens" ? "max_completion_tokens" : "max_tokens";
+}
+
+function modelAcceptsTemperature(model) {
+  const recipe = registryModelConfig(model)?.requestRecipe;
+  if (!recipe) return true;
+  return recipe.temperature !== false;
+}
+
+function shouldNormalizeSystemForModel(model) {
+  return registryModelConfig(model)?.normalizeSystem === "ascii" || model === "Chitti-Fast-Think";
+}
+
+function buildChatBody(body, includeTools = true, upstreamModel = body.model) {
+  const messages = responsesInputToChatMessages(body);
+  if (shouldNormalizeSystemForModel(body.model)) {
+    for (const message of messages) {
+      if (message.role === "system" && typeof message.content === "string") {
+        message.content = message.content
+          .normalize("NFKD")
+          .replace(/[\u2018\u2019]/g, "'")
+          .replace(/[\u201C\u201D]/g, '"')
+          .replace(/[\u2013\u2014]/g, "-")
+          .replace(/[^\x00-\x7F]/g, "");
+      }
+    }
+  }
+
+  const chat = {
+    model: upstreamModel,
+    messages,
+    stream: true,
+    // Ask for usage in the final stream chunk; without this most OpenAI-compatible
+    // servers (vLLM, OpenAI, DeepSeek) omit usage entirely and the client shows
+    // 0 in / 0 out. upstreamChat retries without it for providers that reject it.
+    stream_options: { include_usage: true },
+  };
+
+  if (typeof body.temperature === "number" && modelAcceptsTemperature(body.model)) chat.temperature = body.temperature;
+  if (typeof body.top_p === "number") chat.top_p = body.top_p;
+  const outputLimit = outputTokenLimitForModel(body.model);
+  const tokenParam = tokenParamForModel(body.model);
+  if (typeof body.max_output_tokens === "number") {
+    chat[tokenParam] = outputLimit ? Math.min(body.max_output_tokens, outputLimit) : body.max_output_tokens;
+  } else if (outputLimit) {
+    chat[tokenParam] = outputLimit;
+  }
+  applyRegistryRequestAdditions(chat, body);
+  if (includeTools) {
+    const tools = responsesToolsToChatTools(body.tools);
+    if (tools.length) {
+      chat.tools = tools;
+      chat.tool_choice = body.tool_choice || "auto";
+      if (typeof body.parallel_tool_calls === "boolean") chat.parallel_tool_calls = body.parallel_tool_calls;
+    }
+  }
+  return chat;
+}
+
+function hasRequestTools(body) {
+  return responsesToolsToChatTools(body.tools).length > 0;
+}
+
+async function upstreamChat(body, includeTools) {
+  const route = routeForModel(body.model);
+  const chatBody = buildChatBody(body, includeTools, route.model);
+  const send = async (payload) => {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), upstreamTimeoutMs);
+    return fetch(`${route.apiBase}/chat/completions`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${route.apiKey}`,
+        "Content-Type": "application/json",
+        "HTTP-Referer": "https://retrace.local",
+        "X-Title": "Retrace",
+      },
+      body: JSON.stringify(payload),
+      signal: controller.signal,
+    }).finally(() => clearTimeout(timeout));
+  };
+  let response = await send(chatBody);
+  if (!response.ok) {
+    const text = await response.text();
+    // Some providers reject stream_options; drop it and retry once before
+    // surfacing the error to the caller.
+    if (chatBody.stream_options && /stream_options/i.test(text)) {
+      const retryBody = { ...chatBody };
+      delete retryBody.stream_options;
+      response = await send(retryBody);
+      if (response.ok) return { response };
+      return { response, text: await response.text() };
+    }
+    return { response, text };
+  }
+  return { response };
+}
+
+function emitMessageStart(state, res) {
+  if (state.messageStarted) return;
+  finishReasoning(state, res);
+  state.messageStarted = true;
+  const item = { id: state.messageId, type: "message", status: "in_progress", role: "assistant", content: [] };
+  sendSse(res, "response.output_item.added", { type: "response.output_item.added", output_index: state.output.length, item });
+  sendSse(res, "response.content_part.added", {
+    type: "response.content_part.added",
+    item_id: state.messageId,
+    output_index: state.output.length,
+    content_index: 0,
+    part: { type: "output_text", text: "", annotations: [] },
+  });
+}
+
+function emitTextDelta(state, res, delta) {
+  if (!delta) return;
+  emitMessageStart(state, res);
+  state.text += delta;
+  sendSse(res, "response.output_text.delta", {
+    type: "response.output_text.delta",
+    item_id: state.messageId,
+    output_index: state.output.length,
+    content_index: 0,
+    delta,
+  });
+}
+
+function firstPlainLeakIndex(text) {
+  let index = -1;
+  for (const pattern of plainLeakPatterns) {
+    const match = pattern.exec(text);
+    if (!match) continue;
+    if (index === -1 || match.index < index) index = match.index;
+  }
+  return index;
+}
+
+function looksLikeShortLoop(text) {
+  const compact = text.replace(/\s+/g, "");
+  if (compact.length < 24) return false;
+  for (let size = 2; size <= 8; size++) {
+    const unit = compact.slice(0, size);
+    if (!unit || unit.length < size) continue;
+    const repeated = unit.repeat(Math.ceil(compact.length / size)).slice(0, compact.length);
+    if (repeated === compact) return true;
+  }
+  return false;
+}
+
+function cleanVisibleText(text) {
+  let cleaned = text;
+  for (const token of gemmaSpecialTokens) cleaned = cleaned.split(token).join("");
+  cleaned = cleaned.replace(/^\s*Generating a response\.\.\.\s*/i, "");
+  const leakIndex = firstPlainLeakIndex(cleaned);
+  if (leakIndex !== -1) cleaned = cleaned.slice(0, leakIndex);
+  if (looksLikeShortLoop(cleaned)) return "";
+  return cleaned;
+}
+
+// Marker pairs whose enclosed content is model thinking embedded in `content`
+// (Gemma hidden channels, DeepSeek/Qwen-style <think> tags). The enclosed text
+// is captured into `state.capturedReasoning` so it can be surfaced as a
+// reasoning block instead of being silently dropped.
+const hiddenSpanMarkers = [
+  { start: hiddenChannelStart, end: hiddenChannelEnd, stripLabel: true },
+  { start: "<think>", end: "</think>", stripLabel: false },
+  { start: "<thinking>", end: "</thinking>", stripLabel: false },
+];
+const maxHiddenMarkerHold = Math.max(...hiddenSpanMarkers.map((marker) => Math.max(marker.start.length, marker.end.length))) - 1;
+
+function visibleTextDelta(state, delta) {
+  if (!delta) return "";
+
+  state.pendingText += delta;
+  let visible = "";
+
+  while (state.pendingText) {
+    if (state.inHiddenChannel) {
+      const marker = state.hiddenMarker || hiddenSpanMarkers[0];
+      const end = state.pendingText.indexOf(marker.end);
+      if (end === -1) {
+        const hold = marker.end.length - 1;
+        if (state.pendingText.length > hold) {
+          state.capturedReasoning += state.pendingText.slice(0, -hold);
+          state.pendingText = state.pendingText.slice(-hold);
+        }
+        return visible;
+      }
+      state.capturedReasoning += state.pendingText.slice(0, end);
+      state.pendingText = state.pendingText.slice(end + marker.end.length);
+      state.inHiddenChannel = false;
+      state.hiddenMarker = null;
+      if (marker.stripLabel) {
+        state.pendingText = state.pendingText.replace(/^\s*(?:thought|text)\s*\n/i, "");
+      }
+      continue;
+    }
+
+    let start = -1;
+    let matched = null;
+    for (const marker of hiddenSpanMarkers) {
+      const index = state.pendingText.indexOf(marker.start);
+      if (index !== -1 && (start === -1 || index < start)) {
+        start = index;
+        matched = marker;
+      }
+    }
+    if (start === -1) {
+      const hold = maxHiddenMarkerHold;
+      if (state.pendingText.length <= hold) return visible;
+      visible += state.pendingText.slice(0, -hold);
+      state.pendingText = state.pendingText.slice(-hold);
+      return cleanVisibleText(visible);
+    }
+
+    visible += state.pendingText.slice(0, start);
+    state.pendingText = state.pendingText.slice(start + matched.start.length);
+    state.inHiddenChannel = true;
+    state.hiddenMarker = matched;
+  }
+
+  return cleanVisibleText(visible);
+}
+
+function flushVisibleText(state) {
+  if (state.inHiddenChannel) {
+    state.capturedReasoning += state.pendingText;
+    state.pendingText = "";
+    return "";
+  }
+  const text = cleanVisibleText(state.pendingText);
+  state.pendingText = "";
+  return text;
+}
+
+/// Drains reasoning captured from hidden `content` spans since the last call.
+function takeCapturedReasoning(state) {
+  const captured = state.capturedReasoning;
+  state.capturedReasoning = "";
+  return captured;
+}
+
+function ensureToolCall(state, res, toolDelta) {
+  finishReasoning(state, res);
+  const index = toolDelta.index ?? 0;
+  if (!state.toolCalls.has(index)) {
+    const item = {
+      id: `fc_${Date.now()}_${index}`,
+      type: "function_call",
+      status: "in_progress",
+      call_id: toolDelta.id || `call_${Date.now()}_${index}`,
+      name: toolDelta.function?.name || "",
+      arguments: "",
+    };
+    state.toolCalls.set(index, item);
+    sendSse(res, "response.output_item.added", {
+      type: "response.output_item.added",
+      output_index: state.output.length + state.toolCalls.size - 1,
+      item,
+    });
+  }
+  const item = state.toolCalls.get(index);
+  if (toolDelta.id) item.call_id = toolDelta.id;
+  if (toolDelta.function?.name) item.name = toolDelta.function.name;
+  return item;
+}
+
+function emitToolDelta(state, res, toolDelta) {
+  const item = ensureToolCall(state, res, toolDelta);
+  const delta = toolDelta.function?.arguments || "";
+  if (!delta) return;
+  item.arguments += delta;
+  sendSse(res, "response.function_call_arguments.delta", {
+    type: "response.function_call_arguments.delta",
+    item_id: item.id,
+    output_index: state.output.length + [...state.toolCalls.values()].indexOf(item),
+    delta,
+  });
+}
+
+function finishMessage(state, res) {
+  if (!state.messageStarted) return;
+  sendSse(res, "response.output_text.done", {
+    type: "response.output_text.done",
+    item_id: state.messageId,
+    output_index: state.output.length,
+    content_index: 0,
+    text: state.text,
+  });
+  const part = { type: "output_text", text: state.text, annotations: [] };
+  sendSse(res, "response.content_part.done", {
+    type: "response.content_part.done",
+    item_id: state.messageId,
+    output_index: state.output.length,
+    content_index: 0,
+    part,
+  });
+  const item = { id: state.messageId, type: "message", status: "completed", role: "assistant", content: [part] };
+  sendSse(res, "response.output_item.done", { type: "response.output_item.done", output_index: state.output.length, item });
+  state.output.push(item);
+}
+
+function finishToolCalls(state, res) {
+  for (const item of state.toolCalls.values()) {
+    const outputIndex = state.output.length;
+    sendSse(res, "response.function_call_arguments.done", {
+      type: "response.function_call_arguments.done",
+      item_id: item.id,
+      output_index: outputIndex,
+      arguments: item.arguments,
+    });
+    const doneItem = { ...item, status: "completed" };
+    sendSse(res, "response.output_item.done", { type: "response.output_item.done", output_index: outputIndex, item: doneItem });
+    state.output.push(doneItem);
+  }
+}
+
+function newResponseState(model) {
+  return {
+    responseId: `resp_${Date.now()}`,
+    model,
+    messageId: `msg_${Date.now()}`,
+    messageStarted: false,
+    text: "",
+    output: [],
+    toolCalls: new Map(),
+    usage: null,
+    inHiddenChannel: false,
+    hiddenMarker: null,
+    pendingText: "",
+    capturedReasoning: "",
+    reasoningId: `rs_${Date.now()}`,
+    reasoningStarted: false,
+    reasoningFinished: false,
+    reasoningText: "",
+  };
+}
+
+/// Maps upstream chat-completions usage (with provider-specific cache fields)
+/// onto Responses-API usage, including cached and reasoning token details so
+/// the client's TokenUsage picks them up.
+function usageFromChunk(usage) {
+  const promptDetails = usage.prompt_tokens_details || usage.input_tokens_details || {};
+  const completionDetails = usage.completion_tokens_details || usage.output_tokens_details || {};
+  const cachedTokens = promptDetails.cached_tokens
+    || usage.prompt_cache_hit_tokens
+    || usage.cache_read_input_tokens
+    || 0;
+  const reasoningTokens = completionDetails.reasoning_tokens || usage.reasoning_tokens || 0;
+  return {
+    input_tokens: usage.prompt_tokens || usage.input_tokens || 0,
+    input_tokens_details: { cached_tokens: cachedTokens },
+    output_tokens: usage.completion_tokens || usage.output_tokens || 0,
+    output_tokens_details: { reasoning_tokens: reasoningTokens },
+    total_tokens: usage.total_tokens || 0,
+  };
+}
+
+/// Extracts a reasoning delta from a chat-completions streaming delta,
+/// covering reasoning_content (vLLM/DeepSeek/Kimi), reasoning (some routers),
+/// and OpenRouter-style reasoning_details.
+function reasoningDeltaFromChunk(delta) {
+  if (typeof delta?.reasoning_content === "string" && delta.reasoning_content) return delta.reasoning_content;
+  if (typeof delta?.reasoning === "string" && delta.reasoning) return delta.reasoning;
+  if (Array.isArray(delta?.reasoning_details)) {
+    return delta.reasoning_details
+      .map((detail) => detail?.text || detail?.summary || "")
+      .filter(Boolean)
+      .join("");
+  }
+  return "";
+}
+
+// Reasoning must be emitted as its own Responses output item, opened before and
+// closed before the assistant message item: the client tracks a single active
+// item, so interleaving deltas across items would be dropped or crash it.
+function reasoningItemShell(state, status) {
+  return {
+    id: state.reasoningId,
+    type: "reasoning",
+    status,
+    summary: state.reasoningText
+      ? [{ type: "summary_text", text: state.reasoningText }]
+      : [],
+    encrypted_content: null,
+  };
+}
+
+function emitReasoningStart(state, res) {
+  if (state.reasoningStarted) return;
+  state.reasoningStarted = true;
+  sendSse(res, "response.output_item.added", {
+    type: "response.output_item.added",
+    output_index: state.output.length,
+    item: reasoningItemShell(state, "in_progress"),
+  });
+  sendSse(res, "response.reasoning_summary_part.added", {
+    type: "response.reasoning_summary_part.added",
+    item_id: state.reasoningId,
+    output_index: state.output.length,
+    summary_index: 0,
+  });
+}
+
+function emitReasoningDelta(state, res, delta) {
+  if (!delta || state.reasoningFinished) {
+    // Late reasoning after the message opened still lands in the transcript
+    // total via state.reasoningText, it just cannot stream live any more.
+    state.reasoningText += delta || "";
+    return;
+  }
+  emitReasoningStart(state, res);
+  state.reasoningText += delta;
+  sendSse(res, "response.reasoning_summary_text.delta", {
+    type: "response.reasoning_summary_text.delta",
+    item_id: state.reasoningId,
+    output_index: state.output.length,
+    summary_index: 0,
+    delta,
+  });
+}
+
+function finishReasoning(state, res) {
+  if (!state.reasoningStarted || state.reasoningFinished) {
+    state.reasoningFinished = true;
+    return;
+  }
+  state.reasoningFinished = true;
+  const item = reasoningItemShell(state, "completed");
+  sendSse(res, "response.output_item.done", {
+    type: "response.output_item.done",
+    output_index: state.output.length,
+    item,
+  });
+  state.output.push(item);
+}
+
+async function collectChatToResponse(upstream, model) {
+  const state = newResponseState(model);
+  const reader = upstream.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+
+  while (true) {
+    const { value, done } = await readWithTimeout(reader, streamInactivityTimeoutMs);
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    const events = buffer.split(/\n\n/);
+    buffer = events.pop() || "";
+    for (const eventText of events) {
+      const dataLines = eventText
+        .split(/\n/)
+        .filter((line) => line.startsWith("data:"))
+        .map((line) => line.slice(5).trim());
+      if (!dataLines.length) continue;
+      const data = dataLines.join("\n");
+      if (data === "[DONE]") continue;
+      let chunk;
+      try {
+        chunk = JSON.parse(data);
+      } catch {
+        continue;
+      }
+      if (chunk.usage) state.usage = usageFromChunk(chunk.usage);
+      const choice = chunk.choices?.[0];
+      const delta = choice?.delta || {};
+      state.reasoningText += reasoningDeltaFromChunk(delta);
+      state.text += visibleTextDelta(state, delta.content || "");
+      state.reasoningText += takeCapturedReasoning(state);
+      for (const toolDelta of delta.tool_calls || []) {
+        const index = toolDelta.index ?? 0;
+        if (!state.toolCalls.has(index)) {
+          state.toolCalls.set(index, {
+            id: `fc_${Date.now()}_${index}`,
+            type: "function_call",
+            status: "in_progress",
+            call_id: toolDelta.id || `call_${Date.now()}_${index}`,
+            name: toolDelta.function?.name || "",
+            arguments: "",
+          });
+        }
+        const item = state.toolCalls.get(index);
+        if (toolDelta.id) item.call_id = toolDelta.id;
+        if (toolDelta.function?.name) item.name = toolDelta.function.name;
+        item.arguments += toolDelta.function?.arguments || "";
+      }
+    }
+  }
+
+  state.text += flushVisibleText(state);
+  state.reasoningText += takeCapturedReasoning(state);
+  return state;
+}
+
+async function readWithTimeout(reader, timeoutMs) {
+  let timeout;
+  try {
+    return await Promise.race([
+      reader.read(),
+      new Promise((_, reject) => {
+        timeout = setTimeout(() => reject(new Error(`Upstream stream timed out after ${timeoutMs}ms without data`)), timeoutMs);
+      }),
+    ]);
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+function emitCollectedResponse(state, res) {
+  sseHeaders(res);
+  sendSse(res, "response.created", {
+    type: "response.created",
+    response: responseShell(state.responseId, state.model),
+  });
+
+  if (state.reasoningText && !state.reasoningStarted) {
+    emitReasoningStart(state, res);
+    sendSse(res, "response.reasoning_summary_text.delta", {
+      type: "response.reasoning_summary_text.delta",
+      item_id: state.reasoningId,
+      output_index: state.output.length,
+      summary_index: 0,
+      delta: state.reasoningText,
+    });
+    finishReasoning(state, res);
+  }
+
+  if (state.text) {
+    const item = { id: state.messageId, type: "message", status: "in_progress", role: "assistant", content: [] };
+    sendSse(res, "response.output_item.added", { type: "response.output_item.added", output_index: state.output.length, item });
+    sendSse(res, "response.content_part.added", {
+      type: "response.content_part.added",
+      item_id: state.messageId,
+      output_index: state.output.length,
+      content_index: 0,
+      part: { type: "output_text", text: "", annotations: [] },
+    });
+    sendSse(res, "response.output_text.delta", {
+      type: "response.output_text.delta",
+      item_id: state.messageId,
+      output_index: state.output.length,
+      content_index: 0,
+      delta: state.text,
+    });
+    sendSse(res, "response.output_text.done", {
+      type: "response.output_text.done",
+      item_id: state.messageId,
+      output_index: state.output.length,
+      content_index: 0,
+      text: state.text,
+    });
+    const part = { type: "output_text", text: state.text, annotations: [] };
+    sendSse(res, "response.content_part.done", {
+      type: "response.content_part.done",
+      item_id: state.messageId,
+      output_index: state.output.length,
+      content_index: 0,
+      part,
+    });
+    const doneItem = { id: state.messageId, type: "message", status: "completed", role: "assistant", content: [part] };
+    sendSse(res, "response.output_item.done", { type: "response.output_item.done", output_index: state.output.length, item: doneItem });
+    state.output.push(doneItem);
+  }
+
+  for (const item of state.toolCalls.values()) {
+    const outputIndex = state.output.length;
+    sendSse(res, "response.output_item.added", {
+      type: "response.output_item.added",
+      output_index: outputIndex,
+      item,
+    });
+    if (item.arguments) {
+      sendSse(res, "response.function_call_arguments.delta", {
+        type: "response.function_call_arguments.delta",
+        item_id: item.id,
+        output_index: outputIndex,
+        delta: item.arguments,
+      });
+    }
+    sendSse(res, "response.function_call_arguments.done", {
+      type: "response.function_call_arguments.done",
+      item_id: item.id,
+      output_index: outputIndex,
+      arguments: item.arguments,
+    });
+    const doneItem = { ...item, status: "completed" };
+    sendSse(res, "response.output_item.done", { type: "response.output_item.done", output_index: outputIndex, item: doneItem });
+    state.output.push(doneItem);
+  }
+
+  sendSse(res, "response.completed", {
+    type: "response.completed",
+    response: responseShell(state.responseId, state.model, "completed", state.output, state.usage),
+  });
+  res.end();
+}
+
+/// Streams one upstream chat-completions response into `state`, emitting
+/// Responses-API deltas (reasoning, text, tool args) to the client as they
+/// arrive. Does NOT finish items or complete the response, so callers can
+/// append further attempts (Agent Check retries) into the same message.
+async function streamUpstreamIntoState(upstream, res, state) {
+  const reader = upstream.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+
+  while (true) {
+    const { value, done } = await readWithTimeout(reader, streamInactivityTimeoutMs);
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    const events = buffer.split(/\n\n/);
+    buffer = events.pop() || "";
+    for (const eventText of events) {
+      const dataLines = eventText
+        .split(/\n/)
+        .filter((line) => line.startsWith("data:"))
+        .map((line) => line.slice(5).trim());
+      if (!dataLines.length) continue;
+      const data = dataLines.join("\n");
+      if (data === "[DONE]") continue;
+      let chunk;
+      try {
+        chunk = JSON.parse(data);
+      } catch {
+        continue;
+      }
+      if (chunk.usage) state.usage = usageFromChunk(chunk.usage);
+      const choice = chunk.choices?.[0];
+      const delta = choice?.delta || {};
+      emitReasoningDelta(state, res, reasoningDeltaFromChunk(delta));
+      const visibleDelta = visibleTextDelta(state, delta.content || "");
+      emitReasoningDelta(state, res, takeCapturedReasoning(state));
+      emitTextDelta(state, res, visibleDelta);
+      for (const toolDelta of delta.tool_calls || []) emitToolDelta(state, res, toolDelta);
+    }
+  }
+
+  emitReasoningDelta(state, res, takeCapturedReasoning(state));
+  emitTextDelta(state, res, flushVisibleText(state));
+}
+
+/// Closes all in-progress items and completes the streamed response.
+function finishStreamedResponse(state, res) {
+  finishReasoning(state, res);
+  finishMessage(state, res);
+  finishToolCalls(state, res);
+  if (!state.output.length) {
+    emitTextDelta(state, res, "");
+    finishMessage(state, res);
+  }
+  sendSse(res, "response.completed", {
+    type: "response.completed",
+    response: responseShell(state.responseId, state.model, "completed", state.output, state.usage),
+  });
+  res.end();
+}
+
+function latestUserText(body) {
+  for (let index = (body.input || []).length - 1; index >= 0; index--) {
+    const item = body.input[index];
+    if (item?.type === "message" && item.role === "user") {
+      return contentText(item.content);
+    }
+  }
+  return "";
+}
+
+function parseAgentCheck(text) {
+  const trimmed = String(text || "").trim();
+  const jsonText = trimmed.match(/\{[\s\S]*\}/)?.[0] || trimmed;
+  try {
+    const parsed = JSON.parse(jsonText);
+    return {
+      answered: Boolean(parsed.answered),
+      direction: typeof parsed.direction === "string" ? parsed.direction : "",
+    };
+  } catch {
+    return { answered: true, direction: "" };
+  }
+}
+
+function parseOnOff(value, fallback) {
+  switch (String(value || "").trim().toLowerCase()) {
+    case "on":
+    case "true":
+    case "1":
+    case "yes":
+    case "enabled":
+    case "enable":
+      return true;
+    case "off":
+    case "false":
+    case "0":
+    case "no":
+    case "disabled":
+    case "disable":
+      return false;
+    case "":
+      return fallback;
+    default:
+      return fallback;
+  }
+}
+
+function agentCheckEnabled() {
+  let enabled = parseOnOff(
+    (process.env.RETRACE_AGENT_CHECK_ENABLED || process.env.CODEXOS_AGENT_CHECK_ENABLED) || (process.env.RETRACE_AGENT_CHECK || process.env.CODEXOS_AGENT_CHECK),
+    false,
+  );
+  try {
+    if (fs.existsSync(agentCheckStateFile)) {
+      enabled = parseOnOff(fs.readFileSync(agentCheckStateFile, "utf8"), enabled);
+    }
+  } catch {
+    return enabled;
+  }
+  return enabled;
+}
+
+function agentCheckShowNotes() {
+  return parseOnOff((process.env.RETRACE_AGENT_CHECK_SHOW_NOTES || process.env.CODEXOS_AGENT_CHECK_SHOW_NOTES), false);
+}
+
+function shouldRunAgentCheck(state) {
+  return state.text.trim() && state.toolCalls.size === 0;
+}
+
+async function runAgentCheck(body, state) {
+  const checkBody = {
+    ...body,
+    tools: [],
+    tool_choice: "none",
+    max_output_tokens: 220,
+    input: [
+      {
+        type: "message",
+        role: "system",
+        content: `You are Agent Check. Decide if the assistant's draft fully answers the user's latest request.
+	Return JSON only with this exact shape: {"answered":true|false,"direction":"..."}.
+	Use answered=false when the draft is only a progress update, promises future work, says it will inspect/read/check, lacks the requested final answer, or stops before using an obvious next step.
+	If answered=false and the draft itself points to a next step, put that next step in direction. Otherwise provide a concise new approach.`,
+      },
+      ...(body.input || []),
+      {
+        type: "message",
+        role: "assistant",
+        content: stripProxyArtifacts(state.text).trim(),
+      },
+      {
+        type: "message",
+        role: "user",
+        content: `Agent Check: using the full conversation and initial instructions above, decide whether the immediately preceding assistant draft fully completed the latest user request. Return JSON only.`,
+      },
+    ],
+  };
+
+  const upstream = await upstreamChat(checkBody, false);
+  if (!upstream.response.ok) return { answered: true, direction: "" };
+  const checkState = await collectChatToResponse(upstream.response, body.model);
+  return parseAgentCheck(checkState.text);
+}
+
+function bodyWithAgentCheckFeedback(body, state, check) {
+  return {
+    ...body,
+    input: [
+      ...(body.input || []),
+      {
+        type: "message",
+        role: "assistant",
+        content: stripProxyArtifacts(state.text),
+      },
+      {
+        type: "message",
+        role: "user",
+        content: `Agent Check says the previous draft did not fully answer the request. Continue now and complete the task. Direction: ${check.direction || "Use a new approach and provide the missing answer."}`,
+      },
+    ],
+  };
+}
+
+function prependAgentCheckRetryNote(state, direction) {
+  const note = `Agent Check: retrying because the previous answer was incomplete. Direction: ${direction || "Use a new approach and provide the missing answer."}\n\n`;
+  state.text = note + state.text;
+}
+
+function prependAgentCheckBlockedNote(state, direction) {
+  const note = `Agent Check: retry limit reached; the retry still did not complete the task. Last direction: ${direction || "Use a new approach and provide the missing answer."}\n\n`;
+  state.text = note + state.text;
+}
+
+async function handleResponses(req, res, body) {
+  if (!modelIsAllowed(body.model)) {
+    json(res, 400, {
+      error: {
+        message: `Model ${body.model || "(missing)"} is not enabled in Retrace`,
+        type: "model_not_enabled",
+      },
+    });
+    return;
+  }
+
+  let upstream = await upstreamChat(body, true);
+  if (!upstream.response.ok && hasRequestTools(body)) {
+    upstream = await upstreamChat(body, false);
+  }
+  if (!upstream.response.ok) {
+    json(res, upstream.response.status, {
+      error: {
+        message: upstream.text || `Upstream returned ${upstream.response.status}`,
+        type: "upstream_error",
+      },
+    });
+    return;
+  }
+
+  // Always stream: attempt 1 is forwarded live. When Agent Check is enabled and
+  // judges the streamed draft incomplete, each retry streams as a continuation
+  // of the same message (separated by a note) until the check passes or the
+  // retry budget is exhausted.
+  const state = newResponseState(body.model);
+  sseHeaders(res);
+  sendSse(res, "response.created", {
+    type: "response.created",
+    response: responseShell(state.responseId, state.model),
+  });
+  await streamUpstreamIntoState(upstream.response, res, state);
+
+  const maxAgentCheckRetries = agentCheckEnabled()
+    ? Number((process.env.RETRACE_AGENT_CHECK_RETRIES || process.env.CODEXOS_AGENT_CHECK_RETRIES) || "8")
+    : 0;
+
+  for (let attempt = 0; attempt < maxAgentCheckRetries; attempt++) {
+    if (!shouldRunAgentCheck(state)) break;
+
+    const check = await runAgentCheck(body, state);
+    if (check.answered) break;
+
+    const retryBody = bodyWithAgentCheckFeedback(body, state, {
+      ...check,
+      direction: `${check.direction || "Use a new approach and provide the missing answer."} Do not answer with a progress update. Either call the needed tool now or provide the completed final answer.`,
+    });
+    let retry = await upstreamChat(retryBody, true);
+    if (!retry.response.ok && hasRequestTools(retryBody)) {
+      retry = await upstreamChat(retryBody, false);
+    }
+    if (!retry.response.ok) break;
+
+    const separator = agentCheckShowNotes()
+      ? `\n\nAgent Check: the draft above was incomplete; continuing. Direction: ${check.direction || "complete the task"}\n\n`
+      : "\n\n";
+    emitTextDelta(state, res, separator);
+    await streamUpstreamIntoState(retry.response, res, state);
+  }
+
+  finishStreamedResponse(state, res);
+}
+
+async function proxyModels(_req, res) {
+  json(res, 200, localModelCatalog());
+}
+
+const server = http.createServer((req, res) => {
+  const chunks = [];
+  req.on("data", (chunk) => chunks.push(chunk));
+  req.on("end", async () => {
+    try {
+      if (req.method === "GET" && req.url?.endsWith("/models")) {
+        await proxyModels(req, res);
+        return;
+      }
+      if (req.method !== "POST" || !req.url?.endsWith("/responses")) {
+        json(res, 404, { error: { message: "Not found" } });
+        return;
+      }
+      const body = JSON.parse(Buffer.concat(chunks).toString("utf8") || "{}");
+      await handleResponses(req, res, body);
+    } catch (error) {
+      json(res, 500, { error: { message: error.stack || error.message || String(error), type: "proxy_error" } });
+    }
+  });
+});
+
+server.listen(port, host, () => {
+  const address = server.address();
+  const actualPort = typeof address === "object" && address ? address.port : port;
+  if (readyFile) fs.writeFileSync(readyFile, `${actualPort}\n`, { mode: 0o600 });
+  console.error(`retrace proxy listening on ${host}:${actualPort}`);
+});

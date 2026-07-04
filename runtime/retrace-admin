@@ -1,0 +1,9 @@
+#!/usr/bin/env zsh
+set -euo pipefail
+
+RETRACE_HOME="${RETRACE_HOME:-$HOME/.retrace}"
+if [[ -f "$RETRACE_HOME/env.zsh" ]]; then
+  source "$RETRACE_HOME/env.zsh"
+fi
+
+exec node "$RETRACE_HOME/bin/retrace-admin.mjs" "$@"

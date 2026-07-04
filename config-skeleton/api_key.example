@@ -1,0 +1,4 @@
+# Rename this file to `api_key` (no extension) in ~/.retrace/ and paste a key
+# for your DEFAULT provider's gateway, OR leave a placeholder and add per-provider
+# keys through `retrace` -> /model -> "Add custom model".
+placeholder-not-a-real-key

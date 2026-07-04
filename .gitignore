@@ -1,0 +1,19 @@
+# Secrets — never commit real keys
+api_key
+*.key
+keys/
+/config.toml
+/registry.json
+.env
+
+# Build artifacts
+target/
+dist/
+*.tar.gz
+
+# Local source checkout (built separately; see README "Build from source")
+codex-src/
+
+# OS / editor
+.DS_Store
+*.swp

@@ -1,0 +1,41 @@
+name: release
+
+# Push a tag like v0.1.0 to build the macOS binary and publish a release tarball.
+# Requires the Rust fork source under codex-src/ (see docs/BUILD.md).
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-macos:
+    strategy:
+      matrix:
+        include:
+          - runner: macos-14      # Apple Silicon
+            arch: aarch64
+          - runner: macos-13      # Intel
+            arch: x86_64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build release binary
+        working-directory: codex-src/codex-rs
+        run: cargo build --release -p codex-cli --bin retrace
+      - name: Assemble tarball
+        run: |
+          set -euo pipefail
+          STAGE="$(mktemp -d)"
+          cp codex-src/codex-rs/target/release/retrace "$STAGE/retrace-bin"
+          cp -R runtime "$STAGE/runtime"
+          cp -R config-skeleton "$STAGE/config-skeleton"
+          mkdir -p "$STAGE/launchd"
+          cp launchd/com.retrace.responses-proxy.plist.template "$STAGE/launchd/"
+          tar -czf "retrace-macos-${{ matrix.arch }}.tar.gz" -C "$STAGE" .
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: retrace-macos-${{ matrix.arch }}.tar.gz
