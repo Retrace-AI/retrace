@@ -15,6 +15,15 @@ BIN_DIR="${RETRACE_BIN_DIR:-$HOME/.local/bin}"
 PLIST_LABEL="com.retrace.responses-proxy"
 PLIST_DEST="$HOME/Library/LaunchAgents/${PLIST_LABEL}.plist"
 
+# Opt-in browser control (Playwright MCP driving Chrome, vision/coordinate mode).
+# Enable with:  ... | bash -s -- --with-browser   or   RETRACE_WITH_BROWSER=1
+WITH_BROWSER="${RETRACE_WITH_BROWSER:-0}"
+for arg in "$@"; do
+  case "$arg" in
+    --with-browser) WITH_BROWSER=1 ;;
+  esac
+done
+
 say()  { printf '\033[1;36m==>\033[0m %s\n' "$1"; }
 warn() { printf '\033[1;33m warning:\033[0m %s\n' "$1" >&2; }
 die()  { printf '\033[1;31m error:\033[0m %s\n' "$1" >&2; exit 1; }
@@ -69,6 +78,39 @@ else
   say "Existing config found — leaving it untouched."
 fi
 
+# --- optional: browser control MCP (Playwright, vision/coordinate mode) -----
+setup_browser_mcp() {
+  local cfg="$RETRACE_HOME/config.toml"
+  if grep -q '^\[mcp_servers.browser\]' "$cfg" 2>/dev/null; then
+    say "Browser MCP already configured — leaving it."
+    return
+  fi
+  # Playwright's --browser chrome drives real Google Chrome. Install it if absent.
+  if [ ! -d "/Applications/Google Chrome.app" ] && ! command -v google-chrome >/dev/null 2>&1; then
+    say "Chrome not found — installing it for browser control..."
+    if command -v brew >/dev/null 2>&1; then
+      brew install --cask google-chrome || warn "Chrome install via Homebrew failed."
+    else
+      npx -y playwright install chrome >/dev/null 2>&1 \
+        || warn "Could not auto-install Chrome. Install Google Chrome manually, then re-run with --with-browser."
+    fi
+  fi
+  say "Adding the browser control MCP (Playwright, vision mode)..."
+  cat >> "$cfg" <<'TOML'
+
+# Browser control for the model (Playwright driving Chrome).
+# Vision mode exposes coordinate tools (browser_mouse_click_xy, ...), suited to
+# grounding/vision models that emit x,y. Requires a vision-capable model.
+[mcp_servers.browser]
+command = "npx"
+args = ["-y", "@playwright/mcp@latest", "--browser", "chrome", "--caps", "vision"]
+TOML
+}
+
+if [ "$WITH_BROWSER" = "1" ]; then
+  setup_browser_mcp
+fi
+
 # --- launchd proxy agent ----------------------------------------------------
 say "Setting up the local proxy service..."
 sed -e "s#__NODE__#${NODE_BIN}#g" \
@@ -94,6 +136,8 @@ cat <<DONE
                  and enter your provider's URL + API key.
 
   Manage models: retrace-admin models list
+  Browser use:   re-run with  --with-browser  to let the model drive Chrome
+                 (Playwright, vision/coordinate mode; installs Chrome if missing)
   Uninstall:     launchctl bootout gui/$(id -u)/${PLIST_LABEL}; rm -rf "$RETRACE_HOME" "$BIN_DIR/retrace" "$BIN_DIR/retrace-admin" "$PLIST_DEST"
 
 DONE

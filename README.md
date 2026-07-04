@@ -26,6 +26,17 @@ On first launch there are no models configured — inside Retrace, run **`/model
 > Requires [Node.js](https://nodejs.org) (for the local proxy). macOS only for
 > v1; Linux/Windows are on the roadmap.
 
+### Optional: let the model drive a browser
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/Retrace-AI/retrace/main/install.sh | bash -s -- --with-browser
+```
+
+Adds a [Playwright](https://github.com/microsoft/playwright-mcp) MCP that controls
+**Google Chrome** in **vision mode** — the model clicks by screen coordinates
+(`browser_mouse_click_xy`), which suits vision/grounding models. Installs Chrome if
+it isn't already present. (Best with a vision-capable model.)
+
 ## What Retrace adds over Codex
 
 - **Bring any provider.** `/model` → *Add custom model* connects OpenAI-, Anthropic-,
