@@ -501,14 +501,23 @@ debug = "none"
 strip = "symbols"
 
 [profile.release]
-lto = "thin"
-debug = "line-tables-only"
+# Fast, small default release build. No cross-crate LTO and parallel codegen
+# so a full build is ~10-15 min instead of ~1 hour, and symbols are stripped so
+# the binary is a fraction of the unstripped size (~577MB -> tens of MB).
+# Runtime cost is negligible (~5%) for a TUI. For maximum-optimized public
+# artifacts, build with `--profile release-lto`.
+lto = false
+codegen-units = 16
+debug = "none"
 split-debuginfo = "off"
-# Keep release binaries symbolicateable until packaging has archived the
-# sidecar symbols and stripped the binaries.
-strip = false
+strip = "symbols"
 
-# See https://github.com/openai/codex/issues/1411 for details.
+# Maximum-optimized profile for final distributable artifacts. Slower to build
+# (thin-LTO + single codegen unit); use for tagged public releases when the last
+# few percent of runtime performance matters.
+[profile.release-lto]
+inherits = "release"
+lto = "thin"
 codegen-units = 1
 
 [profile.profiling]
