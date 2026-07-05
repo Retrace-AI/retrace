@@ -119,6 +119,7 @@ function stripAgentCheckBanners(text) {
       "",
     )
     .replace(/\n*Agent Check: the draft above was incomplete; continuing\. Direction: [^\n]*\n*/gi, "\n\n")
+    .replace(/\n*_?(?:✓|⚠) Agent Check[^\n]*_?\n*/g, "\n")
     .trimStart();
 }
 
@@ -1176,6 +1177,14 @@ function agentCheckShowNotes() {
   return parseOnOff((process.env.RETRACE_AGENT_CHECK_SHOW_NOTES || process.env.CODEXOS_AGENT_CHECK_SHOW_NOTES), false);
 }
 
+function looksLikeLeakedToolCall(text) {
+  const t = String(text || "").trim();
+  if (!t) return false;
+  // A tool-call token, or a text-encoded tool call the model emitted instead of
+  // a structured tool_call (Gemma-4 tool-call leak, e.g. `call:write_stdin{...}`).
+  return /<\|?\s*tool_call\s*\|?>/i.test(t) || /(^|[\s>])call:[a-z0-9_]+\s*\{/i.test(t);
+}
+
 function shouldRunAgentCheck(state) {
   return state.text.trim() && state.toolCalls.size === 0;
 }
@@ -1285,11 +1294,38 @@ async function handleResponses(req, res, body) {
     ? Number((process.env.RETRACE_AGENT_CHECK_RETRIES || process.env.CODEXOS_AGENT_CHECK_RETRIES) || "50")
     : 0;
 
+  if (agentCheckEnabled()) {
+    console.error(
+      `[agentcheck] model=${body.model} enabled=true eligible=${shouldRunAgentCheck(state)} (text=${Boolean(state.text.trim())} toolCalls=${state.toolCalls.size})`,
+    );
+  }
+
+  let agentCheckRan = false;
+  let agentCheckPassed = false;
   for (let attempt = 0; attempt < maxAgentCheckRetries; attempt++) {
     if (!shouldRunAgentCheck(state)) break;
+    agentCheckRan = true;
 
-    const check = await runAgentCheck(body, state);
-    if (check.answered) break;
+    // A leaked/malformed tool call is never a valid final answer. Force a retry
+    // without spending a judge call so the turn never ends on that garbage.
+    let check;
+    if (looksLikeLeakedToolCall(state.text)) {
+      check = {
+        answered: false,
+        direction:
+          "Your previous output was a malformed or leaked tool call, not an answer. Either issue a proper tool call now, or give the completed final answer to the user's request.",
+      };
+      console.error(`[agentcheck] attempt ${attempt + 1}: leaked-tool-call draft, forcing retry`);
+    } else {
+      check = await runAgentCheck(body, state);
+      console.error(
+        `[agentcheck] attempt ${attempt + 1}: answered=${check.answered}${check.answered ? "" : ` direction=${JSON.stringify((check.direction || "").slice(0, 120))}`}`,
+      );
+    }
+    if (check.answered) {
+      agentCheckPassed = true;
+      break;
+    }
 
     const retryBody = bodyWithAgentCheckFeedback(body, state, {
       ...check,
@@ -1306,6 +1342,16 @@ async function handleResponses(req, res, body) {
     const separator = `\n\nAgent Check: the draft above was incomplete; continuing. Direction: ${check.direction || "complete the task"}\n\n`;
     emitTextDelta(state, res, separator);
     await streamUpstreamIntoState(retry.response, res, state);
+  }
+
+  // Always-visible tag so the user can see Agent Check ran (the spinner shows
+  // the "working" activity during the check itself).
+  if (agentCheckRan) {
+    emitTextDelta(
+      state,
+      res,
+      agentCheckPassed ? "\n\n_✓ Agent Check_" : "\n\n_⚠ Agent Check: retries exhausted_",
+    );
   }
 
   finishStreamedResponse(state, res);
