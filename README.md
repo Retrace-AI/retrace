@@ -23,8 +23,9 @@ retrace
 On first launch there are no models configured — inside Retrace, run **`/model` →
 "Add custom model"** and paste your provider's base URL and API key. That's it.
 
-> Requires [Node.js](https://nodejs.org) (for the local proxy). macOS only for
-> v1; Linux/Windows are on the roadmap.
+> Requires [Node.js](https://nodejs.org) (for the local proxy). Supported on
+> **macOS** (launchd) and **Linux x86_64** (systemd + `zsh`). Windows is on the
+> roadmap.
 
 ### Optional: let the model drive a browser
 
