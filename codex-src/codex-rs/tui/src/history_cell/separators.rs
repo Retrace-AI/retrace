@@ -29,7 +29,6 @@ impl HistoryCell for FinalMessageSeparator {
         let mut label_parts = Vec::new();
         if let Some(elapsed_seconds) = self
             .elapsed_seconds
-            .filter(|seconds| *seconds > 60)
             .map(crate::status_indicator_widget::fmt_elapsed_compact)
         {
             label_parts.push(format!("Worked for {elapsed_seconds}"));
@@ -57,7 +56,6 @@ impl HistoryCell for FinalMessageSeparator {
         let mut label_parts = Vec::new();
         if let Some(elapsed_seconds) = self
             .elapsed_seconds
-            .filter(|seconds| *seconds > 60)
             .map(crate::status_indicator_widget::fmt_elapsed_compact)
         {
             label_parts.push(format!("Worked for {elapsed_seconds}"));

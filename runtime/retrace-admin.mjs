@@ -608,15 +608,29 @@ async function detectStreamingCapability(provider, key, modelId, recipe, thinkin
   }
 }
 
+// Emit a live probe-progress line on stderr. The TUI streams stderr into the
+// probe spinner so the user can watch each step; stdout stays clean for the
+// human-readable summary and the JSON catalog reads.
+function probeProgress(msg) {
+  try {
+    process.stderr.write(`${msg}\n`);
+  } catch {}
+}
+
 async function detectModelCapability(provider, key, modelId) {
+  probeProgress(`▸ ${modelId}: detecting request format…`);
   const found = await findRecipe(provider, key, modelId);
-  if (!found) return capabilityFallback(modelId, false);
+  if (!found) {
+    probeProgress(`✗ ${modelId}: no working request format`);
+    return capabilityFallback(modelId, false);
+  }
   const capability = capabilityFallback(modelId, true);
   capability.requestRecipe = found.recipe;
   capability.acceptsTemperature = Boolean(found.recipe.temperature);
   capability.usageDialect = detectUsageShape(found.json);
   capability.usageSample = usageSample(found.json);
 
+  probeProgress(`▸ ${modelId}: reasoning / effort levels…`);
   const thinkingPrompt = "A bat and a ball cost $1.10 total. The bat costs $1 more than the ball. What does the ball cost? Reason briefly, then answer.";
   const base = await callChat(provider, key, modelId, thinkingPrompt, 256, found.recipe).catch(() => null);
   if (base?.ok && reasoningSignal(base.data)) {
@@ -661,14 +675,23 @@ async function detectModelCapability(provider, key, modelId) {
     }
   }
 
+  probeProgress(`▸ ${modelId}: context window…`);
   capability.contextWindow = await detectContextWindow(provider, key, modelId);
+  probeProgress(`▸ ${modelId}: prompt cache…`);
   capability.cache = await detectCacheCapability(provider, key, modelId, found.recipe);
+  probeProgress(`▸ ${modelId}: streaming…`);
   capability.streaming = await detectStreamingCapability(
     provider,
     key,
     modelId,
     found.recipe,
     capability.thinking && capability.thinkingMethod?.body ? capability.thinkingMethod.body : {},
+  );
+  const thinkDesc = capability.thinking
+    ? `thinking [${(capability.thinkingLevels || []).join("/") || "on"}]`
+    : "no-thinking";
+  probeProgress(
+    `✓ ${modelId}: ${thinkDesc}, cache ${capability.cache ? "yes" : "no"}, streaming ${capability.streaming ? "yes" : "no"}`,
   );
   return capability;
 }

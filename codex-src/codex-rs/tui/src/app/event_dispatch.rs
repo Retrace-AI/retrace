@@ -433,6 +433,10 @@ impl App {
                     .on_codexos_provider_configured(result, success_message);
                 tui.frame_requester().schedule_frame();
             }
+            AppEvent::CodexOsProbeProgress { line } => {
+                self.chat_widget.on_codexos_probe_progress(line);
+                tui.frame_requester().schedule_frame();
+            }
             AppEvent::CodexOsProviderRemoveSnapshotLoaded {
                 provider_id,
                 result,
@@ -461,6 +465,14 @@ impl App {
             AppEvent::CodexOsOpenProviderPrompt => {
                 self.chat_widget
                     .open_codexos_provider_url_prompt(String::new());
+                tui.frame_requester().schedule_frame();
+            }
+            AppEvent::DeleteTargetConversations => {
+                self.chat_widget.open_delete_conversations_picker();
+                tui.frame_requester().schedule_frame();
+            }
+            AppEvent::DeleteTargetProviders => {
+                self.chat_widget.start_provider_remove_flow(None);
                 tui.frame_requester().schedule_frame();
             }
             AppEvent::DeleteConversationsListLoaded { rows } => {

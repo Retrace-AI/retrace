@@ -397,6 +397,13 @@ pub(crate) enum AppEvent {
         success_message: Option<String>,
     },
 
+    /// A live progress line emitted (on the probe subprocess's stderr) while
+    /// probing provider/model capabilities. Rendered into the probe spinner's
+    /// rolling detail so the user can see each step as it happens.
+    CodexOsProbeProgress {
+        line: String,
+    },
+
     /// Result of loading providers and models for removal.
     CodexOsProviderRemoveSnapshotLoaded {
         provider_id: Option<String>,
@@ -422,6 +429,14 @@ pub(crate) enum AppEvent {
 
     /// Open the /provider add workflow (URL + API key prompt).
     CodexOsOpenProviderPrompt,
+
+    /// From the unified `/delete` category picker: open the conversation
+    /// deletion picker.
+    DeleteTargetConversations,
+
+    /// From the unified `/delete` category picker: open the provider/model
+    /// removal flow (remove selected models or a whole provider).
+    DeleteTargetProviders,
 
     /// Loaded the list of saved conversations for the /delete picker.
     DeleteConversationsListLoaded {

@@ -69,6 +69,53 @@ impl ChatWidget {
         self.bottom_pane.set_status_line(status_line);
     }
 
+    /// Show the shared "probing" spinner with `header`, without disturbing an
+    /// in-progress agent turn. Live steps arriving as
+    /// `AppEvent::CodexOsProbeProgress` refresh its detail as a small rolling
+    /// log so the user can see what is being probed instead of just waiting.
+    pub(crate) fn begin_probe_status(&mut self, header: String) {
+        if !self.bottom_pane.is_task_running() {
+            self.bottom_pane.set_task_running(true);
+            self.model_probe_spinner_active = true;
+        }
+        self.set_status(
+            header,
+            Some("starting…".to_string()),
+            StatusDetailsCapitalization::Preserve,
+            STATUS_DETAILS_DEFAULT_MAX_LINES,
+        );
+    }
+
+    /// Append one live probe-progress line to the spinner's rolling detail log,
+    /// preserving the current probe header.
+    pub(crate) fn on_codexos_probe_progress(&mut self, line: String) {
+        let header = self.status_state.current_status.header.clone();
+        let max = STATUS_DETAILS_DEFAULT_MAX_LINES.max(1);
+        let mut lines: Vec<String> = self
+            .status_state
+            .current_status
+            .details
+            .as_deref()
+            .map(|details| {
+                details
+                    .lines()
+                    .map(str::trim)
+                    .filter(|l| !l.is_empty() && *l != "starting…")
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default();
+        lines.push(line);
+        let start = lines.len().saturating_sub(max);
+        let details = lines[start..].join("\n");
+        self.set_status(
+            header,
+            Some(details),
+            StatusDetailsCapitalization::Preserve,
+            max,
+        );
+    }
+
     /// Sets the terminal hyperlink target for the currently rendered footer status line.
     pub(crate) fn set_status_line_hyperlink(&mut self, url: Option<String>) {
         self.bottom_pane.set_status_line_hyperlink(url);

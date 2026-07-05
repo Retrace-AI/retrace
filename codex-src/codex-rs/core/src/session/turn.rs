@@ -842,10 +842,13 @@ async fn build_active_exec_continuation_message(
     turn_context: &TurnContext,
     last_agent_message: Option<&str>,
 ) -> Option<ResponseItem> {
-    if !matches!(
-        turn_context.collaboration_mode.mode,
-        ModeKind::Default | ModeKind::ReadonlyResearch | ModeKind::AbsoluteRampage
-    ) {
+    // Only autonomous Rampage mode is force-continued while a background exec
+    // session is still live. Interactive modes (Default, Ask, ReadonlyResearch)
+    // have a human present who manages background terminals via /ps and /stop,
+    // so their turns must finalize and deliver the answer immediately rather than
+    // being pinned open (re-prompting the model to poll) until the background
+    // process exits.
+    if !matches!(turn_context.collaboration_mode.mode, ModeKind::AbsoluteRampage) {
         return None;
     }
     if !sess

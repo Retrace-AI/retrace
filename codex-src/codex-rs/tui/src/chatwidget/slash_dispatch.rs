@@ -30,9 +30,17 @@ use serde::Deserialize;
 use std::path::PathBuf;
 use std::process::ExitStatus;
 use std::process::Stdio;
+use tokio::io::AsyncBufReadExt;
+use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWriteExt;
+use tokio::io::BufReader;
 use tokio::process::Command;
 use url::Url;
+
+/// Sentinel row id used in the `/model add` multiselect for the "add a custom
+/// model / connect a new provider" entry. It is not a real model; selecting it
+/// routes to the provider-add prompt instead of the enable/disable apply.
+const ADD_CUSTOM_MODEL_SENTINEL: &str = "__retrace_add_custom_model__";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SlashCommandDispatchSource {
@@ -287,6 +295,83 @@ async fn run_codexos_local_command_checked(command: CodexOsLocalCommand) -> Resu
                 ));
                 Err(text)
             }
+        }
+        Err(err) => Err(format!("failed to run {}: {err}\n", program.display())),
+    }
+}
+
+/// Like [`run_codexos_local_command_checked`], but streams the child's **stderr**
+/// line-by-line to the UI as live probe-progress events while capturing its
+/// **stdout** for the returned display text. Provider/model capability probes
+/// (`retrace-admin models probe …`) emit their per-step progress on stderr and
+/// keep stdout for the human-readable summary, so this lets the user watch each
+/// step ("reasoning effort… streaming… cache…") instead of staring at a spinner.
+async fn run_codexos_local_command_streaming(
+    command: CodexOsLocalCommand,
+    tx: AppEventSender,
+) -> Result<String, String> {
+    let CodexOsLocalCommand {
+        label,
+        program,
+        args,
+    } = command;
+    let mut text = format!("$ {label}\n");
+    let mut child = match Command::new(&program)
+        .args(&args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(err) => return Err(format!("failed to run {}: {err}\n", program.display())),
+    };
+
+    // Forward each stderr line to the UI as a progress event as it arrives.
+    let stderr_task = child.stderr.take().map(|stderr| {
+        let tx = tx.clone();
+        tokio::spawn(async move {
+            let mut collected = String::new();
+            let mut lines = BufReader::new(stderr).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                let trimmed = line.trim();
+                if !trimmed.is_empty() {
+                    tx.send(AppEvent::CodexOsProbeProgress {
+                        line: trimmed.to_string(),
+                    });
+                }
+                collected.push_str(&line);
+                collected.push('\n');
+            }
+            collected
+        })
+    });
+
+    // Read stdout to completion (the human-readable summary).
+    let mut stdout_buf = Vec::new();
+    if let Some(mut stdout) = child.stdout.take() {
+        let _ = stdout.read_to_end(&mut stdout_buf).await;
+    }
+
+    let status = child.wait().await;
+    let stderr_text = match stderr_task {
+        Some(handle) => handle.await.unwrap_or_default(),
+        None => String::new(),
+    };
+
+    let stdout = String::from_utf8_lossy(&stdout_buf);
+    if !stdout.trim().is_empty() {
+        text.push_str(stdout.trim_end());
+        text.push('\n');
+    }
+    match status {
+        Ok(status) if status.success() => Ok(text),
+        Ok(status) => {
+            if !stderr_text.trim().is_empty() {
+                text.push_str(stderr_text.trim_end());
+                text.push('\n');
+            }
+            text.push_str(&format!("[exit status: {}]\n", codexos_status_display(status)));
+            Err(text)
         }
         Err(err) => Err(format!("failed to run {}: {err}\n", program.display())),
     }
@@ -565,6 +650,7 @@ fn codexos_model_row_from_json(row: CodexOsProviderModelJson) -> CodexOsProvider
 async fn configure_codexos_provider_models(
     provider_id: String,
     model_ids: Vec<String>,
+    tx: AppEventSender,
 ) -> Result<CodexOsProviderConfigureResult, String> {
     if model_ids.is_empty() {
         return Err("No models were selected.".to_string());
@@ -574,7 +660,9 @@ async fn configure_codexos_provider_models(
     let mut probe_args = vec!["models".to_string(), "probe".to_string()];
     probe_args.extend(model_ids.iter().cloned());
     probe_args.extend(["--provider".to_string(), provider_id.clone()]);
-    output.push_str(&run_codexos_local_command_checked(codexos_admin_command(probe_args)).await?);
+    output.push_str(
+        &run_codexos_local_command_streaming(codexos_admin_command(probe_args), tx.clone()).await?,
+    );
 
     let rows = list_codexos_provider_models(&provider_id).await?;
     let usable_model_ids: Vec<String> = if rows.is_empty() {
@@ -631,14 +719,20 @@ async fn configure_codexos_provider_models(
 
 /// Runs the live capability probe (thinking formats, effort levels, cache,
 /// streaming) for one model and returns the refreshed catalog for hot reload.
-async fn reprobe_codexos_model(model_id: String) -> Result<CodexOsProviderConfigureResult, String> {
+async fn reprobe_codexos_model(
+    model_id: String,
+    tx: AppEventSender,
+) -> Result<CodexOsProviderConfigureResult, String> {
     let mut output = format!("/model reprobe {model_id}\n\n");
     output.push_str(
-        &run_codexos_local_command_checked(codexos_admin_command(vec![
-            "models".to_string(),
-            "probe".to_string(),
-            model_id,
-        ]))
+        &run_codexos_local_command_streaming(
+            codexos_admin_command(vec![
+                "models".to_string(),
+                "probe".to_string(),
+                model_id,
+            ]),
+            tx.clone(),
+        )
         .await?,
     );
     let model_catalog = load_codexos_model_catalog()?;
@@ -654,6 +748,7 @@ async fn reprobe_codexos_model(model_id: String) -> Result<CodexOsProviderConfig
 async fn apply_model_add_selection(
     rows: Vec<CodexOsProviderModelRow>,
     selected_ids: Vec<String>,
+    tx: AppEventSender,
 ) -> Result<CodexOsProviderConfigureResult, String> {
     use std::collections::BTreeMap;
     use std::collections::HashSet;
@@ -680,8 +775,10 @@ async fn apply_model_add_selection(
         let mut probe_args = vec!["models".to_string(), "probe".to_string()];
         probe_args.extend(model_ids.iter().cloned());
         probe_args.extend(["--provider".to_string(), provider_id.clone()]);
-        output
-            .push_str(&run_codexos_local_command_checked(codexos_admin_command(probe_args)).await?);
+        output.push_str(
+            &run_codexos_local_command_streaming(codexos_admin_command(probe_args), tx.clone())
+                .await?,
+        );
         output.push('\n');
         let mut enable_args = vec!["models".to_string(), "enable".to_string()];
         enable_args.extend(model_ids.iter().cloned());
@@ -900,7 +997,7 @@ impl ChatWidget {
         });
     }
 
-    fn start_provider_remove_flow(&mut self, provider_id: Option<String>) {
+    pub(crate) fn start_provider_remove_flow(&mut self, provider_id: Option<String>) {
         self.add_info_message(
             "Loading providers and models".to_string(),
             Some(
@@ -1115,6 +1212,7 @@ impl ChatWidget {
             format!("Listing models for provider '{provider_id}'"),
             Some("Normalizing the URL, validating the API key, and fetching the model list. This can take a while.".to_string()),
         );
+        self.begin_probe_status(format!("Connecting to {provider_id}"));
     }
 
     pub(crate) fn on_codexos_provider_connected(
@@ -1122,6 +1220,9 @@ impl ChatWidget {
         provider_id: String,
         result: Result<Vec<CodexOsProviderModelRow>, String>,
     ) {
+        // The "Connecting…" probe spinner started in `on_codexos_provider_probe_started`
+        // is done now; clear it before showing the model picker or any message.
+        self.clear_model_probe_spinner();
         let rows = match result {
             Ok(rows) => rows,
             Err(message) => {
@@ -1201,9 +1302,11 @@ impl ChatWidget {
             ),
             Some("This runs selected-model capability probes. It can take a while.".to_string()),
         );
+        self.begin_probe_status(format!("Probing {} model(s) from {provider_id}", model_ids.len()));
         let tx = self.app_event_tx.clone();
         tokio::spawn(async move {
-            let result = configure_codexos_provider_models(provider_id, model_ids).await;
+            let result =
+                configure_codexos_provider_models(provider_id, model_ids, tx.clone()).await;
             tx.send(AppEvent::CodexOsProviderConfigured {
                 result,
                 success_message: Some("Selected provider models were added to /model.".to_string()),
@@ -1581,7 +1684,45 @@ impl ChatWidget {
     }
 
     /// `/delete` — enumerate saved conversations, then show a picker.
-    fn open_delete_conversations_picker(&mut self) {
+    /// Unified `/delete` entry: choose what to delete — conversations, or
+    /// models/providers — then route to the matching picker.
+    fn open_delete_target_picker(&mut self) {
+        let items = vec![
+            crate::bottom_pane::SelectionItem {
+                name: "Conversations".to_string(),
+                description: Some(
+                    "Delete a saved conversation, or all of them.".to_string(),
+                ),
+                actions: vec![Box::new(|tx| {
+                    tx.send(AppEvent::DeleteTargetConversations);
+                })],
+                dismiss_on_select: true,
+                ..Default::default()
+            },
+            crate::bottom_pane::SelectionItem {
+                name: "Models or a provider".to_string(),
+                description: Some(
+                    "Remove selected models from a provider, or remove a whole provider."
+                        .to_string(),
+                ),
+                actions: vec![Box::new(|tx| {
+                    tx.send(AppEvent::DeleteTargetProviders);
+                })],
+                dismiss_on_select: true,
+                ..Default::default()
+            },
+        ];
+        self.bottom_pane
+            .show_selection_view(crate::bottom_pane::SelectionViewParams {
+                title: Some("Delete".to_string()),
+                subtitle: Some("What do you want to delete?".to_string()),
+                footer_hint: Some(standard_popup_hint_line()),
+                items,
+                ..Default::default()
+            });
+    }
+
+    pub(crate) fn open_delete_conversations_picker(&mut self) {
         let codex_home = self.config.codex_home.as_path().to_path_buf();
         let tx = self.app_event_tx.clone();
         tokio::spawn(async move {
@@ -1732,26 +1873,35 @@ impl ChatWidget {
         };
         if rows.is_empty() {
             self.add_info_message(
-                "No models are registered yet.".to_string(),
-                Some("Use /provider (or the Add custom model entry in /model) to connect one.".to_string()),
+                "No models are registered yet — connect a provider to add one.".to_string(),
+                Some("Enter its API base URL, then its API key.".to_string()),
             );
+            self.open_codexos_provider_url_prompt(String::new());
             return;
         }
-        let items: Vec<MultiSelectItem> = rows
-            .iter()
-            .map(|row| MultiSelectItem {
-                id: row.id.clone(),
-                name: row.id.clone(),
-                description: Some(format!(
-                    "{}; {}",
-                    row.provider,
-                    codexos_model_registry_description(row)
-                )),
-                enabled: row.enabled,
-                orderable: false,
-                section_break_after: false,
-            })
-            .collect();
+        // First entry: connect a brand-new provider without leaving /model add.
+        let mut items: Vec<MultiSelectItem> = vec![MultiSelectItem {
+            id: ADD_CUSTOM_MODEL_SENTINEL.to_string(),
+            name: "➕ Add a custom model (connect a new provider)".to_string(),
+            description: Some(
+                "Select and press Enter to add a provider: enter its URL and API key, then pick models".to_string(),
+            ),
+            enabled: false,
+            orderable: false,
+            section_break_after: true,
+        }];
+        items.extend(rows.iter().map(|row| MultiSelectItem {
+            id: row.id.clone(),
+            name: row.id.clone(),
+            description: Some(format!(
+                "{}; {}",
+                row.provider,
+                codexos_model_registry_description(row)
+            )),
+            enabled: row.enabled,
+            orderable: false,
+            section_break_after: false,
+        }));
         let rows_for_event = rows.clone();
         let list_keymap = crate::keymap::RuntimeKeymap::from_config(&self.config.tui_keymap)
             .map(|keymap| keymap.list)
@@ -1771,6 +1921,12 @@ impl ChatWidget {
             Some(Line::from(format!("{selected} enabled")))
         })
         .on_confirm(move |ids, tx| {
+            // The "add a custom model" sentinel routes to the provider-add
+            // prompt instead of the enable/disable apply.
+            if ids.iter().any(|id| id == ADD_CUSTOM_MODEL_SENTINEL) {
+                tx.send(AppEvent::CodexOsOpenProviderPrompt);
+                return;
+            }
             tx.send(AppEvent::CodexOsModelAddSelectionConfirmed {
                 rows: rows_for_event.clone(),
                 model_ids: ids.to_vec(),
@@ -1790,13 +1946,10 @@ impl ChatWidget {
             "Applying model selection…".to_string(),
             Some("Newly added models are probed live before they are enabled.".to_string()),
         );
-        if !self.bottom_pane.is_task_running() {
-            self.bottom_pane.set_task_running(/*running*/ true);
-            self.model_probe_spinner_active = true;
-        }
+        self.begin_probe_status("Probing model capabilities".to_string());
         let tx = self.app_event_tx.clone();
         tokio::spawn(async move {
-            let result = apply_model_add_selection(rows, model_ids).await;
+            let result = apply_model_add_selection(rows, model_ids, tx.clone()).await;
             tx.send(AppEvent::CodexOsProviderConfigured {
                 result,
                 success_message: Some(
@@ -1888,15 +2041,12 @@ impl ChatWidget {
                     .to_string(),
             ),
         );
-        if !self.bottom_pane.is_task_running() {
-            self.bottom_pane.set_task_running(/*running*/ true);
-            self.model_probe_spinner_active = true;
-        }
+        self.begin_probe_status(format!("Probing {model_id}"));
         let tx = self.app_event_tx.clone();
         tokio::spawn(async move {
             let success_message =
                 format!("{model_id} probed; /model reflects the new capabilities.");
-            let result = reprobe_codexos_model(model_id).await;
+            let result = reprobe_codexos_model(model_id, tx.clone()).await;
             tx.send(AppEvent::CodexOsProviderConfigured {
                 result,
                 success_message: Some(success_message),
@@ -2059,7 +2209,7 @@ impl ChatWidget {
                 self.app_event_tx.send(AppEvent::OpenResumePicker);
             }
             SlashCommand::Delete => {
-                self.open_delete_conversations_picker();
+                self.open_delete_target_picker();
             }
             SlashCommand::Fork => {
                 self.app_event_tx.send(AppEvent::ForkCurrentSession);

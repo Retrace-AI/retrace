@@ -1282,7 +1282,7 @@ async function handleResponses(req, res, body) {
   await streamUpstreamIntoState(upstream.response, res, state);
 
   const maxAgentCheckRetries = agentCheckEnabled()
-    ? Number((process.env.RETRACE_AGENT_CHECK_RETRIES || process.env.CODEXOS_AGENT_CHECK_RETRIES) || "8")
+    ? Number((process.env.RETRACE_AGENT_CHECK_RETRIES || process.env.CODEXOS_AGENT_CHECK_RETRIES) || "50")
     : 0;
 
   for (let attempt = 0; attempt < maxAgentCheckRetries; attempt++) {
@@ -1301,9 +1301,9 @@ async function handleResponses(req, res, body) {
     }
     if (!retry.response.ok) break;
 
-    const separator = agentCheckShowNotes()
-      ? `\n\nAgent Check: the draft above was incomplete; continuing. Direction: ${check.direction || "complete the task"}\n\n`
-      : "\n\n";
+    // Always show the full Agent Check banner on retry so the user can see it
+    // working. (SHOW_NOTES no longer gates the retry banner.)
+    const separator = `\n\nAgent Check: the draft above was incomplete; continuing. Direction: ${check.direction || "complete the task"}\n\n`;
     emitTextDelta(state, res, separator);
     await streamUpstreamIntoState(retry.response, res, state);
   }

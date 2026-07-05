@@ -327,7 +327,12 @@ impl ChatWidget {
             now,
         );
         for cell in outcome.cells {
-            self.bottom_pane.hide_status_indicator();
+            // Keep the working spinner visible until the turn actually completes
+            // (user preference: it should not drop mid-stream before the final
+            // answer). Only hide it here when no turn is running.
+            if !self.turn_lifecycle.agent_turn_running {
+                self.bottom_pane.hide_status_indicator();
+            }
             self.add_boxed_history(cell);
         }
         self.sync_active_stream_tail();
@@ -429,7 +434,9 @@ impl ChatWidget {
                 return;
             }
 
-            self.bottom_pane.hide_status_indicator();
+            if !self.turn_lifecycle.agent_turn_running {
+                self.bottom_pane.hide_status_indicator();
+            }
             self.transcript.active_cell =
                 Some(Box::new(history_cell::StreamingAgentTailCell::new(
                     tail_lines,
@@ -446,7 +453,9 @@ impl ChatWidget {
                 return;
             }
 
-            self.bottom_pane.hide_status_indicator();
+            if !self.turn_lifecycle.agent_turn_running {
+                self.bottom_pane.hide_status_indicator();
+            }
             self.transcript.active_cell = Some(Box::new(history_cell::StreamingPlanTailCell::new(
                 tail_lines,
                 !controller.tail_starts_stream(),
