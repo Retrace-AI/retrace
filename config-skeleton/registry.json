@@ -1,8 +1,58 @@
 {
   "version": 1,
-  "defaultProvider": "",
-  "defaultModel": "",
-  "providers": {},
-  "modelOrder": [],
-  "models": {}
+  "defaultProvider": "pollinations",
+  "defaultModel": "openai",
+  "providers": {
+    "pollinations": {
+      "name": "Pollinations (free, no key)",
+      "baseUrl": "https://text.pollinations.ai/openai/v1",
+      "wireApi": "chat_completions",
+      "defaultContextWindow": 98304
+    }
+  },
+  "modelOrder": [
+    "openai"
+  ],
+  "models": {
+    "openai": {
+      "provider": "pollinations",
+      "upstreamModel": "openai",
+      "enabled": true,
+      "contextWindow": 98304,
+      "maxContextWindow": 98304,
+      "effectiveContextWindowPercent": 95,
+      "outputTokenLimit": null,
+      "thinking": "off",
+      "thinkingMethod": null,
+      "thinkingLevels": [],
+      "requestRecipe": {
+        "tokenParam": "max_tokens",
+        "temperature": false
+      },
+      "capabilities": {
+        "usable": true,
+        "thinking": false,
+        "acceptsTemperature": false,
+        "cache": {
+          "read": false,
+          "write": false,
+          "method": "none"
+        },
+        "streaming": {
+          "supported": false,
+          "reasoningDelta": "none"
+        },
+        "usageDialect": "openai",
+        "usageSample": {
+          "input": 313,
+          "output": 62,
+          "reasoning": 0,
+          "cacheRead": false,
+          "cacheWrite": false
+        }
+      },
+      "normalizeSystem": "off",
+      "displayName": "GPT-OSS 20B (free, no key)"
+    }
+  }
 }

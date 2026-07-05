@@ -90,11 +90,11 @@ install -m 0755 "$TMP/runtime/retrace-admin"            "$BIN_DIR/retrace-admin"
 
 # --- first-run config skeleton (never overwrite an existing one) -----------
 if [ ! -f "$RETRACE_HOME/config.toml" ]; then
-  say "Writing a fresh, empty config (no providers yet)..."
+  say "Writing config with a free, no-key model (GPT-OSS 20B via Pollinations)..."
   cp "$TMP/config-skeleton/config.toml"   "$RETRACE_HOME/config.toml"
   cp "$TMP/config-skeleton/registry.json" "$RETRACE_HOME/registry.json"
   cp "$TMP/config-skeleton/models.json"   "$RETRACE_HOME/models.json"
-  [ -f "$RETRACE_HOME/api_key" ] || printf 'placeholder-not-a-real-key\n' > "$RETRACE_HOME/api_key"
+  [ -f "$RETRACE_HOME/api_key" ] || printf 'local-proxy\n' > "$RETRACE_HOME/api_key"
   chmod 600 "$RETRACE_HOME/api_key"
 else
   say "Existing config found — leaving it untouched."
@@ -175,9 +175,9 @@ cat <<DONE
 
   Retrace installed.
 
-  Start it:      retrace
-  First step:    inside Retrace, run  /model  ->  "Add custom model"
-                 and enter your provider's URL + API key.
+  Start it:      retrace   (works immediately — free GPT-OSS 20B, no key)
+  Your model:    a free shared model is preconfigured. For speed, privacy, and
+                 stronger models, run  /model  ->  "Add custom model".
 
   Manage models: retrace-admin models list
   Browser:       set up by default (Playwright + Chrome, vision mode; Chrome

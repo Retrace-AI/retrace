@@ -1,12 +1,25 @@
 # Retrace starter config. Copy to ~/.retrace/config.toml.
-# No secrets live here — provider keys are stored separately and added via
-# `retrace` -> /model -> "Add custom model".
+# Ships with a free, no-key model (GPT-OSS 20B via Pollinations) so it works out
+# of the box. Add your own provider any time via `retrace` -> /model -> "Add
+# custom model" for speed, privacy, and stronger models.
 
 approval_policy = "on-request"
 sandbox_mode = "workspace-write"
 
-# The retrace launcher rewrites the provider base_url to the local proxy port
-# at startup, so you normally do not edit model_providers by hand.
+# The retrace launcher rewrites these base_url values to the local proxy port at
+# startup, so you normally do not edit model_providers by hand. name/env_key/
+# wire_api must be present — a partial provider (base_url only) fails to load.
+[model_providers.lumenatech]
+name = "Retrace Local Proxy"
+base_url = "http://127.0.0.1:48765/v1"
+env_key = "RETRACE_LOCAL_API_KEY"
+wire_api = "responses"
+
+[model_providers.openrouter]
+name = "OpenRouter via Local Proxy"
+base_url = "http://127.0.0.1:48765/v1"
+env_key = "RETRACE_LOCAL_API_KEY"
+wire_api = "responses"
 
 [tui]
 status_line = ["model-with-reasoning", "permissions", "context-remaining", "context-window-size", "total-input-tokens", "total-output-tokens", "total-cached-tokens", "task-progress"]
