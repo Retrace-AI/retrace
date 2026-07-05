@@ -17,14 +17,17 @@ PLIST_DEST="$HOME/Library/LaunchAgents/${PLIST_LABEL}.plist"
 SYSTEMD_UNIT="retrace-responses-proxy"
 SYSTEMD_DIR="$HOME/.config/systemd/user"
 
-# Opt-in browser control (Playwright MCP driving Chrome, vision/coordinate mode).
-# Enable with:  ... | bash -s -- --with-browser   or   RETRACE_WITH_BROWSER=1
-WITH_BROWSER="${RETRACE_WITH_BROWSER:-0}"
+# Browser control (Playwright MCP driving Chrome, vision/coordinate mode) is set
+# up by DEFAULT: the installer checks for Chrome and installs it if absent, then
+# wires the MCP. Opt out with  --no-browser  or  RETRACE_NO_BROWSER=1.
+WITH_BROWSER="${RETRACE_WITH_BROWSER:-1}"
 for arg in "$@"; do
   case "$arg" in
     --with-browser) WITH_BROWSER=1 ;;
+    --no-browser)   WITH_BROWSER=0 ;;
   esac
 done
+[ "${RETRACE_NO_BROWSER:-0}" = "1" ] && WITH_BROWSER=0
 
 say()  { printf '\033[1;36m==>\033[0m %s\n' "$1"; }
 warn() { printf '\033[1;33m warning:\033[0m %s\n' "$1" >&2; }
@@ -177,8 +180,8 @@ cat <<DONE
                  and enter your provider's URL + API key.
 
   Manage models: retrace-admin models list
-  Browser use:   re-run with  --with-browser  to let the model drive Chrome
-                 (Playwright, vision/coordinate mode; installs Chrome if missing)
+  Browser:       set up by default (Playwright + Chrome, vision mode; Chrome
+                 auto-installed if missing). Skip next time with  --no-browser.
   Uninstall:     ${UNINSTALL}
 
 DONE

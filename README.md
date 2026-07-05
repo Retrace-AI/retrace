@@ -27,16 +27,19 @@ On first launch there are no models configured — inside Retrace, run **`/model
 > **macOS** (launchd) and **Linux x86_64** (systemd + `zsh`). Windows is on the
 > roadmap.
 
-### Optional: let the model drive a browser
+### Browser control (on by default)
+
+The installer sets up a [Playwright](https://github.com/microsoft/playwright-mcp)
+MCP that controls **Google Chrome** in **vision mode** — the model clicks by
+screen coordinates (`browser_mouse_click_xy`), which suits vision/grounding
+models. It checks for Chrome and **installs it if missing**. (Best with a
+vision-capable model.)
+
+Don't want it? Opt out:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/Retrace-AI/retrace/main/install.sh | bash -s -- --with-browser
+curl -fsSL https://raw.githubusercontent.com/Retrace-AI/retrace/main/install.sh | bash -s -- --no-browser
 ```
-
-Adds a [Playwright](https://github.com/microsoft/playwright-mcp) MCP that controls
-**Google Chrome** in **vision mode** — the model clicks by screen coordinates
-(`browser_mouse_click_xy`), which suits vision/grounding models. Installs Chrome if
-it isn't already present. (Best with a vision-capable model.)
 
 ## What Retrace adds over Codex
 
