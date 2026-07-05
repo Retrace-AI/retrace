@@ -1131,7 +1131,18 @@ function parseAgentCheck(text) {
       direction: typeof parsed.direction === "string" ? parsed.direction : "",
     };
   } catch {
-    return { answered: true, direction: "" };
+    // Judges (especially weak models) sometimes wrap or mangle the JSON.
+    // Fall back to a regex scan before giving up, and mark unparseable
+    // verdicts so the caller can log them instead of silently passing.
+    const answeredMatch = trimmed.match(/"answered"\s*:\s*(true|false)/i);
+    if (answeredMatch) {
+      const directionMatch = trimmed.match(/"direction"\s*:\s*"([^"]*)"/i);
+      return {
+        answered: answeredMatch[1].toLowerCase() === "true",
+        direction: directionMatch ? directionMatch[1] : "",
+      };
+    }
+    return { answered: true, direction: "", unparseable: true };
   }
 }
 
@@ -1186,7 +1197,10 @@ function looksLikeLeakedToolCall(text) {
 }
 
 function shouldRunAgentCheck(state) {
-  return state.text.trim() && state.toolCalls.size === 0;
+  // Eligible whenever the model produced no tool call. This includes an EMPTY
+  // final answer, which is itself a non-answer that should be retried rather
+  // than silently ending the turn.
+  return state.toolCalls.size === 0;
 }
 
 async function runAgentCheck(body, state) {
@@ -1219,9 +1233,16 @@ async function runAgentCheck(body, state) {
   };
 
   const upstream = await upstreamChat(checkBody, false);
-  if (!upstream.response.ok) return { answered: true, direction: "" };
+  if (!upstream.response.ok) {
+    console.error(`[agentcheck] judge call failed (${upstream.response.status}); passing by default`);
+    return { answered: true, direction: "" };
+  }
   const checkState = await collectChatToResponse(upstream.response, body.model);
-  return parseAgentCheck(checkState.text);
+  const verdict = parseAgentCheck(checkState.text);
+  if (verdict.unparseable) {
+    console.error(`[agentcheck] judge verdict unparseable; passing by default: ${JSON.stringify(String(checkState.text || "").slice(0, 160))}`);
+  }
+  return verdict;
 }
 
 function bodyWithAgentCheckFeedback(body, state, check) {
@@ -1309,7 +1330,14 @@ async function handleResponses(req, res, body) {
     // A leaked/malformed tool call is never a valid final answer. Force a retry
     // without spending a judge call so the turn never ends on that garbage.
     let check;
-    if (looksLikeLeakedToolCall(state.text)) {
+    if (!state.text.trim()) {
+      check = {
+        answered: false,
+        direction:
+          "Your previous response was empty. Provide the completed final answer to the user's request now.",
+      };
+      console.error(`[agentcheck] attempt ${attempt + 1}: empty draft, forcing retry`);
+    } else if (looksLikeLeakedToolCall(state.text)) {
       check = {
         answered: false,
         direction:
@@ -1345,8 +1373,11 @@ async function handleResponses(req, res, body) {
   }
 
   // Always-visible tag so the user can see Agent Check ran (the spinner shows
-  // the "working" activity during the check itself).
-  if (agentCheckRan) {
+  // the "working" activity during the check itself). If a retry produced a
+  // proper tool call, the turn continues with tool execution — that is
+  // progress, not exhaustion, so no verdict tag yet (the eventual final
+  // answer gets checked again on the next round-trip).
+  if (agentCheckRan && state.toolCalls.size === 0) {
     emitTextDelta(
       state,
       res,
