@@ -1,7 +1,7 @@
 {
   "version": 1,
   "defaultProvider": "pollinations",
-  "defaultModel": "openai",
+  "defaultModel": "gpt-oss-20b",
   "providers": {
     "pollinations": {
       "name": "Pollinations (free, no key)",
@@ -11,10 +11,10 @@
     }
   },
   "modelOrder": [
-    "openai"
+    "gpt-oss-20b"
   ],
   "models": {
-    "openai": {
+    "gpt-oss-20b": {
       "provider": "pollinations",
       "upstreamModel": "openai",
       "enabled": true,

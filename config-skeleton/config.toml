@@ -6,6 +6,12 @@
 approval_policy = "on-request"
 sandbox_mode = "workspace-write"
 
+# Active model + provider. model_provider must point at the local proxy provider
+# (not the built-in "openai" one) so Retrace does NOT show the OpenAI sign-in
+# screen — the local proxy needs no OpenAI auth.
+model = "gpt-oss-20b"
+model_provider = "lumenatech"
+
 # The retrace launcher rewrites these base_url values to the local proxy port at
 # startup, so you normally do not edit model_providers by hand. name/env_key/
 # wire_api must be present — a partial provider (base_url only) fails to load.
