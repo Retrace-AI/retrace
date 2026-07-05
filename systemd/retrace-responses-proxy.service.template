@@ -1,0 +1,28 @@
+# Retrace responses proxy — systemd --user unit (Linux).
+# Installed to ~/.config/systemd/user/ by install.sh, then:
+#   loginctl enable-linger "$USER"
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now retrace-responses-proxy
+[Unit]
+Description=Retrace responses proxy
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=__NODE__ __HOME__/.retrace/responses-chat-proxy.mjs
+WorkingDirectory=__HOME__/.retrace
+Environment=RETRACE_PROXY_HOST=127.0.0.1
+Environment=RETRACE_PROXY_PORT=48765
+Environment=RETRACE_API_KEY_FILE=__HOME__/.retrace/api_key
+Environment=RETRACE_MODEL_CATALOG_JSON=__HOME__/.retrace/models.json
+Environment=RETRACE_REGISTRY_JSON=__HOME__/.retrace/registry.json
+Environment=RETRACE_AGENT_CHECK_FILE=__HOME__/.retrace/agentcheck
+Environment=PATH=__NODE_DIR__:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin
+Restart=always
+RestartSec=2
+StandardOutput=append:__HOME__/.retrace/retrace-proxy-48765.out.log
+StandardError=append:__HOME__/.retrace/retrace-proxy-48765.err.log
+
+[Install]
+WantedBy=default.target

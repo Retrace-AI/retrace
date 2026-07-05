@@ -101,3 +101,8 @@ insta = { workspace = true }
 predicates = { workspace = true }
 pretty_assertions = { workspace = true }
 sqlx = { workspace = true }
+
+# Linux: statically vendor OpenSSL so the binary is self-contained and does not
+# require libssl-dev on the build host or target. (native-tls -> openssl-sys.)
+[target.'cfg(target_os = "linux")'.dependencies]
+openssl = { version = "0.10", features = ["vendored"] }

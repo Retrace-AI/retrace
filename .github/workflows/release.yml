@@ -45,3 +45,31 @@ jobs:
       - uses: softprops/action-gh-release@v2
         with:
           files: retrace-macos-${{ matrix.arch }}.tar.gz
+
+  build-linux:
+    runs-on: ubuntu-latest      # x86_64
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: codex-src/codex-rs
+      - name: Build release binary
+        working-directory: codex-src/codex-rs
+        # OpenSSL is vendored (statically compiled) on Linux via cli/Cargo.toml,
+        # so no libssl-dev is needed and the binary is self-contained. perl +
+        # a C compiler (present on the runner) are required for the vendored build.
+        run: cargo build --release -p codex-cli --bin retrace
+      - name: Assemble tarball
+        run: |
+          set -euo pipefail
+          STAGE="$(mktemp -d)"
+          cp codex-src/codex-rs/target/release/retrace "$STAGE/retrace-bin"
+          cp -R runtime "$STAGE/runtime"
+          cp -R config-skeleton "$STAGE/config-skeleton"
+          mkdir -p "$STAGE/systemd"
+          cp systemd/retrace-responses-proxy.service.template "$STAGE/systemd/"
+          tar -czf "retrace-linux-x86_64.tar.gz" -C "$STAGE" .
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: retrace-linux-x86_64.tar.gz

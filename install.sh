@@ -5,7 +5,7 @@
 #   curl -fsSL https://raw.githubusercontent.com/Retrace-AI/retrace/main/install.sh | bash
 #
 # Installs the Retrace CLI: a local-first, provider-agnostic coding agent.
-# macOS only for v1 (uses launchd + Seatbelt sandbox).
+# macOS (launchd) and Linux/x86_64 (systemd --user) are supported.
 
 set -euo pipefail
 
@@ -14,6 +14,8 @@ RETRACE_HOME="${RETRACE_HOME:-$HOME/.retrace}"
 BIN_DIR="${RETRACE_BIN_DIR:-$HOME/.local/bin}"
 PLIST_LABEL="com.retrace.responses-proxy"
 PLIST_DEST="$HOME/Library/LaunchAgents/${PLIST_LABEL}.plist"
+SYSTEMD_UNIT="retrace-responses-proxy"
+SYSTEMD_DIR="$HOME/.config/systemd/user"
 
 # Opt-in browser control (Playwright MCP driving Chrome, vision/coordinate mode).
 # Enable with:  ... | bash -s -- --with-browser   or   RETRACE_WITH_BROWSER=1
@@ -29,42 +31,59 @@ warn() { printf '\033[1;33m warning:\033[0m %s\n' "$1" >&2; }
 die()  { printf '\033[1;31m error:\033[0m %s\n' "$1" >&2; exit 1; }
 
 # --- preflight -------------------------------------------------------------
-[ "$(uname -s)" = "Darwin" ] || die "Retrace v1 supports macOS only. Linux/Windows are on the roadmap."
-command -v node >/dev/null 2>&1 || die "Node.js is required (for the local proxy). Install it (e.g. 'brew install node') and re-run."
+OS="$(uname -s)"
+case "$OS" in
+  Darwin) PLATFORM="macos" ;;
+  Linux)  PLATFORM="linux" ;;
+  *) die "Unsupported OS: $OS. Retrace supports macOS and Linux." ;;
+esac
+
+command -v node >/dev/null 2>&1 || die "Node.js is required (for the local proxy). Install it and re-run."
 command -v curl >/dev/null 2>&1 || die "curl is required."
+command -v zsh  >/dev/null 2>&1 || die "zsh is required (the retrace launcher is a zsh script). Install it (e.g. 'apt install zsh') and re-run."
 NODE_BIN="$(command -v node)"
 NODE_DIR="$(dirname "$NODE_BIN")"
 
-ARCH="$(uname -m)"   # arm64 or x86_64
+ARCH="$(uname -m)"   # arm64 / aarch64 / x86_64
 case "$ARCH" in
   arm64|aarch64) ASSET_ARCH="aarch64" ;;
   x86_64|amd64)  ASSET_ARCH="x86_64" ;;
   *) die "Unsupported architecture: $ARCH" ;;
 esac
 
-say "Installing Retrace to $RETRACE_HOME"
-mkdir -p "$RETRACE_HOME/bin" "$BIN_DIR" "$HOME/Library/LaunchAgents"
+if [ "$PLATFORM" = "linux" ] && [ "$ASSET_ARCH" != "x86_64" ]; then
+  die "Linux builds are x86_64 only for now (got $ARCH)."
+fi
+if [ "$PLATFORM" = "linux" ] && ! command -v systemctl >/dev/null 2>&1; then
+  die "systemd (systemctl) is required to run the proxy service on Linux."
+fi
+
+ASSET="retrace-${PLATFORM}-${ASSET_ARCH}.tar.gz"
+
+say "Installing Retrace ($PLATFORM/$ASSET_ARCH) to $RETRACE_HOME"
+mkdir -p "$RETRACE_HOME/bin" "$BIN_DIR"
+[ "$PLATFORM" = "macos" ] && mkdir -p "$HOME/Library/LaunchAgents"
+[ "$PLATFORM" = "linux" ] && mkdir -p "$SYSTEMD_DIR"
 
 # --- resolve latest release tarball ----------------------------------------
 say "Finding the latest release..."
 TAG="$(curl -fsSL "https://api.github.com/repos/${REPO}/releases/latest" \
   | grep -m1 '"tag_name"' | sed -E 's/.*"tag_name": *"([^"]+)".*/\1/')" || true
 [ -n "${TAG:-}" ] || die "No published release found yet for ${REPO}."
-ASSET="retrace-macos-${ASSET_ARCH}.tar.gz"
 URL="https://github.com/${REPO}/releases/download/${TAG}/${ASSET}"
 
 TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
 say "Downloading ${ASSET} (${TAG})..."
-curl -fsSL "$URL" -o "$TMP/retrace.tar.gz" || die "Download failed: $URL"
+curl -fsSL "$URL" -o "$TMP/retrace.tar.gz" || die "Download failed: $URL (no ${PLATFORM}/${ASSET_ARCH} build in ${TAG}?)"
 tar -xzf "$TMP/retrace.tar.gz" -C "$TMP"
 
-# Tarball layout: retrace-bin, runtime/*, config-skeleton/*, launchd template
+# Tarball layout: retrace-bin, runtime/*, config-skeleton/*, service template
 say "Installing binary and runtime..."
-install -m 0755 "$TMP/retrace-bin"                 "$RETRACE_HOME/bin/retrace-bin"
+install -m 0755 "$TMP/retrace-bin"                      "$RETRACE_HOME/bin/retrace-bin"
 install -m 0644 "$TMP/runtime/responses-chat-proxy.mjs" "$RETRACE_HOME/responses-chat-proxy.mjs"
-install -m 0755 "$TMP/runtime/retrace-admin.mjs"   "$RETRACE_HOME/bin/retrace-admin.mjs"
-install -m 0755 "$TMP/runtime/retrace"             "$BIN_DIR/retrace"
-install -m 0755 "$TMP/runtime/retrace-admin"       "$BIN_DIR/retrace-admin"
+install -m 0755 "$TMP/runtime/retrace-admin.mjs"        "$RETRACE_HOME/bin/retrace-admin.mjs"
+install -m 0755 "$TMP/runtime/retrace"                  "$BIN_DIR/retrace"
+install -m 0755 "$TMP/runtime/retrace-admin"            "$BIN_DIR/retrace-admin"
 
 # --- first-run config skeleton (never overwrite an existing one) -----------
 if [ ! -f "$RETRACE_HOME/config.toml" ]; then
@@ -86,9 +105,13 @@ setup_browser_mcp() {
     return
   fi
   # Playwright's --browser chrome drives real Google Chrome. Install it if absent.
-  if [ ! -d "/Applications/Google Chrome.app" ] && ! command -v google-chrome >/dev/null 2>&1; then
+  local have_chrome=0
+  [ -d "/Applications/Google Chrome.app" ] && have_chrome=1
+  command -v google-chrome >/dev/null 2>&1 && have_chrome=1
+  command -v google-chrome-stable >/dev/null 2>&1 && have_chrome=1
+  if [ "$have_chrome" = "0" ]; then
     say "Chrome not found — installing it for browser control..."
-    if command -v brew >/dev/null 2>&1; then
+    if [ "$PLATFORM" = "macos" ] && command -v brew >/dev/null 2>&1; then
       brew install --cask google-chrome || warn "Chrome install via Homebrew failed."
     else
       npx -y playwright install chrome >/dev/null 2>&1 \
@@ -111,14 +134,26 @@ if [ "$WITH_BROWSER" = "1" ]; then
   setup_browser_mcp
 fi
 
-# --- launchd proxy agent ----------------------------------------------------
+# --- proxy service ---------------------------------------------------------
 say "Setting up the local proxy service..."
-sed -e "s#__NODE__#${NODE_BIN}#g" \
-    -e "s#__NODE_DIR__#${NODE_DIR}#g" \
-    -e "s#__HOME__#${HOME}#g" \
-    "$TMP/launchd/com.retrace.responses-proxy.plist.template" > "$PLIST_DEST"
-launchctl bootout   "gui/$(id -u)/${PLIST_LABEL}" 2>/dev/null || true
-launchctl bootstrap "gui/$(id -u)" "$PLIST_DEST" 2>/dev/null || launchctl load "$PLIST_DEST" 2>/dev/null || true
+if [ "$PLATFORM" = "macos" ]; then
+  sed -e "s#__NODE__#${NODE_BIN}#g" \
+      -e "s#__NODE_DIR__#${NODE_DIR}#g" \
+      -e "s#__HOME__#${HOME}#g" \
+      "$TMP/launchd/com.retrace.responses-proxy.plist.template" > "$PLIST_DEST"
+  launchctl bootout   "gui/$(id -u)/${PLIST_LABEL}" 2>/dev/null || true
+  launchctl bootstrap "gui/$(id -u)" "$PLIST_DEST" 2>/dev/null || launchctl load "$PLIST_DEST" 2>/dev/null || true
+else
+  sed -e "s#__NODE__#${NODE_BIN}#g" \
+      -e "s#__NODE_DIR__#${NODE_DIR}#g" \
+      -e "s#__HOME__#${HOME}#g" \
+      "$TMP/systemd/${SYSTEMD_UNIT}.service.template" > "$SYSTEMD_DIR/${SYSTEMD_UNIT}.service"
+  # Keep the user service running without an active login session.
+  loginctl enable-linger "$USER" 2>/dev/null || warn "Could not enable linger; the proxy may stop when you log out."
+  systemctl --user daemon-reload 2>/dev/null || true
+  systemctl --user enable --now "${SYSTEMD_UNIT}.service" 2>/dev/null \
+    || warn "Could not start the proxy via systemctl --user. Start it manually: systemctl --user enable --now ${SYSTEMD_UNIT}"
+fi
 
 # --- PATH hint --------------------------------------------------------------
 case ":$PATH:" in
@@ -126,6 +161,12 @@ case ":$PATH:" in
   *) warn "$BIN_DIR is not on your PATH. Add this to your shell profile:"
      printf '\n    export PATH="%s:$PATH"\n\n' "$BIN_DIR" ;;
 esac
+
+if [ "$PLATFORM" = "macos" ]; then
+  UNINSTALL="launchctl bootout gui/$(id -u)/${PLIST_LABEL}; rm -rf \"$RETRACE_HOME\" \"$BIN_DIR/retrace\" \"$BIN_DIR/retrace-admin\" \"$PLIST_DEST\""
+else
+  UNINSTALL="systemctl --user disable --now ${SYSTEMD_UNIT}; rm -rf \"$RETRACE_HOME\" \"$BIN_DIR/retrace\" \"$BIN_DIR/retrace-admin\" \"$SYSTEMD_DIR/${SYSTEMD_UNIT}.service\""
+fi
 
 cat <<DONE
 
@@ -138,6 +179,6 @@ cat <<DONE
   Manage models: retrace-admin models list
   Browser use:   re-run with  --with-browser  to let the model drive Chrome
                  (Playwright, vision/coordinate mode; installs Chrome if missing)
-  Uninstall:     launchctl bootout gui/$(id -u)/${PLIST_LABEL}; rm -rf "$RETRACE_HOME" "$BIN_DIR/retrace" "$BIN_DIR/retrace-admin" "$PLIST_DEST"
+  Uninstall:     ${UNINSTALL}
 
 DONE
