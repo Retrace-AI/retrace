@@ -156,7 +156,7 @@ function serperCompatibilityHint(body) {
 - The Serper MCP server is configured in CODEX_HOME as "serper".
 - Serper exposes MCP tools, not MCP resources. Do not call list_mcp_resources to decide whether Serper is configured.
 - Prefer the Serper MCP tool "google_search" for web searches and "scrape" for fetching result pages when those tools are available.
-- If direct Serper MCP tools are not exposed, run ${HOME}/.retrace/bin/serper-google-search with the query. It uses the configured SERPER_API_KEY and Google's Serper backend.
+- If direct Serper MCP tools are not exposed, run ${process.env.HOME}/.retrace/bin/serper-google-search with the query. It uses the configured SERPER_API_KEY and Google's Serper backend.
 - Do not use DuckDuckGo, Brave, Bing, or generic curl search pages for --search requests.
 - If direct Serper MCP tools are not exposed in this Chitti-backed session, say that the configured Serper server is not exposed to the current tool surface; do not say it is unconfigured.`;
 }
