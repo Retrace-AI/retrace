@@ -884,6 +884,9 @@ function buildModelEntry(template, modelId, config, registry) {
     effort,
     description: reasoningDescription(effort),
   }));
+  // Expose MCP tools directly (browser, etc.) instead of deferring them behind
+  // tool-search, which weaker models cannot drive. See mcp_tool_exposure.rs.
+  entry.supports_search_tool = false;
   return entry;
 }
 

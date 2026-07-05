@@ -245,18 +245,36 @@ function responsesInputToChatMessages(body) {
   return instructions ? [{ role: "system", content: instructions }, ...messages] : messages;
 }
 
+function pushChatFunction(chatTools, name, description, parameters) {
+  if (!name) return;
+  chatTools.push({
+    type: "function",
+    function: {
+      name,
+      description: description || "",
+      parameters: parameters || { type: "object", properties: {} },
+    },
+  });
+}
+
 function responsesToolsToChatTools(tools) {
   const chatTools = [];
   for (const tool of tools || []) {
-    if (!tool || tool.type !== "function" || !tool.name) continue;
-    chatTools.push({
-      type: "function",
-      function: {
-        name: tool.name,
-        description: tool.description || "",
-        parameters: tool.parameters || { type: "object", properties: {} },
-      },
-    });
+    if (!tool) continue;
+    if (tool.type === "function") {
+      pushChatFunction(chatTools, tool.name, tool.description, tool.parameters);
+    } else if (tool.type === "namespace" && Array.isArray(tool.tools)) {
+      // Expand namespace tools (e.g. mcp__browser) into individual chat
+      // functions; a plain chat/completions model cannot call nested
+      // Responses-API namespace tools, so flatten each sub-tool.
+      for (const sub of tool.tools) {
+        if (sub && sub.type === "function") {
+          pushChatFunction(chatTools, sub.name, sub.description, sub.parameters);
+        }
+      }
+    }
+    // Other types (e.g. freeform "custom" tools like apply_patch) are described
+    // in the base instructions and intentionally not sent as chat tools.
   }
   return chatTools;
 }
