@@ -442,6 +442,7 @@ impl ChatWidget {
         if !self.warning_display_state.should_display(&message) {
             return;
         }
+        let message = super::warnings::augment_warning(message);
         self.add_to_history(history_cell::new_warning_event(message));
         self.request_redraw();
     }

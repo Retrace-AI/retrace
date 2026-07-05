@@ -125,11 +125,12 @@ setup_browser_mcp() {
   cat >> "$cfg" <<'TOML'
 
 # Browser control for the model (Playwright driving Chrome).
-# Vision mode exposes coordinate tools (browser_mouse_click_xy, ...), suited to
-# grounding/vision models that emit x,y. Requires a vision-capable model.
+# DOM/accessibility mode: the model reads a page snapshot and clicks elements by
+# reference — works with text models. For coordinate/vision models, add
+#   "--caps", "vision"   to args (exposes browser_mouse_click_xy).
 [mcp_servers.browser]
 command = "npx"
-args = ["-y", "@playwright/mcp@latest", "--browser", "chrome", "--caps", "vision"]
+args = ["-y", "@playwright/mcp@latest", "--browser", "chrome"]
 TOML
 }
 

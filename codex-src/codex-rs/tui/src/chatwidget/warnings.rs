@@ -21,3 +21,16 @@ fn fallback_model_metadata_warning_slug(message: &str) -> Option<&str> {
         .strip_prefix(FALLBACK_MODEL_METADATA_WARNING_PREFIX)?
         .strip_suffix(FALLBACK_MODEL_METADATA_WARNING_SUFFIX)
 }
+
+/// Append an actionable hint to the fallback-metadata warning at display time.
+/// The core message is left unchanged (so dedup matching still works); this only
+/// affects what the user sees.
+pub(super) fn augment_warning(message: String) -> String {
+    if fallback_model_metadata_warning_slug(&message).is_some() {
+        format!(
+            "{message} Quit and relaunch this session to load the model's metadata."
+        )
+    } else {
+        message
+    }
+}
