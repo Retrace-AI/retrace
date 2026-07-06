@@ -91,14 +91,27 @@ RETRACE_PORT="$(tr -d '\n' < "$RETRACE_READY_FILE")"
 export CODEX_HOME="$RETRACE_HOME"
 export RETRACE_LOCAL_API_KEY="local-proxy"
 
-RETRACE_MODEL_ARGS=()
-if [[ -n "$RETRACE_MODEL" ]]; then
-  RETRACE_MODEL_ARGS=(--model "$RETRACE_MODEL")
+# Pin the model + provider and force them as `-c` overrides below. A `-c` value
+# beats config.toml, config profiles, and environment — so a machine that
+# already has OpenAI Codex installed (a stray profile / CODEX_* setting / soft
+# default) can never fall the fork back to its built-in gpt-5.5 default. Source
+# order: $RETRACE_MODEL env -> config.toml `model` -> registry `defaultModel`.
+RETRACE_PINNED_MODEL="$RETRACE_MODEL"
+if [[ -z "$RETRACE_PINNED_MODEL" ]]; then
+  RETRACE_PINNED_MODEL="$(sed -nE 's/^[[:space:]]*model[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p' "$RETRACE_HOME/config.toml" 2>/dev/null | head -1)"
 fi
+if [[ -z "$RETRACE_PINNED_MODEL" ]]; then
+  RETRACE_PINNED_MODEL="$(sed -nE 's/.*"defaultModel"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/p' "$RETRACE_HOME/registry.json" 2>/dev/null | head -1)"
+fi
+[[ -z "$RETRACE_PINNED_MODEL" ]] && RETRACE_PINNED_MODEL="gpt-oss-20b"
+
+RETRACE_PINNED_PROVIDER="$(sed -nE 's/^[[:space:]]*model_provider[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p' "$RETRACE_HOME/config.toml" 2>/dev/null | head -1)"
+[[ -z "$RETRACE_PINNED_PROVIDER" ]] && RETRACE_PINNED_PROVIDER="lumenatech"
 
 "$RETRACE_BIN" \
   --sandbox "$RETRACE_SANDBOX" \
-  "${RETRACE_MODEL_ARGS[@]}" \
+  -c "model=\"$RETRACE_PINNED_MODEL\"" \
+  -c "model_provider=\"$RETRACE_PINNED_PROVIDER\"" \
   -c "mcp_servers.supabase.url=\"https://mcp.supabase.com/mcp\"" \
   -c "mcp_servers.supabase.enabled=false" \
   -c "model_catalog_json=\"$RETRACE_HOME/models.json\"" \
