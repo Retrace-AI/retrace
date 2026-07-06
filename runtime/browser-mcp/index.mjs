@@ -62,15 +62,21 @@ function clearProfileLocks() {
 // fake cursor that glides to each click, a click ripple, and a red-dot favicon.
 // All elements carry data-retrace-ui so we can hide them during screenshots —
 // the model always sees the clean page, only a human watching sees the overlay.
+const OVERLAY_COLOR = process.env.RETRACE_BROWSER_OVERLAY_COLOR || "108,92,231"; // R,G,B (purple)
+const TITLE_PREFIX = "🔴 Retrace · "; // "🔴 Retrace · "
 const OVERLAY_JS = `(() => {
   if (window.__retraceUIInstalled) return;
   window.__retraceUIInstalled = true;
-  var BID='__retrace_banner', CID='__retrace_cursor';
+  var BID='__retrace_banner', CID='__retrace_cursor', FID='__retrace_frame';
+  var RGB='${OVERLAY_COLOR}', PFX=${JSON.stringify(TITLE_PREFIX)};
   function favicon(){ try{
     var l=document.querySelector("link[rel~='icon']")||document.createElement('link');
     l.rel='icon'; l.type='image/svg+xml';
     l.href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Ccircle cx='8' cy='8' r='7' fill='%23E5484D'/%3E%3C/svg%3E";
     if(!l.parentNode&&document.head) document.head.appendChild(l);
+  }catch(e){} }
+  function title(){ try{
+    if(document.title.indexOf(PFX)!==0) document.title = PFX + document.title.replace(PFX,'');
   }catch(e){} }
   function build(){
     if(!document.body) return;
@@ -79,31 +85,41 @@ const OVERLAY_JS = `(() => {
       st.textContent='@keyframes __rtcpulse{0%,100%{opacity:1}50%{opacity:.3}}@keyframes __rtcring{0%{transform:translate(-50%,-50%) scale(.3);opacity:.7}100%{transform:translate(-50%,-50%) scale(1.7);opacity:0}}';
       (document.head||document.documentElement).appendChild(st);
     }
+    // Translucent colored frame over the whole viewport (a light wash + glowing border).
+    if(!document.getElementById(FID)){
+      var f=document.createElement('div'); f.id=FID; f.setAttribute('data-retrace-ui','1');
+      var fs=f.style; fs.position='fixed'; fs.inset='0'; fs.zIndex='2147483646'; fs.pointerEvents='none';
+      fs.background='rgba('+RGB+',0.06)';
+      fs.boxShadow='inset 0 0 0 3px rgba('+RGB+',0.75), inset 0 0 34px rgba('+RGB+',0.28)';
+      document.documentElement.appendChild(f);
+    }
     if(!document.getElementById(BID)){
       var b=document.createElement('div'); b.id=BID; b.setAttribute('data-retrace-ui','1');
-      b.innerHTML="<span style='display:inline-block;width:9px;height:9px;border-radius:50%;background:#E5484D;margin-right:8px;box-shadow:0 0 6px #E5484D;animation:__rtcpulse 1.2s infinite;vertical-align:middle'></span>Retrace is controlling this browser";
+      b.innerHTML="<span style='display:inline-block;width:9px;height:9px;border-radius:50%;background:#fff;margin-right:8px;box-shadow:0 0 6px #fff;animation:__rtcpulse 1.2s infinite;vertical-align:middle'></span>Retrace is controlling this browser";
       var s=b.style; s.position='fixed'; s.top='0'; s.left='0'; s.right='0'; s.zIndex='2147483647';
-      s.background='rgba(18,18,24,0.86)'; s.color='#fff'; s.font='600 12.5px -apple-system,BlinkMacSystemFont,system-ui,sans-serif';
-      s.padding='6px 12px'; s.textAlign='center'; s.pointerEvents='none'; s.letterSpacing='.2px'; s.borderBottom='2px solid #6C5CE7';
+      s.background='rgba('+RGB+',0.55)'; s.color='#fff'; s.font='600 12.5px -apple-system,BlinkMacSystemFont,system-ui,sans-serif';
+      s.padding='6px 12px'; s.textAlign='center'; s.pointerEvents='none'; s.letterSpacing='.2px';
+      s.borderBottom='1px solid rgba('+RGB+',0.9)'; s.backdropFilter='blur(3px)'; s.webkitBackdropFilter='blur(3px)';
+      s.textShadow='0 1px 2px rgba(0,0,0,.4)';
       document.documentElement.appendChild(b);
     }
     if(!document.getElementById(CID)){
       var c=document.createElement('div'); c.id=CID; c.setAttribute('data-retrace-ui','1');
-      c.innerHTML="<svg width='24' height='24' viewBox='0 0 24 24' style='filter:drop-shadow(0 1px 2px rgba(0,0,0,.5))'><path d='M4 2 L4 20 L9 15 L12.5 22 L15 21 L11.5 14 L18 14 Z' fill='%23fff' stroke='%236C5CE7' stroke-width='1.5'/></svg>";
+      c.innerHTML="<svg width='24' height='24' viewBox='0 0 24 24' style='filter:drop-shadow(0 1px 2px rgba(0,0,0,.5))'><path d='M4 2 L4 20 L9 15 L12.5 22 L15 21 L11.5 14 L18 14 Z' fill='%23fff' stroke='rgb('+RGB+')' stroke-width='1.5'/></svg>";
       var cs=c.style; cs.position='fixed'; cs.left='0'; cs.top='0'; cs.width='24px'; cs.height='24px'; cs.zIndex='2147483647';
       cs.pointerEvents='none'; cs.transition='left .35s cubic-bezier(.22,.61,.36,1),top .35s cubic-bezier(.22,.61,.36,1)'; cs.transform='translate(-3px,-3px)'; cs.opacity='.95';
       document.documentElement.appendChild(c);
     }
-    favicon();
+    favicon(); title();
   }
   window.__retraceMoveCursor=function(x,y){ build(); var c=document.getElementById(CID); if(c){ c.style.left=x+'px'; c.style.top=y+'px'; } };
   window.__retraceRipple=function(x,y){ var r=document.createElement('div'); r.setAttribute('data-retrace-ui','1'); var s=r.style;
-    s.position='fixed'; s.left=x+'px'; s.top=y+'px'; s.width='34px'; s.height='34px'; s.border='2px solid #6C5CE7'; s.borderRadius='50%';
+    s.position='fixed'; s.left=x+'px'; s.top=y+'px'; s.width='34px'; s.height='34px'; s.border='2px solid rgb('+RGB+')'; s.borderRadius='50%';
     s.zIndex='2147483647'; s.pointerEvents='none'; s.animation='__rtcring .5s ease-out forwards'; document.documentElement.appendChild(r); setTimeout(function(){r.remove();},520); };
   window.__retraceHideUI=function(){ document.querySelectorAll('[data-retrace-ui]').forEach(function(e){e.style.visibility='hidden';}); };
   window.__retraceShowUI=function(){ document.querySelectorAll('[data-retrace-ui]').forEach(function(e){e.style.visibility='visible';}); };
   if(document.body) build(); else document.addEventListener('DOMContentLoaded',build);
-  try{ new MutationObserver(function(){ if(document.body&&!document.getElementById(BID)) build(); }).observe(document.documentElement,{childList:true}); }catch(e){}
+  try{ new MutationObserver(function(){ if(document.body&&!document.getElementById(BID)) build(); title(); }).observe(document.documentElement,{childList:true,subtree:true}); }catch(e){}
 })();`;
 
 async function injectOverlay(p) {
@@ -335,7 +351,8 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
     if (name === "browser_snapshot") {
       const p = await ensurePage();
       const body = await p.evaluate(() => document.body?.innerText?.slice(0, 8000) || "");
-      return text(`URL: ${p.url()}\nTitle: ${await p.title()}\n\n${body}`);
+      const title = (await p.title()).replace(TITLE_PREFIX, "");
+      return text(`URL: ${p.url()}\nTitle: ${title}\n\n${body}`);
     }
     if (name === "browser_back") {
       const p = await ensurePage();

@@ -850,16 +850,31 @@ function finishMessage(state, res) {
 // return the repaired string if it actually parses, so we never make it worse.
 function repairJsonArgs(s) {
   if (typeof s !== "string") return "{}";
-  const t = s.trim();
+  let t = s.trim();
   if (!t) return "{}";
   try { JSON.parse(t); return t; } catch {}
-  const repaired = t
-    // insert a missing comma between a JSON value and the next "key":
-    //   500 "y"  ->  500, "y"   |   "a" "b" -> "a", "b"   |   } "b" -> }, "b"
+  // Strip code fences / prose around the JSON object or array.
+  const start = t.search(/[{[]/);
+  if (start > 0) t = t.slice(start);
+  const end = Math.max(t.lastIndexOf("}"), t.lastIndexOf("]"));
+  if (end >= 0 && end < t.length - 1) t = t.slice(0, end + 1);
+  // Common per-fix transforms (guarded: we only keep a result that parses).
+  const commas = (x) => x
+    // missing comma between a value and the next key:  500 "y" -> 500, "y"
     .replace(/(true|false|null|\d|"|\}|\])\s+(")/g, "$1, $2")
-    // drop any accidental trailing comma before a close
+    // trailing comma before a close:  [1,2,] -> [1,2]
     .replace(/,\s*([}\]])/g, "$1");
-  try { JSON.parse(repaired); return repaired; } catch {}
+  // Python-style literals -> JSON (whole-word):  True/False/None
+  const pyLit = (x) => x
+    .replace(/\bTrue\b/g, "true").replace(/\bFalse\b/g, "false").replace(/\bNone\b/g, "null");
+  const candidates = [t, commas(t), pyLit(t), commas(pyLit(t))];
+  // All single quotes and no doubles -> swap (Python-dict style).
+  if (!t.includes('"') && t.includes("'")) candidates.push(commas(pyLit(t.replace(/'/g, '"'))));
+  for (const c of candidates) {
+    try { JSON.parse(c); if (c !== s) console.error(`[toolrepair] fixed ${JSON.stringify(s).slice(0, 120)} -> ${c.slice(0, 120)}`); return c; }
+    catch {}
+  }
+  console.error(`[toolrepair] UNREPAIRABLE tool args: ${JSON.stringify(s).slice(0, 200)}`);
   return t;
 }
 
