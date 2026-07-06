@@ -69,7 +69,13 @@ uninstall_retrace() {
   done
   rm -f "$BIN_DIR/retrace" "$BIN_DIR/retrace-admin"
   rm -rf "$RETRACE_HOME"
-  say "Retrace removed ($RETRACE_HOME, commands, and proxy service)."
+  # Strip the PATH block we may have added to the shell profile.
+  for rc in "$HOME/.zshrc" "$HOME/.bashrc"; do
+    if [ -f "$rc" ] && grep -q '# >>> retrace PATH >>>' "$rc" 2>/dev/null; then
+      sed -i.retracebak '/# >>> retrace PATH >>>/,/# <<< retrace PATH <<</d' "$rc" && rm -f "$rc.retracebak"
+    fi
+  done
+  say "Retrace removed ($RETRACE_HOME, commands, proxy service, PATH entry)."
 }
 
 if [ "$DO_UNINSTALL" = "1" ]; then
@@ -247,11 +253,27 @@ else
     || warn "Could not start the proxy via systemctl --user. Start it manually: systemctl --user enable --now ${SYSTEMD_UNIT}"
 fi
 
-# --- PATH hint --------------------------------------------------------------
+# --- PATH setup ------------------------------------------------------------
+# If BIN_DIR isn't on PATH, append it to the user's shell profile (idempotently)
+# so `retrace` is found in new shells. The current shell still needs a reload,
+# so we flag that and print a highlighted notice at the end.
+PATH_ADDED=0
+PATH_RC=""
 case ":$PATH:" in
-  *":$BIN_DIR:"*) : ;;
-  *) warn "$BIN_DIR is not on your PATH. Add this to your shell profile:"
-     printf '\n    export PATH="%s:$PATH"\n\n' "$BIN_DIR" ;;
+  *":$BIN_DIR:"*) : ;;  # already on PATH — nothing to do
+  *)
+    case "$(basename "${SHELL:-/bin/zsh}")" in
+      bash) PATH_RC="$HOME/.bashrc" ;;
+      *)    PATH_RC="$HOME/.zshrc" ;;
+    esac
+    if [ -f "$PATH_RC" ] && grep -q '# >>> retrace PATH >>>' "$PATH_RC" 2>/dev/null; then
+      : # our block is already there
+    else
+      printf '\n# >>> retrace PATH >>>\nexport PATH="%s:$PATH"\n# <<< retrace PATH <<<\n' "$BIN_DIR" >> "$PATH_RC"
+    fi
+    PATH_ADDED=1
+    export PATH="$BIN_DIR:$PATH"  # make retrace usable for the rest of this run
+    ;;
 esac
 
 if [ "$PLATFORM" = "macos" ]; then
@@ -275,3 +297,20 @@ cat <<DONE
   Uninstall:     ${UNINSTALL}
 
 DONE
+
+# Highlighted, can't-miss PATH notice — only when we just added BIN_DIR to PATH.
+if [ "$PATH_ADDED" = "1" ]; then
+  Y=$'\033[1;33m'; B=$'\033[1;36m'; R=$'\033[0m'; BG=$'\033[43;30m'
+  printf '%s╔════════════════════════════════════════════════════════════════════╗%s\n' "$Y" "$R"
+  printf '%s║%s  %sACTION NEEDED — one step so the `retrace` command works%s            %s║%s\n' "$Y" "$R" "$BG" "$R" "$Y" "$R"
+  printf '%s╠════════════════════════════════════════════════════════════════════╣%s\n' "$Y" "$R"
+  printf '%s║%s  Added %s to your PATH in %s.\n' "$Y" "$R" "$BIN_DIR" "$PATH_RC"
+  printf '%s║%s  Your CURRENT terminal does not have it yet. Do ONE of these:\n' "$Y" "$R"
+  printf '%s║%s\n' "$Y" "$R"
+  printf '%s║%s    1) Reload your shell:   %ssource %s%s\n' "$Y" "$R" "$B" "$PATH_RC" "$R"
+  printf '%s║%s       (or just open a new terminal window), then run:  %sretrace%s\n' "$Y" "$R" "$B" "$R"
+  printf '%s║%s\n' "$Y" "$R"
+  printf '%s║%s    2) Or skip that and run the full path directly:\n' "$Y" "$R"
+  printf '%s║%s          %s%s/retrace%s\n' "$Y" "$R" "$B" "$BIN_DIR" "$R"
+  printf '%s╚════════════════════════════════════════════════════════════════════╝%s\n\n' "$Y" "$R"
+fi
