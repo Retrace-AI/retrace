@@ -62,8 +62,8 @@ function clearProfileLocks() {
 // fake cursor that glides to each click, a click ripple, and a red-dot favicon.
 // All elements carry data-retrace-ui so we can hide them during screenshots —
 // the model always sees the clean page, only a human watching sees the overlay.
-const OVERLAY_COLOR = process.env.RETRACE_BROWSER_OVERLAY_COLOR || "108,92,231"; // R,G,B (purple)
-const TITLE_PREFIX = "🔴 Retrace · "; // "🔴 Retrace · "
+const OVERLAY_COLOR = process.env.RETRACE_BROWSER_OVERLAY_COLOR || "16,185,129"; // R,G,B (emerald green)
+const TITLE_PREFIX = "⚡ Retrace ⚡ · "; // shown on the browser tab while controlled
 const OVERLAY_JS = `(() => {
   if (window.__retraceUIInstalled) return;
   window.__retraceUIInstalled = true;
@@ -72,7 +72,7 @@ const OVERLAY_JS = `(() => {
   function favicon(){ try{
     var l=document.querySelector("link[rel~='icon']")||document.createElement('link');
     l.rel='icon'; l.type='image/svg+xml';
-    l.href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Ccircle cx='8' cy='8' r='7' fill='%23E5484D'/%3E%3C/svg%3E";
+    l.href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cdefs%3E%3CradialGradient id='g' cx='35%25' cy='30%25'%3E%3Cstop offset='0%25' stop-color='%236ee7b7'/%3E%3Cstop offset='100%25' stop-color='%2310b981'/%3E%3C/radialGradient%3E%3C/defs%3E%3Ccircle cx='8' cy='8' r='7' fill='url(%23g)'/%3E%3C/svg%3E";
     if(!l.parentNode&&document.head) document.head.appendChild(l);
   }catch(e){} }
   function title(){ try{
@@ -95,7 +95,7 @@ const OVERLAY_JS = `(() => {
     }
     if(!document.getElementById(BID)){
       var b=document.createElement('div'); b.id=BID; b.setAttribute('data-retrace-ui','1');
-      b.innerHTML="<span style='display:inline-block;width:9px;height:9px;border-radius:50%;background:#fff;margin-right:8px;box-shadow:0 0 6px #fff;animation:__rtcpulse 1.2s infinite;vertical-align:middle'></span>Retrace is controlling this browser";
+      b.innerHTML="<span style='display:inline-block;width:9px;height:9px;border-radius:50%;background:#fff;margin-right:8px;box-shadow:0 0 6px #fff;animation:__rtcpulse 1.2s infinite;vertical-align:middle'></span>⚡ Retrace is controlling this browser ⚡";
       var s=b.style; s.position='fixed'; s.top='0'; s.left='0'; s.right='0'; s.zIndex='2147483647';
       s.background='rgba('+RGB+',0.55)'; s.color='#fff'; s.font='600 12.5px -apple-system,BlinkMacSystemFont,system-ui,sans-serif';
       s.padding='6px 12px'; s.textAlign='center'; s.pointerEvents='none'; s.letterSpacing='.2px';
