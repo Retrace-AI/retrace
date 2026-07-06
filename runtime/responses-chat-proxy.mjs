@@ -221,7 +221,7 @@ function responsesInputToChatMessages(body) {
           type: "function",
           function: {
             name: item.name || "unknown",
-            arguments: item.arguments || "{}",
+            arguments: repairJsonArgs(item.arguments || "{}"),
           },
         }],
       });
@@ -818,8 +818,30 @@ function finishMessage(state, res) {
   state.output.push(item);
 }
 
+// Small tool-parsers (e.g. Qwen3 qwen3_xml) occasionally emit tool-call
+// arguments with invalid JSON — most commonly a missing comma between a value
+// and the next key ({"x": 500 "y": 500}). That breaks BOTH local tool execution
+// and the follow-up request (the gateway re-parses the replayed tool_call and
+// returns "Expecting ',' delimiter"). Repair to valid JSON when we can; only
+// return the repaired string if it actually parses, so we never make it worse.
+function repairJsonArgs(s) {
+  if (typeof s !== "string") return "{}";
+  const t = s.trim();
+  if (!t) return "{}";
+  try { JSON.parse(t); return t; } catch {}
+  const repaired = t
+    // insert a missing comma between a JSON value and the next "key":
+    //   500 "y"  ->  500, "y"   |   "a" "b" -> "a", "b"   |   } "b" -> }, "b"
+    .replace(/(true|false|null|\d|"|\}|\])\s+(")/g, "$1, $2")
+    // drop any accidental trailing comma before a close
+    .replace(/,\s*([}\]])/g, "$1");
+  try { JSON.parse(repaired); return repaired; } catch {}
+  return t;
+}
+
 function finishToolCalls(state, res) {
   for (const item of state.toolCalls.values()) {
+    item.arguments = repairJsonArgs(item.arguments);
     const outputIndex = state.output.length;
     sendSse(res, "response.function_call_arguments.done", {
       type: "response.function_call_arguments.done",
@@ -1081,6 +1103,7 @@ function emitCollectedResponse(state, res) {
   }
 
   for (const item of state.toolCalls.values()) {
+    item.arguments = repairJsonArgs(item.arguments);
     const outputIndex = state.output.length;
     sendSse(res, "response.output_item.added", {
       type: "response.output_item.added",
