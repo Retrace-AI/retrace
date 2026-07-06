@@ -42,9 +42,39 @@ case "$OS" in
   *) die "Unsupported OS: $OS. Retrace supports macOS and Linux." ;;
 esac
 
-command -v node >/dev/null 2>&1 || die "Node.js is required (for the local proxy). Install it and re-run."
 command -v curl >/dev/null 2>&1 || die "curl is required."
 command -v zsh  >/dev/null 2>&1 || die "zsh is required (the retrace launcher is a zsh script). Install it (e.g. 'apt install zsh') and re-run."
+
+# Node.js (>=18) powers the local proxy + browser MCP. If it is missing or too
+# old, install a private copy under $RETRACE_HOME/node — no admin/sudo needed,
+# so mac users no longer have to install Node by hand and re-run.
+NODE_MIN_MAJOR=18
+NODE_VER="v20.18.1"
+node_ok() {
+  command -v node >/dev/null 2>&1 || return 1
+  local maj; maj="$(node -p 'process.versions.node.split(".")[0]' 2>/dev/null || echo 0)"
+  [ "${maj:-0}" -ge "$NODE_MIN_MAJOR" ]
+}
+ensure_node() {
+  node_ok && return 0
+  local os arch nos narch
+  os="$(uname -s)"; arch="$(uname -m)"
+  case "$os" in Darwin) nos=darwin ;; Linux) nos=linux ;; *) return 1 ;; esac
+  case "$arch" in arm64|aarch64) narch=arm64 ;; x86_64|amd64) narch=x64 ;; *) return 1 ;; esac
+  say "Node.js not found — installing a private copy (${NODE_VER}, no admin needed)..."
+  local url="https://nodejs.org/dist/${NODE_VER}/node-${NODE_VER}-${nos}-${narch}.tar.gz"
+  local dest="$RETRACE_HOME/node"
+  mkdir -p "$dest" "$BIN_DIR"
+  curl -fsSL "$url" -o "$RETRACE_HOME/.node.tgz" || { warn "could not download Node ($url)"; return 1; }
+  tar -xzf "$RETRACE_HOME/.node.tgz" -C "$dest" --strip-components=1 || { warn "could not unpack Node"; return 1; }
+  rm -f "$RETRACE_HOME/.node.tgz"
+  export PATH="$dest/bin:$PATH"
+  ln -sf "$dest/bin/node" "$BIN_DIR/node"
+  ln -sf "$dest/bin/npm"  "$BIN_DIR/npm"
+  ln -sf "$dest/bin/npx"  "$BIN_DIR/npx"
+  node_ok
+}
+ensure_node || die "Node.js ${NODE_MIN_MAJOR}+ is required and the automatic install failed. Install Node from https://nodejs.org and re-run."
 NODE_BIN="$(command -v node)"
 NODE_DIR="$(dirname "$NODE_BIN")"
 
