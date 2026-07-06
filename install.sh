@@ -22,10 +22,14 @@ SYSTEMD_DIR="$HOME/.config/systemd/user"
 # checks for Chrome and installs it if absent, installs the MCP's Node deps, then
 # wires the MCP. Opt out with  --no-browser  or  RETRACE_NO_BROWSER=1.
 WITH_BROWSER="${RETRACE_WITH_BROWSER:-1}"
+DO_UNINSTALL=0
+DO_REINSTALL=0
 for arg in "$@"; do
   case "$arg" in
     --with-browser) WITH_BROWSER=1 ;;
     --no-browser)   WITH_BROWSER=0 ;;
+    --uninstall)    DO_UNINSTALL=1 ;;
+    --reinstall)    DO_UNINSTALL=1; DO_REINSTALL=1 ;;
   esac
 done
 [ "${RETRACE_NO_BROWSER:-0}" = "1" ] && WITH_BROWSER=0
@@ -41,6 +45,41 @@ case "$OS" in
   Linux)  PLATFORM="linux" ;;
   *) die "Unsupported OS: $OS. Retrace supports macOS and Linux." ;;
 esac
+
+# --- uninstall -------------------------------------------------------------
+# Fully remove Retrace: stop the proxy service, remove the commands + config +
+# bundled Node + browser profile. Safe to run even if things are half-installed.
+#   curl -fsSL <install.sh> | bash -s -- --uninstall     (remove)
+#   curl -fsSL <install.sh> | bash -s -- --reinstall     (remove, then install fresh)
+uninstall_retrace() {
+  say "Removing Retrace..."
+  pkill -f responses-chat-proxy 2>/dev/null || true
+  pkill -f "$RETRACE_HOME/browser-mcp" 2>/dev/null || true
+  if [ "$PLATFORM" = "macos" ]; then
+    launchctl bootout "gui/$(id -u)/${PLIST_LABEL}" 2>/dev/null || true
+    rm -f "$PLIST_DEST"
+  else
+    systemctl --user disable --now "${SYSTEMD_UNIT}" 2>/dev/null || true
+    rm -f "$SYSTEMD_DIR/${SYSTEMD_UNIT}.service"
+  fi
+  # Remove node/npm/npx shims only if they point into RETRACE_HOME (i.e. ours).
+  for l in node npm npx; do
+    tgt="$(readlink "$BIN_DIR/$l" 2>/dev/null || true)"
+    case "$tgt" in "$RETRACE_HOME"/*) rm -f "$BIN_DIR/$l" ;; esac
+  done
+  rm -f "$BIN_DIR/retrace" "$BIN_DIR/retrace-admin"
+  rm -rf "$RETRACE_HOME"
+  say "Retrace removed ($RETRACE_HOME, commands, and proxy service)."
+}
+
+if [ "$DO_UNINSTALL" = "1" ]; then
+  uninstall_retrace
+  if [ "$DO_REINSTALL" != "1" ]; then
+    printf '\n  Done. Reinstall any time with the install command.\n\n'
+    exit 0
+  fi
+  say "Reinstalling a fresh copy..."
+fi
 
 command -v curl >/dev/null 2>&1 || die "curl is required."
 command -v zsh  >/dev/null 2>&1 || die "zsh is required (the retrace launcher is a zsh script). Install it (e.g. 'apt install zsh') and re-run."
