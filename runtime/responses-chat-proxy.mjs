@@ -229,11 +229,38 @@ function responsesInputToChatMessages(body) {
     }
 
     if (item.type === "function_call_output") {
+      // Tool outputs may include images (e.g. browser screenshots). Sending the
+      // base64 data URL as JSON text counts it as ~250k text tokens and blows
+      // the context window. Extract images and attach them as proper image_url
+      // parts (which vision models tokenize efficiently); keep text in the tool
+      // message.
+      const out = item.output;
+      const imageUrls = [];
+      let textOut = "";
+      if (Array.isArray(out)) {
+        for (const o of out) {
+          if (o && typeof o === "object" && o.type === "input_image" && o.image_url) {
+            imageUrls.push(typeof o.image_url === "string" ? o.image_url : o.image_url.url);
+          } else if (o && typeof o === "object") {
+            textOut += o.text || o.input_text || o.output_text || "";
+          } else if (typeof o === "string") {
+            textOut += o;
+          }
+        }
+      } else {
+        textOut = typeof out === "string" ? out : JSON.stringify(out ?? "");
+      }
       messages.push({
         role: "tool",
         tool_call_id: item.call_id,
-        content: typeof item.output === "string" ? item.output : JSON.stringify(item.output ?? ""),
+        content: textOut || (imageUrls.length ? "[image returned; see the following message]" : ""),
       });
+      if (imageUrls.length) {
+        messages.push({
+          role: "user",
+          content: imageUrls.map((url) => ({ type: "image_url", image_url: { url } })),
+        });
+      }
       continue;
     }
 
@@ -714,6 +741,20 @@ function takeCapturedReasoning(state) {
   return captured;
 }
 
+function buildToolNamespaceMap(tools) {
+  // Map each flattened namespace sub-tool -> its namespace, so function_calls
+  // can be emitted with the namespace codex needs to route them (router.rs).
+  const map = {};
+  for (const tool of tools || []) {
+    if (tool && tool.type === "namespace" && Array.isArray(tool.tools)) {
+      for (const sub of tool.tools) {
+        if (sub && sub.type === "function" && sub.name) map[sub.name] = tool.name;
+      }
+    }
+  }
+  return map;
+}
+
 function ensureToolCall(state, res, toolDelta) {
   finishReasoning(state, res);
   const index = toolDelta.index ?? 0;
@@ -736,6 +777,9 @@ function ensureToolCall(state, res, toolDelta) {
   const item = state.toolCalls.get(index);
   if (toolDelta.id) item.call_id = toolDelta.id;
   if (toolDelta.function?.name) item.name = toolDelta.function.name;
+  if (state.toolNamespaces && item.name && state.toolNamespaces[item.name]) {
+    item.namespace = state.toolNamespaces[item.name];
+  }
   return item;
 }
 
@@ -1322,6 +1366,7 @@ async function handleResponses(req, res, body) {
   // of the same message (separated by a note) until the check passes or the
   // retry budget is exhausted.
   const state = newResponseState(body.model);
+  state.toolNamespaces = buildToolNamespaceMap(body.tools);
   sseHeaders(res);
   sendSse(res, "response.created", {
     type: "response.created",

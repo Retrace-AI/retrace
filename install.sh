@@ -17,8 +17,9 @@ PLIST_DEST="$HOME/Library/LaunchAgents/${PLIST_LABEL}.plist"
 SYSTEMD_UNIT="retrace-responses-proxy"
 SYSTEMD_DIR="$HOME/.config/systemd/user"
 
-# Browser control (Playwright MCP driving Chrome, vision/coordinate mode) is set
-# up by DEFAULT: the installer checks for Chrome and installs it if absent, then
+# Browser control (Retrace's own MCP: 1000x1000 normalized screenshots + click
+# coordinate remapping, driving real Chrome) is set up by DEFAULT: the installer
+# checks for Chrome and installs it if absent, installs the MCP's Node deps, then
 # wires the MCP. Opt out with  --no-browser  or  RETRACE_NO_BROWSER=1.
 WITH_BROWSER="${RETRACE_WITH_BROWSER:-1}"
 for arg in "$@"; do
@@ -121,16 +122,34 @@ setup_browser_mcp() {
         || warn "Could not auto-install Chrome. Install Google Chrome manually, then re-run with --with-browser."
     fi
   fi
-  say "Adding the browser control MCP (Playwright, vision mode)..."
-  cat >> "$cfg" <<'TOML'
+  # Install Retrace's own browser MCP (normalizes every screenshot to 1000x1000
+  # and maps click coordinates back to real pixels — see runtime/browser-mcp).
+  local mcp_dir="$RETRACE_HOME/browser-mcp"
+  if [ -d "$TMP/runtime/browser-mcp" ]; then
+    if ! command -v npm >/dev/null 2>&1; then
+      warn "npm not found — skipping the browser MCP. Install Node/npm and re-run with --with-browser."
+      return
+    fi
+    say "Installing the Retrace browser MCP (1000x1000 normalized vision)..."
+    mkdir -p "$mcp_dir"
+    cp "$TMP/runtime/browser-mcp/index.mjs" "$mcp_dir/index.mjs"
+    cp "$TMP/runtime/browser-mcp/package.json" "$mcp_dir/package.json"
+    ( cd "$mcp_dir" && npm install --omit=dev --no-audit --no-fund >/dev/null 2>&1 ) \
+      || warn "npm install for the browser MCP failed — run 'cd $mcp_dir && npm install' by hand."
+  else
+    warn "runtime/browser-mcp not found in the install bundle; skipping browser MCP."
+    return
+  fi
+  cat >> "$cfg" <<TOML
 
-# Browser control for the model (Playwright driving Chrome).
-# DOM/accessibility mode: the model reads a page snapshot and clicks elements by
-# reference — works with text models. For coordinate/vision models, add
-#   "--caps", "vision"   to args (exposes browser_mouse_click_xy).
+# Browser control for the model. Retrace's own browser MCP: every screenshot is
+# normalized to a 1000x1000 image and the server maps the model's click
+# coordinates in that space back to real page pixels (folds in retina/DPR and
+# viewport). Keeps screenshots tiny so they never blow the context window.
+# Set RETRACE_BROWSER_HEADLESS=1 to run without a visible window.
 [mcp_servers.browser]
-command = "npx"
-args = ["-y", "@playwright/mcp@latest", "--browser", "chrome"]
+command = "node"
+args = ["$mcp_dir/index.mjs"]
 TOML
 }
 
@@ -181,8 +200,9 @@ cat <<DONE
                  stronger models, run  /model  ->  "Add custom model".
 
   Manage models: retrace-admin models list
-  Browser:       set up by default (Playwright + Chrome, vision mode; Chrome
-                 auto-installed if missing). Skip next time with  --no-browser.
+  Browser:       set up by default (Retrace browser MCP + Chrome; 1000x1000
+                 normalized vision, Chrome auto-installed if missing). Skip
+                 next time with  --no-browser.
   Uninstall:     ${UNINSTALL}
 
 DONE

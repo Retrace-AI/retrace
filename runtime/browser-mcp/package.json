@@ -1,0 +1,12 @@
+{
+  "name": "retrace-browser-mcp",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "bin": { "retrace-browser-mcp": "index.mjs" },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.0",
+    "playwright": "^1.48.0",
+    "sharp": "^0.33.0"
+  }
+}
