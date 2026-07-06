@@ -58,6 +58,65 @@ function clearProfileLocks() {
   }
 }
 
+// Injected into every page: a "Retrace is controlling this browser" banner, a
+// fake cursor that glides to each click, a click ripple, and a red-dot favicon.
+// All elements carry data-retrace-ui so we can hide them during screenshots —
+// the model always sees the clean page, only a human watching sees the overlay.
+const OVERLAY_JS = `(() => {
+  if (window.__retraceUIInstalled) return;
+  window.__retraceUIInstalled = true;
+  var BID='__retrace_banner', CID='__retrace_cursor';
+  function favicon(){ try{
+    var l=document.querySelector("link[rel~='icon']")||document.createElement('link');
+    l.rel='icon'; l.type='image/svg+xml';
+    l.href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Ccircle cx='8' cy='8' r='7' fill='%23E5484D'/%3E%3C/svg%3E";
+    if(!l.parentNode&&document.head) document.head.appendChild(l);
+  }catch(e){} }
+  function build(){
+    if(!document.body) return;
+    if(!document.getElementById('__retrace_style')){
+      var st=document.createElement('style'); st.id='__retrace_style'; st.setAttribute('data-retrace-ui','1');
+      st.textContent='@keyframes __rtcpulse{0%,100%{opacity:1}50%{opacity:.3}}@keyframes __rtcring{0%{transform:translate(-50%,-50%) scale(.3);opacity:.7}100%{transform:translate(-50%,-50%) scale(1.7);opacity:0}}';
+      (document.head||document.documentElement).appendChild(st);
+    }
+    if(!document.getElementById(BID)){
+      var b=document.createElement('div'); b.id=BID; b.setAttribute('data-retrace-ui','1');
+      b.innerHTML="<span style='display:inline-block;width:9px;height:9px;border-radius:50%;background:#E5484D;margin-right:8px;box-shadow:0 0 6px #E5484D;animation:__rtcpulse 1.2s infinite;vertical-align:middle'></span>Retrace is controlling this browser";
+      var s=b.style; s.position='fixed'; s.top='0'; s.left='0'; s.right='0'; s.zIndex='2147483647';
+      s.background='rgba(18,18,24,0.86)'; s.color='#fff'; s.font='600 12.5px -apple-system,BlinkMacSystemFont,system-ui,sans-serif';
+      s.padding='6px 12px'; s.textAlign='center'; s.pointerEvents='none'; s.letterSpacing='.2px'; s.borderBottom='2px solid #6C5CE7';
+      document.documentElement.appendChild(b);
+    }
+    if(!document.getElementById(CID)){
+      var c=document.createElement('div'); c.id=CID; c.setAttribute('data-retrace-ui','1');
+      c.innerHTML="<svg width='24' height='24' viewBox='0 0 24 24' style='filter:drop-shadow(0 1px 2px rgba(0,0,0,.5))'><path d='M4 2 L4 20 L9 15 L12.5 22 L15 21 L11.5 14 L18 14 Z' fill='%23fff' stroke='%236C5CE7' stroke-width='1.5'/></svg>";
+      var cs=c.style; cs.position='fixed'; cs.left='0'; cs.top='0'; cs.width='24px'; cs.height='24px'; cs.zIndex='2147483647';
+      cs.pointerEvents='none'; cs.transition='left .35s cubic-bezier(.22,.61,.36,1),top .35s cubic-bezier(.22,.61,.36,1)'; cs.transform='translate(-3px,-3px)'; cs.opacity='.95';
+      document.documentElement.appendChild(c);
+    }
+    favicon();
+  }
+  window.__retraceMoveCursor=function(x,y){ build(); var c=document.getElementById(CID); if(c){ c.style.left=x+'px'; c.style.top=y+'px'; } };
+  window.__retraceRipple=function(x,y){ var r=document.createElement('div'); r.setAttribute('data-retrace-ui','1'); var s=r.style;
+    s.position='fixed'; s.left=x+'px'; s.top=y+'px'; s.width='34px'; s.height='34px'; s.border='2px solid #6C5CE7'; s.borderRadius='50%';
+    s.zIndex='2147483647'; s.pointerEvents='none'; s.animation='__rtcring .5s ease-out forwards'; document.documentElement.appendChild(r); setTimeout(function(){r.remove();},520); };
+  window.__retraceHideUI=function(){ document.querySelectorAll('[data-retrace-ui]').forEach(function(e){e.style.visibility='hidden';}); };
+  window.__retraceShowUI=function(){ document.querySelectorAll('[data-retrace-ui]').forEach(function(e){e.style.visibility='visible';}); };
+  if(document.body) build(); else document.addEventListener('DOMContentLoaded',build);
+  try{ new MutationObserver(function(){ if(document.body&&!document.getElementById(BID)) build(); }).observe(document.documentElement,{childList:true}); }catch(e){}
+})();`;
+
+async function injectOverlay(p) {
+  try { await p.evaluate(OVERLAY_JS); } catch {}
+}
+// Glide the fake cursor to (realX, realY) and let the human see the motion.
+async function showCursorAt(p, x, y) {
+  try {
+    await p.evaluate(([x, y]) => window.__retraceMoveCursor && window.__retraceMoveCursor(x, y), [x, y]);
+    await p.waitForTimeout(380);
+  } catch {}
+}
+
 let launchingPromise = null;
 
 async function ensurePage() {
@@ -88,6 +147,9 @@ async function ensurePage() {
   page.on("close", () => {
     page = null;
   });
+  // Re-inject the "Retrace is controlling" overlay on every navigation, and once now.
+  try { await ctx.addInitScript({ content: OVERLAY_JS }); } catch {}
+  await injectOverlay(page);
   return page;
   })();
   try {
@@ -109,7 +171,10 @@ async function normalizedScreenshot() {
   const p = await ensurePage();
   const vp = p.viewportSize() || { width: VW, height: VH };
   real = { w: vp.width, h: vp.height };
+  // Hide our overlay so the model sees the clean page, then restore it.
+  try { await p.evaluate(() => window.__retraceHideUI && window.__retraceHideUI()); } catch {}
   const raw = await p.screenshot({ type: "png", scale: "css" });
+  try { await p.evaluate(() => window.__retraceShowUI && window.__retraceShowUI()); } catch {}
   // Resize to exactly NORM x NORM (fill). Per-axis inverse in toReal() recovers
   // the exact real point, so the coordinate round-trip is exact.
   const png = await sharp(raw)
@@ -219,6 +284,7 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
     if (name === "browser_navigate") {
       const p = await ensurePage();
       await p.goto(String(args.url), { waitUntil: "domcontentloaded", timeout: 30000 });
+      await injectOverlay(p);
       return text(`Navigated to ${p.url()}. Call browser_screenshot to see the ${NORM}x${NORM} page.`);
     }
     if (name === "browser_screenshot") {
@@ -233,6 +299,8 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
     if (name === "browser_click") {
       const p = await ensurePage();
       const { x, y } = toReal(args.x, args.y);
+      await showCursorAt(p, x, y);
+      try { await p.evaluate(([x, y]) => window.__retraceRipple && window.__retraceRipple(x, y), [x, y]); } catch {}
       await p.mouse.click(x, y, {
         button: args.button || "left",
         clickCount: args.doubleClick ? 2 : 1,
@@ -243,6 +311,7 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
     if (name === "browser_move") {
       const p = await ensurePage();
       const { x, y } = toReal(args.x, args.y);
+      await showCursorAt(p, x, y);
       await p.mouse.move(x, y);
       return text(`Moved to normalized (${args.x},${args.y}).`);
     }

@@ -11,6 +11,7 @@ const apiKey = fs.readFileSync(apiKeyFile, "utf8").trim();
 const modelCatalogFile = (process.env.RETRACE_MODEL_CATALOG_JSON || process.env.CODEXOS_MODEL_CATALOG_JSON) || `${process.env.HOME}/.retrace/models.json`;
 const registryFile = (process.env.RETRACE_REGISTRY_JSON || process.env.CODEXOS_REGISTRY_JSON) || `${process.env.HOME}/.retrace/registry.json`;
 const agentCheckStateFile = (process.env.RETRACE_AGENT_CHECK_FILE || process.env.CODEXOS_AGENT_CHECK_FILE) || `${process.env.HOME}/.retrace/agentcheck`;
+const MAX_IMAGES = Math.max(1, Number(process.env.RETRACE_MAX_IMAGES) || 2);
 const upstreamTimeoutMs = Number((process.env.RETRACE_UPSTREAM_TIMEOUT_MS || process.env.CODEXOS_UPSTREAM_TIMEOUT_MS) || "90000");
 const streamInactivityTimeoutMs = Number((process.env.RETRACE_STREAM_INACTIVITY_TIMEOUT_MS || process.env.CODEXOS_STREAM_INACTIVITY_TIMEOUT_MS) || "90000");
 const serperSearchMode = (process.env.RETRACE_SERPER_SEARCH || process.env.CODEXOS_SERPER_SEARCH) === "1";
@@ -268,8 +269,31 @@ function responsesInputToChatMessages(body) {
     if (text) messages.push({ role: "user", content: text });
   }
 
+  pruneImageParts(messages, MAX_IMAGES);
   const instructions = systemParts.join("\n\n");
   return instructions ? [{ role: "system", content: instructions }, ...messages] : messages;
+}
+
+// Vision models cap images per prompt (Chitti-Smart: 2). Across a multi-step
+// browse, screenshots accumulate and the request soon exceeds that cap, so the
+// gateway returns "At most N image(s) may be provided". The model only needs the
+// current view, so keep the most recent MAX_IMAGES screenshots and replace older
+// image parts with a short text note.
+function pruneImageParts(messages, maxImages) {
+  const imgs = [];
+  for (const m of messages) {
+    if (!Array.isArray(m.content)) continue;
+    for (const part of m.content) {
+      if (part && part.type === "image_url") imgs.push({ m, part });
+    }
+  }
+  const drop = imgs.length - maxImages;
+  if (drop <= 0) return;
+  for (let i = 0; i < drop; i++) {
+    const { m, part } = imgs[i];
+    const idx = m.content.indexOf(part);
+    if (idx >= 0) m.content[idx] = { type: "text", text: "[earlier screenshot omitted]" };
+  }
 }
 
 function pushChatFunction(chatTools, name, description, parameters) {
