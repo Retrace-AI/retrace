@@ -1256,18 +1256,43 @@ impl ChatWidget {
             .map(|keymap| keymap.list)
             .unwrap_or_else(|_| crate::keymap::RuntimeKeymap::defaults().list);
         let picker = MultiSelectPicker::builder(
-            "Select provider models".to_string(),
+            "Select models".to_string(),
             Some(format!(
-                "{provider_id}: {} discovered. Space toggles models to probe and add to /model.",
+                "{provider_id}: {} discovered. Enter selects models to probe and add to /model.",
                 rows.len()
             )),
             self.app_event_tx.clone(),
         )
         .items(items)
         .list_keymap(list_keymap)
+        .confirm_label(|selected| match selected {
+            0 => "Add selected models (nothing selected yet)".to_string(),
+            1 => "Add 1 selected model".to_string(),
+            n => format!("Add {n} selected models"),
+        })
+        .cancel_label("Discard and close")
         .on_preview(|items| {
-            let selected = items.iter().filter(|item| item.enabled).count();
-            Some(Line::from(format!("{selected} selected")))
+            let selected: Vec<&str> = items
+                .iter()
+                .filter(|item| item.enabled)
+                .map(|item| item.name.as_str())
+                .collect();
+            if selected.is_empty() {
+                return None;
+            }
+            let shown = selected
+                .iter()
+                .take(3)
+                .copied()
+                .collect::<Vec<_>>()
+                .join(" · ");
+            let more = selected.len().saturating_sub(3);
+            let text = if more > 0 {
+                format!("Selected: {shown} · +{more} more")
+            } else {
+                format!("Selected: {shown}")
+            };
+            Some(Line::from(text))
         })
         .on_confirm(move |ids, tx| {
             tx.send(AppEvent::CodexOsProviderModelsSelected {
@@ -1500,13 +1525,17 @@ impl ChatWidget {
             .unwrap_or_else(|_| crate::keymap::RuntimeKeymap::defaults().list);
         let picker = MultiSelectPicker::builder(
             "Remove provider models".to_string(),
-            Some(format!(
-                "{provider_id}: Space toggles models to remove, Enter confirms."
-            )),
+            Some(format!("{provider_id}: Enter selects models to remove.")),
             self.app_event_tx.clone(),
         )
         .items(items)
         .list_keymap(list_keymap)
+        .confirm_label(|selected| match selected {
+            0 => "Remove selected models (nothing selected yet)".to_string(),
+            1 => "Remove 1 selected model".to_string(),
+            n => format!("Remove {n} selected models"),
+        })
+        .cancel_label("Discard and close")
         .on_preview(|items| {
             let selected = items.iter().filter(|item| item.enabled).count();
             Some(Line::from(format!("{selected} selected for removal")))
@@ -1884,7 +1913,7 @@ impl ChatWidget {
             id: ADD_CUSTOM_MODEL_SENTINEL.to_string(),
             name: "➕ Add a custom model (connect a new provider)".to_string(),
             description: Some(
-                "Select and press Enter to add a provider: enter its URL and API key, then pick models".to_string(),
+                "Press Enter to connect a new provider: enter its URL and API key, then pick models".to_string(),
             ),
             enabled: false,
             orderable: false,
@@ -1909,27 +1938,43 @@ impl ChatWidget {
         let picker = MultiSelectPicker::builder(
             "Add models".to_string(),
             Some(format!(
-                "{} model(s) across all providers. Space toggles; checked models appear in /model.",
+                "{} model(s) across all providers. Enter toggles; checked models appear in /model.",
                 rows.len()
             )),
             self.app_event_tx.clone(),
         )
         .items(items)
         .list_keymap(list_keymap)
+        .confirm_label(|enabled| format!("Apply selection ({enabled} enabled)"))
+        .cancel_label("Discard changes")
+        .on_change(|items, tx| {
+            // The "add a custom model" sentinel acts the moment it is checked:
+            // the provider-connect prompt replaces this picker.
+            if items
+                .iter()
+                .any(|item| item.id == ADD_CUSTOM_MODEL_SENTINEL && item.enabled)
+            {
+                tx.send(AppEvent::CodexOsOpenProviderPrompt);
+            }
+        })
         .on_preview(|items| {
-            let selected = items.iter().filter(|item| item.enabled).count();
+            let selected = items
+                .iter()
+                .filter(|item| item.enabled && item.id != ADD_CUSTOM_MODEL_SENTINEL)
+                .count();
             Some(Line::from(format!("{selected} enabled")))
         })
         .on_confirm(move |ids, tx| {
-            // The "add a custom model" sentinel routes to the provider-add
-            // prompt instead of the enable/disable apply.
-            if ids.iter().any(|id| id == ADD_CUSTOM_MODEL_SENTINEL) {
-                tx.send(AppEvent::CodexOsOpenProviderPrompt);
-                return;
-            }
+            // The sentinel opens the provider prompt from on_change; strip it
+            // here so it can never hijack or miscount an apply.
+            let model_ids: Vec<String> = ids
+                .iter()
+                .filter(|id| id.as_str() != ADD_CUSTOM_MODEL_SENTINEL)
+                .cloned()
+                .collect();
             tx.send(AppEvent::CodexOsModelAddSelectionConfirmed {
                 rows: rows_for_event.clone(),
-                model_ids: ids.to_vec(),
+                model_ids,
             });
         })
         .build();

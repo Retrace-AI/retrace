@@ -319,6 +319,8 @@ impl StatusLineSetupView {
             .list_keymap(list_keymap)
             .items(items)
             .enable_ordering()
+            .confirm_label(|selected| format!("Save status line ({selected} selected)"))
+            .cancel_label("Discard changes")
             .on_preview(move |items| {
                 let use_theme_colors = items
                     .iter()

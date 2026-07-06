@@ -4,7 +4,9 @@
 //! to toggle multiple items on/off. It supports:
 //!
 //! - **Fuzzy search**: Type to filter items by name
-//! - **Toggle selection**: Space to toggle items on/off
+//! - **Toggle selection**: Enter (or Space) toggles the highlighted item
+//! - **Pinned action rows**: confirm/discard rows below the list; reach them
+//!   with Down past the last item (or Tab) and press Enter to activate
 //! - **Reordering**: Optional left/right arrow support to reorder items
 //! - **Live preview**: Optional callback to show a preview of current selections
 //! - **Callbacks**: Hooks for change, confirm, and cancel events
@@ -91,15 +93,26 @@ enum Direction {
     Down,
 }
 
+/// Which pinned action row (below the list) currently has focus.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ActionFocus {
+    Confirm,
+    Cancel,
+}
+
 /// Callback invoked when any item's state changes (toggled or reordered).
 /// Receives the full list of items and the event sender.
 pub type ChangeCallBack = Box<dyn Fn(&[MultiSelectItem], &AppEventSender) + Send + Sync>;
 
-/// Callback invoked when the user confirms their selection (presses Enter).
-/// Receives a list of IDs for all enabled items.
+/// Callback invoked when the user confirms their selection (activates the
+/// pinned confirm row). Receives a list of IDs for all enabled items.
 pub type ConfirmCallback = Box<dyn Fn(&[String], &AppEventSender) + Send + Sync>;
 
-/// Callback invoked when the user cancels the picker (presses Escape).
+/// Builds the label for the pinned confirm row from the enabled-item count.
+pub type ConfirmLabelCallback = Box<dyn Fn(usize) -> String + Send + Sync>;
+
+/// Callback invoked when the user cancels the picker (Escape or the pinned
+/// discard row).
 pub type CancelCallback = Box<dyn Fn(&AppEventSender) + Send + Sync>;
 
 /// Callback to generate an optional preview line based on current item states.
@@ -150,12 +163,15 @@ struct BuiltRows {
 
 /// A multi-select picker widget with fuzzy search and optional reordering.
 ///
-/// The picker displays a scrollable list of items with checkboxes. Users can:
+/// The picker displays a scrollable list of items with checkboxes, plus two
+/// pinned action rows (confirm/discard) below the list. Users can:
 /// - Type to fuzzy-search and filter the list
-/// - Use Up/Down (or Ctrl+P/Ctrl+N) to navigate
-/// - Press Space to toggle the selected item
-/// - Press Enter to confirm and close
-/// - Press Escape to cancel and close
+/// - Use Up/Down (or Ctrl+P/Ctrl+N) to navigate; moving past the ends of the
+///   list walks through the pinned action rows
+/// - Press Enter (or Space) to toggle the highlighted item
+/// - Press Tab to jump between the list and the action rows
+/// - Press Enter on the confirm row to confirm and close
+/// - Press Enter on the discard row (or Escape anywhere) to cancel and close
 /// - Use Left/Right arrows to reorder items (if ordering is enabled)
 ///
 /// Create instances using the builder pattern via [`MultiSelectPicker::new`].
@@ -186,6 +202,15 @@ pub(crate) struct MultiSelectPicker {
 
     /// Whether left/right arrow reordering is enabled.
     ordering_enabled: bool,
+
+    /// Which pinned action row has focus, if any (`None` = list has focus).
+    action_focus: Option<ActionFocus>,
+
+    /// Builds the pinned confirm row label from the enabled-item count.
+    confirm_label: ConfirmLabelCallback,
+
+    /// Label for the pinned discard row.
+    cancel_label: String,
 
     /// Shared list keybindings for navigation and completion.
     keymap: ListKeymap,
@@ -307,7 +332,8 @@ impl MultiSelectPicker {
                 continue;
             };
             visible_to_row.push(rows.len());
-            let is_selected = self.state.selected_idx == Some(visible_idx);
+            let is_selected =
+                self.action_focus.is_none() && self.state.selected_idx == Some(visible_idx);
             let prefix = if is_selected { '›' } else { ' ' };
             let marker = if item.enabled { 'x' } else { ' ' };
             let item_name = truncate_text(&item.name, ITEM_NAME_TRUNCATE_LEN);
@@ -327,10 +353,13 @@ impl MultiSelectPicker {
             }
         }
 
-        let selected_idx = self
-            .state
-            .selected_idx
-            .and_then(|visible_idx| visible_to_row.get(visible_idx).copied());
+        let selected_idx = if self.action_focus.is_some() {
+            None
+        } else {
+            self.state
+                .selected_idx
+                .and_then(|visible_idx| visible_to_row.get(visible_idx).copied())
+        };
         let scroll_top = visible_to_row
             .get(self.state.scroll_top)
             .copied()
@@ -344,41 +373,126 @@ impl MultiSelectPicker {
         }
     }
 
-    /// Moves the selection cursor up, wrapping to the bottom if at the top.
-    fn move_up(&mut self) {
-        let len = self.visible_len();
-        self.state.move_up_wrap(len);
-        let visible = Self::max_visible_rows(len);
-        self.state.ensure_visible(len, visible);
+    /// Builds the pinned rows shown below the list: a separator, the confirm
+    /// action, and the discard action. The focused action row is rendered with
+    /// the shared accent style via the returned scroll state.
+    fn build_action_rows(&self) -> BuiltRows {
+        let confirm_prefix = if self.action_focus == Some(ActionFocus::Confirm) {
+            '›'
+        } else {
+            ' '
+        };
+        let cancel_prefix = if self.action_focus == Some(ActionFocus::Cancel) {
+            '›'
+        } else {
+            ' '
+        };
+        let enabled = self.items.iter().filter(|item| item.enabled).count();
+        let confirm_label = (self.confirm_label)(enabled);
+        let rows = vec![
+            GenericDisplayRow {
+                name: SECTION_BREAK_ROW.to_string(),
+                is_disabled: true,
+                ..Default::default()
+            },
+            GenericDisplayRow {
+                name: format!("{confirm_prefix} ➤ {confirm_label}"),
+                ..Default::default()
+            },
+            GenericDisplayRow {
+                name: format!("{cancel_prefix} ✕ {}", self.cancel_label),
+                ..Default::default()
+            },
+        ];
+        let selected_idx = match self.action_focus {
+            Some(ActionFocus::Confirm) => Some(1),
+            Some(ActionFocus::Cancel) => Some(2),
+            None => None,
+        };
+        BuiltRows {
+            rows,
+            state: ScrollState {
+                selected_idx,
+                scroll_top: 0,
+            },
+        }
     }
 
-    /// Moves the selection cursor down, wrapping to the top if at the bottom.
+    /// Moves the selection cursor up. From the top of the list this walks onto
+    /// the pinned action rows (discard first), keeping the wrap-around feel.
+    fn move_up(&mut self) {
+        let len = self.visible_len();
+        match self.action_focus {
+            Some(ActionFocus::Cancel) => self.action_focus = Some(ActionFocus::Confirm),
+            Some(ActionFocus::Confirm) => {
+                self.action_focus = None;
+                self.jump_bottom();
+            }
+            None => {
+                if len == 0 || self.state.selected_idx == Some(0) {
+                    self.action_focus = Some(ActionFocus::Cancel);
+                } else {
+                    self.state.move_up_wrap(len);
+                    let visible = Self::max_visible_rows(len);
+                    self.state.ensure_visible(len, visible);
+                }
+            }
+        }
+    }
+
+    /// Moves the selection cursor down. Past the bottom of the list this walks
+    /// onto the pinned action rows, then wraps back to the top of the list.
     fn move_down(&mut self) {
         let len = self.visible_len();
-        self.state.move_down_wrap(len);
-        let visible = Self::max_visible_rows(len);
-        self.state.ensure_visible(len, visible);
+        match self.action_focus {
+            Some(ActionFocus::Confirm) => self.action_focus = Some(ActionFocus::Cancel),
+            Some(ActionFocus::Cancel) => {
+                self.action_focus = None;
+                self.jump_top();
+            }
+            None => {
+                if len == 0 || self.state.selected_idx == Some(len.saturating_sub(1)) {
+                    self.action_focus = Some(ActionFocus::Confirm);
+                } else {
+                    self.state.move_down_wrap(len);
+                    let visible = Self::max_visible_rows(len);
+                    self.state.ensure_visible(len, visible);
+                }
+            }
+        }
     }
 
     fn page_up(&mut self) {
+        if self.visible_len() > 0 {
+            self.action_focus = None;
+        }
         let len = self.visible_len();
         let visible = Self::max_visible_rows(len);
         self.state.page_up_clamped(len, visible);
     }
 
     fn page_down(&mut self) {
+        if self.visible_len() > 0 {
+            self.action_focus = None;
+        }
         let len = self.visible_len();
         let visible = Self::max_visible_rows(len);
         self.state.page_down_clamped(len, visible);
     }
 
     fn jump_top(&mut self) {
+        if self.visible_len() > 0 {
+            self.action_focus = None;
+        }
         let len = self.visible_len();
         let visible = Self::max_visible_rows(len);
         self.state.jump_top(len, visible);
     }
 
     fn jump_bottom(&mut self) {
+        if self.visible_len() > 0 {
+            self.action_focus = None;
+        }
         let len = self.visible_len();
         let visible = Self::max_visible_rows(len);
         self.state.jump_bottom(len, visible);
@@ -402,6 +516,16 @@ impl MultiSelectPicker {
         self.update_preview_line();
         if let Some(on_change) = &self.on_change {
             on_change(&self.items, &self.app_event_tx);
+        }
+    }
+
+    /// Activates whatever has focus: toggles the highlighted item, or fires
+    /// the focused pinned action row.
+    fn activate(&mut self) {
+        match self.action_focus {
+            None => self.toggle_selected(),
+            Some(ActionFocus::Confirm) => self.confirm_selection(),
+            Some(ActionFocus::Cancel) => self.close(),
         }
     }
 
@@ -532,12 +656,14 @@ impl BottomPaneView for MultiSelectPicker {
         match key_event {
             _ if allow_plain_char_navigation
                 && self.ordering_enabled
+                && self.action_focus.is_none()
                 && self.keymap.move_left.is_pressed(key_event) =>
             {
                 self.move_selected_item(Direction::Up);
             }
             _ if allow_plain_char_navigation
                 && self.ordering_enabled
+                && self.action_focus.is_none()
                 && self.keymap.move_right.is_pressed(key_event) =>
             {
                 self.move_selected_item(Direction::Down);
@@ -564,15 +690,24 @@ impl BottomPaneView for MultiSelectPicker {
                 code: KeyCode::Backspace,
                 ..
             } => {
+                self.action_focus = None;
                 self.search_query.pop();
                 self.apply_filter();
+            }
+            KeyEvent {
+                code: KeyCode::Tab, ..
+            } => {
+                self.action_focus = match self.action_focus {
+                    None => Some(ActionFocus::Confirm),
+                    Some(_) => None,
+                };
             }
             KeyEvent {
                 code: KeyCode::Char(' '),
                 modifiers: KeyModifiers::NONE,
                 ..
-            } => self.toggle_selected(),
-            _ if self.keymap.accept.is_pressed(key_event) => self.confirm_selection(),
+            } => self.activate(),
+            _ if self.keymap.accept.is_pressed(key_event) => self.activate(),
             _ if self.keymap.cancel.is_pressed(key_event) => self.close(),
             KeyEvent {
                 code: KeyCode::Char(c),
@@ -581,6 +716,9 @@ impl BottomPaneView for MultiSelectPicker {
             } if !modifiers.contains(KeyModifiers::CONTROL)
                 && !modifiers.contains(KeyModifiers::ALT) =>
             {
+                // Typing is a list-intent signal: pull focus off the action
+                // rows so Enter after a search toggles the match, not a button.
+                self.action_focus = None;
                 self.search_query.push(c);
                 self.apply_filter();
             }
@@ -597,6 +735,8 @@ impl Renderable for MultiSelectPicker {
 
         let mut height = self.header.desired_height(width.saturating_sub(4));
         height = height.saturating_add(rows_height + 3);
+        // Pinned separator + confirm/discard action rows.
+        height = height.saturating_add(3);
         height = height.saturating_add(2);
         height.saturating_add(1 + preview_height)
     }
@@ -622,11 +762,12 @@ impl Renderable for MultiSelectPicker {
         let rows = self.build_rows();
         let rows_width = Self::rows_width(content_area.width);
         let rows_height = self.rows_height(&rows);
-        let [header_area, _, search_area, list_area] = Layout::vertical([
+        let [header_area, _, search_area, list_area, actions_area] = Layout::vertical([
             Constraint::Max(header_height),
             Constraint::Max(1),
             Constraint::Length(2),
             Constraint::Length(rows_height),
+            Constraint::Length(3),
         ])
         .areas(content_area.inset(Insets::vh(/*v*/ 1, /*h*/ 2)));
 
@@ -669,6 +810,24 @@ impl Renderable for MultiSelectPicker {
                 &rows.state,
                 render_area.height as usize,
                 "no matches",
+            );
+        }
+
+        if actions_area.height > 0 {
+            let action_rows = self.build_action_rows();
+            let render_area = Rect {
+                x: actions_area.x.saturating_sub(2),
+                y: actions_area.y,
+                width: rows_width.max(1),
+                height: actions_area.height,
+            };
+            render_rows_single_line(
+                render_area,
+                buf,
+                &action_rows.rows,
+                &action_rows.state,
+                render_area.height as usize,
+                "",
             );
         }
 
@@ -720,6 +879,8 @@ pub(crate) struct MultiSelectPickerBuilder {
     ordering_enabled: bool,
     app_event_tx: AppEventSender,
     keymap: ListKeymap,
+    confirm_label: Option<ConfirmLabelCallback>,
+    cancel_label: Option<String>,
     preview_builder: Option<PreviewCallback>,
     on_change: Option<ChangeCallBack>,
     on_confirm: Option<ConfirmCallback>,
@@ -737,6 +898,8 @@ impl MultiSelectPickerBuilder {
             ordering_enabled: false,
             app_event_tx,
             keymap: RuntimeKeymap::defaults().list,
+            confirm_label: None,
+            cancel_label: None,
             preview_builder: None,
             on_change: None,
             on_confirm: None,
@@ -764,6 +927,23 @@ impl MultiSelectPickerBuilder {
         self
     }
 
+    /// Sets the label builder for the pinned confirm row. Receives the number
+    /// of enabled items so the label can carry a live count, e.g.
+    /// `|n| format!("Add {n} selected models")`.
+    pub fn confirm_label<F>(mut self, callback: F) -> Self
+    where
+        F: Fn(usize) -> String + Send + Sync + 'static,
+    {
+        self.confirm_label = Some(Box::new(callback));
+        self
+    }
+
+    /// Sets the label for the pinned discard row.
+    pub fn cancel_label(mut self, label: impl Into<String>) -> Self {
+        self.cancel_label = Some(label.into());
+        self
+    }
+
     /// Sets a callback to generate a preview line from the current item states.
     ///
     /// The callback receives all items and should return a [`Line`] to display,
@@ -788,7 +968,7 @@ impl MultiSelectPickerBuilder {
         self
     }
 
-    /// Sets a callback invoked when the user confirms their selection (Enter).
+    /// Sets a callback invoked when the user activates the pinned confirm row.
     ///
     /// The callback receives a list of IDs for all enabled items.
     pub fn on_confirm<F>(mut self, callback: F) -> Self
@@ -799,7 +979,8 @@ impl MultiSelectPickerBuilder {
         self
     }
 
-    /// Sets a callback invoked when the user cancels the picker (Escape).
+    /// Sets a callback invoked when the user cancels the picker (Escape or
+    /// the pinned discard row).
     pub fn on_cancel<F>(mut self, callback: F) -> Self
     where
         F: Fn(&AppEventSender) + Send + Sync + 'static,
@@ -821,11 +1002,10 @@ impl MultiSelectPickerBuilder {
         }
 
         let instructions = if self.instructions.is_empty() {
-            let mut spans = vec![
-                "Press ".into(),
-                key_hint::plain(KeyCode::Char(' ')).into(),
-                " to toggle".into(),
-            ];
+            let accept = primary_binding(&self.keymap.accept)
+                .unwrap_or_else(|| key_hint::plain(KeyCode::Enter));
+            let mut spans: Vec<Span<'static>> =
+                vec!["Press ".into(), accept.into(), " to select".into()];
             if self.ordering_enabled
                 && let (Some(move_left), Some(move_right)) = (
                     primary_binding(&self.keymap.move_left),
@@ -838,11 +1018,11 @@ impl MultiSelectPickerBuilder {
                 spans.push(move_right.into());
                 spans.push(" to move".into());
             }
-            if let Some(accept) = primary_binding(&self.keymap.accept) {
-                spans.push("; ".into());
-                spans.push(accept.into());
-                spans.push(" to confirm and close".into());
-            }
+            spans.push("; ".into());
+            spans.push(key_hint::plain(KeyCode::Tab).into());
+            spans.push(" then ".into());
+            spans.push(accept.into());
+            spans.push(" to confirm or discard".into());
             if let Some(cancel) = primary_binding(&self.keymap.cancel) {
                 spans.push("; ".into());
                 spans.push(cancel.into());
@@ -861,6 +1041,13 @@ impl MultiSelectPickerBuilder {
             header: Box::new(header),
             footer_hint: Line::from(instructions),
             ordering_enabled: self.ordering_enabled,
+            action_focus: None,
+            confirm_label: self
+                .confirm_label
+                .unwrap_or_else(|| Box::new(|n| format!("Confirm ({n} selected)"))),
+            cancel_label: self
+                .cancel_label
+                .unwrap_or_else(|| "Discard and close".to_string()),
             keymap: self.keymap,
             search_query: String::new(),
             filtered_indices: Vec::new(),
@@ -1047,6 +1234,206 @@ mod tests {
 
         assert_eq!(picker.search_query, "j");
         assert_eq!(picker.filtered_indices, vec![1]);
+        assert_eq!(picker.state.selected_idx, Some(0));
+    }
+
+    #[test]
+    fn enter_toggles_highlighted_item_instead_of_confirming() {
+        let mut picker = test_picker(vec![
+            item(
+                "alpha", /*orderable*/ true, /*section_break_after*/ false,
+            ),
+            item(
+                "beta", /*orderable*/ true, /*section_break_after*/ false,
+            ),
+        ]);
+
+        picker.handle_key_event(KeyEvent::from(KeyCode::Enter));
+        assert!(!picker.complete);
+        assert!(picker.items[0].enabled);
+
+        picker.handle_key_event(KeyEvent::from(KeyCode::Enter));
+        assert!(!picker.complete);
+        assert!(!picker.items[0].enabled);
+    }
+
+    #[test]
+    fn arrows_walk_through_pinned_action_rows_and_wrap() {
+        let mut picker = test_picker(vec![
+            item(
+                "alpha", /*orderable*/ true, /*section_break_after*/ false,
+            ),
+            item(
+                "beta", /*orderable*/ true, /*section_break_after*/ false,
+            ),
+        ]);
+        assert_eq!(picker.state.selected_idx, Some(0));
+
+        picker.move_down(); // beta
+        picker.move_down(); // confirm row
+        assert_eq!(picker.action_focus, Some(ActionFocus::Confirm));
+        picker.move_down(); // discard row
+        assert_eq!(picker.action_focus, Some(ActionFocus::Cancel));
+        picker.move_down(); // wrap to top of list
+        assert_eq!(picker.action_focus, None);
+        assert_eq!(picker.state.selected_idx, Some(0));
+
+        picker.move_up(); // discard row
+        assert_eq!(picker.action_focus, Some(ActionFocus::Cancel));
+        picker.move_up(); // confirm row
+        assert_eq!(picker.action_focus, Some(ActionFocus::Confirm));
+        picker.move_up(); // back to bottom of list
+        assert_eq!(picker.action_focus, None);
+        assert_eq!(picker.state.selected_idx, Some(1));
+    }
+
+    #[test]
+    fn confirm_action_row_reports_enabled_ids() {
+        use std::sync::Arc;
+        use std::sync::Mutex;
+
+        let (tx, _rx) = unbounded_channel::<AppEvent>();
+        let confirmed: Arc<Mutex<Option<Vec<String>>>> = Arc::new(Mutex::new(None));
+        let confirmed_in = confirmed.clone();
+        let mut picker = MultiSelectPicker::builder(
+            "Test".to_string(),
+            /*subtitle*/ None,
+            AppEventSender::new(tx),
+        )
+        .items(vec![
+            item(
+                "alpha", /*orderable*/ true, /*section_break_after*/ false,
+            ),
+            item(
+                "beta", /*orderable*/ true, /*section_break_after*/ false,
+            ),
+        ])
+        .on_confirm(move |ids, _tx| {
+            *confirmed_in.lock().unwrap() = Some(ids.to_vec());
+        })
+        .build();
+
+        picker.handle_key_event(KeyEvent::from(KeyCode::Enter)); // toggle alpha
+        picker.handle_key_event(KeyEvent::from(KeyCode::Tab)); // jump to confirm row
+        assert_eq!(picker.action_focus, Some(ActionFocus::Confirm));
+        picker.handle_key_event(KeyEvent::from(KeyCode::Enter));
+
+        assert!(picker.complete);
+        assert_eq!(*confirmed.lock().unwrap(), Some(vec!["alpha".to_string()]));
+    }
+
+    #[test]
+    fn discard_action_row_cancels_without_confirming() {
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicBool;
+        use std::sync::atomic::Ordering;
+
+        let (tx, _rx) = unbounded_channel::<AppEvent>();
+        let confirmed = Arc::new(AtomicBool::new(false));
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let confirmed_in = confirmed.clone();
+        let cancelled_in = cancelled.clone();
+        let mut picker = MultiSelectPicker::builder(
+            "Test".to_string(),
+            /*subtitle*/ None,
+            AppEventSender::new(tx),
+        )
+        .items(vec![item(
+            "alpha", /*orderable*/ true, /*section_break_after*/ false,
+        )])
+        .on_confirm(move |_ids, _tx| {
+            confirmed_in.store(true, Ordering::SeqCst);
+        })
+        .on_cancel(move |_tx| {
+            cancelled_in.store(true, Ordering::SeqCst);
+        })
+        .build();
+
+        picker.handle_key_event(KeyEvent::from(KeyCode::Tab)); // confirm row
+        picker.handle_key_event(KeyEvent::from(KeyCode::Down)); // discard row
+        assert_eq!(picker.action_focus, Some(ActionFocus::Cancel));
+        picker.handle_key_event(KeyEvent::from(KeyCode::Enter));
+
+        assert!(picker.complete);
+        assert!(cancelled.load(Ordering::SeqCst));
+        assert!(!confirmed.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn typing_search_pulls_focus_off_action_rows() {
+        let mut picker = test_picker(vec![
+            item(
+                "alpha", /*orderable*/ true, /*section_break_after*/ false,
+            ),
+            item(
+                "beta", /*orderable*/ true, /*section_break_after*/ false,
+            ),
+        ]);
+
+        picker.handle_key_event(KeyEvent::from(KeyCode::Tab));
+        assert_eq!(picker.action_focus, Some(ActionFocus::Confirm));
+
+        picker.handle_key_event(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::NONE));
+        assert_eq!(picker.action_focus, None);
+        picker.handle_key_event(KeyEvent::from(KeyCode::Enter));
+        assert!(!picker.complete);
+        assert!(picker.items[1].enabled);
+
+        picker.handle_key_event(KeyEvent::from(KeyCode::Tab));
+        picker.handle_key_event(KeyEvent::from(KeyCode::Backspace));
+        assert_eq!(picker.action_focus, None);
+    }
+
+    #[test]
+    fn reorder_keys_ignored_while_action_row_focused() {
+        let mut picker = test_picker(vec![
+            item(
+                "model", /*orderable*/ true, /*section_break_after*/ false,
+            ),
+            item(
+                "branch", /*orderable*/ true, /*section_break_after*/ false,
+            ),
+        ]);
+
+        picker.handle_key_event(KeyEvent::from(KeyCode::Tab));
+        picker.handle_key_event(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::CONTROL));
+        assert_eq!(
+            picker
+                .items
+                .iter()
+                .map(|item| item.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["model", "branch"]
+        );
+    }
+
+    #[test]
+    fn page_keys_keep_action_focus_when_list_is_empty() {
+        let mut picker = test_picker(vec![item(
+            "alpha", /*orderable*/ true, /*section_break_after*/ false,
+        )]);
+
+        picker.handle_key_event(KeyEvent::new(KeyCode::Char('z'), KeyModifiers::NONE));
+        assert_eq!(picker.visible_len(), 0);
+        picker.handle_key_event(KeyEvent::from(KeyCode::Tab));
+        assert_eq!(picker.action_focus, Some(ActionFocus::Confirm));
+
+        picker.handle_key_event(KeyEvent::from(KeyCode::PageUp));
+        assert_eq!(picker.action_focus, Some(ActionFocus::Confirm));
+        picker.handle_key_event(KeyEvent::from(KeyCode::Home));
+        assert_eq!(picker.action_focus, Some(ActionFocus::Confirm));
+    }
+
+    #[test]
+    fn tab_jumps_between_list_and_action_rows() {
+        let mut picker = test_picker(vec![item(
+            "alpha", /*orderable*/ true, /*section_break_after*/ false,
+        )]);
+
+        picker.handle_key_event(KeyEvent::from(KeyCode::Tab));
+        assert_eq!(picker.action_focus, Some(ActionFocus::Confirm));
+        picker.handle_key_event(KeyEvent::from(KeyCode::Tab));
+        assert_eq!(picker.action_focus, None);
         assert_eq!(picker.state.selected_idx, Some(0));
     }
 

@@ -1,0 +1,19 @@
+---
+source: tui/src/chatwidget/tests/model_pickers.rs
+assertion_line: 40
+expression: model_picker_snapshot(&chat)
+---
+  Select models
+  openai-com: 3 discovered. Enter selects models to probe and add to /model.
+
+  Type to search
+  >
+› [ ] gpt-5.5      98304 ctx; out default; capability probe pending
+  [x] gpt-5.5-pro  98304 ctx; out default; capability probe pending
+  [ ] chat-latest  98304 ctx; out default; capability probe pending
+  ───────────────────────
+  ➤ Add 1 selected model
+  ✕ Discard and close
+
+  Selected: gpt-5.5-pro
+  Press enter to select; tab then enter to confirm or discard; esc to close

@@ -1,5 +1,6 @@
 ---
 source: tui/src/chatwidget/tests/status_surface_previews.rs
+assertion_line: 311
 expression: terminal_title_popup_snapshot(&mut chat)
 ---
   Configure Terminal Title
@@ -15,6 +16,9 @@ expression: terminal_title_popup_snapshot(&mut chat)
   [ ] current-dir    Current working directory
   [ ] activity       Spinner while working, action-required message while blocked.
   [ ] run-state      Compact session run-state text (Ready, Working, Thinking)
+  ───────────────────────
+  ➤ Save title (4 selected)
+  ✕ Discard changes
 
   preview-live-root | Live preview thread | feature/live-preview-branch | Tasks 2/5
-  Press space to toggle; ←/→ to move; enter to confirm and close; esc to close
+  Press enter to select; ←/→ to move; tab then enter to confirm or discard; esc to close

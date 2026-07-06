@@ -1,0 +1,20 @@
+---
+source: tui/src/chatwidget/tests/model_pickers.rs
+assertion_line: 51
+expression: model_picker_snapshot(&chat)
+---
+  Add models
+  2 model(s) across all providers. Enter toggles; checked models appear in /model.
+
+  Type to search
+  >
+› [ ] ➕  Add a custom mod...  Press Enter to connect a new provider: enter its URL and API key, t…
+  ───────────────────────
+  [x] gpt-5.5                 openai-com; on; upstream gpt-5.5; 98304 ctx; out default; thinking …
+  [ ] glm-5                   openai-com; off; upstream glm-5; 98304 ctx; out default; thinking n…
+  ───────────────────────
+  ➤ Apply selection (1 enabled)
+  ✕ Discard changes
+
+  1 enabled
+  Press enter to select; tab then enter to confirm or discard; esc to close

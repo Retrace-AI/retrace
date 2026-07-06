@@ -1,5 +1,6 @@
 ---
 source: tui/src/chatwidget/tests/status_surface_previews.rs
+assertion_line: 274
 expression: status_line_popup_snapshot(&mut chat)
 ---
   Configure Status Line
@@ -15,6 +16,9 @@ expression: status_line_popup_snapshot(&mut chat)
   [ ] model-with-reasoning  Current model name with reasoning level
   [ ] reasoning             Current reasoning level
   [ ] current-dir           Current working directory
+  ───────────────────────
+  ➤ Save status line (3 selected)
+  ✕ Discard changes
 
   monthly 65% left · weekly 50% left
-  Press space to toggle; ←/→ to move; enter to confirm and close; esc to close
+  Press enter to select; ←/→ to move; tab then enter to confirm or discard; esc to close

@@ -288,6 +288,8 @@ impl TerminalTitleSetupView {
             .list_keymap(list_keymap)
             .items(items)
             .enable_ordering()
+            .confirm_label(|selected| format!("Save title ({selected} selected)"))
+            .cancel_label("Discard changes")
             .on_preview(move |items| {
                 let items = parse_terminal_title_items(
                     items
