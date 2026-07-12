@@ -343,6 +343,7 @@ use self::goal_status::goal_status_indicator_from_app_goal;
 mod goal_menu;
 mod goal_validation;
 mod ide_context;
+pub(crate) mod inference;
 use self::ide_context::IdeContextState;
 mod input_queue;
 use self::input_queue::InputQueueState;
@@ -688,6 +689,10 @@ pub(crate) struct ChatWidget {
     quit_shortcut_key: Option<KeyBinding>,
     // Runtime metrics accumulated across delta snapshots for the active turn.
     turn_runtime_metrics: RuntimeMetricsSummary,
+    // Live inference-speed tracking for the strip shown above the composer. All
+    // measured directly off the streamed deltas so the numbers are provider-
+    // agnostic and do not depend on otel/debug snapshots being enabled.
+    inference: self::inference::InferenceTracker,
     last_rendered_width: std::cell::Cell<Option<usize>>,
     // Feedback sink for /feedback
     feedback: codex_feedback::CodexFeedback,
@@ -1226,6 +1231,9 @@ impl ChatWidget {
     pub(crate) fn pre_draw_tick(&mut self) {
         self.update_due_hook_visibility();
         self.schedule_hook_timer_if_needed();
+        // Refresh the inference-speed strip shown above the composer.
+        let inference_line = crate::inference_strip::inference_strip_line(&self.inference_metrics());
+        self.bottom_pane.set_inference_line(inference_line);
         self.bottom_pane.pre_draw_tick();
         if let Some(pet) = self.ambient_pet.as_ref() {
             pet.schedule_next_frame();

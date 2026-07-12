@@ -231,6 +231,9 @@ pub(crate) struct BottomPane {
 
     /// Inline status indicator shown above the composer while a task is running.
     status: Option<StatusIndicatorWidget>,
+    /// Inference-speed strip line, rendered directly above the composer input.
+    /// Set each frame by the ChatWidget from the live inference metrics.
+    inference_line: Option<ratatui::text::Line<'static>>,
     /// Unified exec session summary source.
     ///
     /// When a status row exists, this summary is mirrored inline in that row;
@@ -296,6 +299,7 @@ impl BottomPane {
             disable_paste_burst,
             is_task_running: false,
             status: None,
+            inference_line: None,
             unified_exec_footer: UnifiedExecFooter::new(),
             live_agent_status: LiveAgentStatusPanel::new(
                 frame_requester.clone(),
@@ -412,6 +416,11 @@ impl BottomPane {
     ) {
         self.composer.set_collaboration_mode_indicator(indicator);
         self.request_redraw();
+    }
+
+    /// Set the inference-speed strip line rendered directly above the composer.
+    pub(crate) fn set_inference_line(&mut self, line: Option<ratatui::text::Line<'static>>) {
+        self.inference_line = line;
     }
 
     pub fn set_goal_status_indicator(&mut self, indicator: Option<GoalStatusIndicator>) {
@@ -1688,6 +1697,16 @@ impl BottomPane {
             }
             let mut flex2 = FlexRenderable::new();
             flex2.push(/*flex*/ 1, RenderableItem::Owned(flex.into()));
+            // Inference-speed strip: directly above the composer input, below the
+            // working-status line and any above-composer panels.
+            flex2.push(
+                /*flex*/ 0,
+                RenderableItem::Owned(Box::new(
+                    crate::inference_strip::InferenceStripRenderable {
+                        line: self.inference_line.clone(),
+                    },
+                )),
+            );
             let composer: RenderableItem<'_> = if composer_right_reserve == 0 {
                 RenderableItem::Borrowed(&self.composer)
             } else {

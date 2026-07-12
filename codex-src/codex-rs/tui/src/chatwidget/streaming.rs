@@ -194,6 +194,7 @@ impl ChatWidget {
         // For reasoning deltas, do not stream to history. Accumulate the
         // current reasoning block and extract the first bold element
         // (between **/**) as the chunk header. Show this header as status.
+        self.record_inference_delta(&delta);
         self.reasoning_buffer.push_str(&delta);
 
         if self.unified_exec_wait_streak.is_some() {
@@ -383,6 +384,7 @@ impl ChatWidget {
         if !delta.is_empty() {
             self.record_visible_turn_activity();
         }
+        self.record_inference_delta(&delta);
         if self.stream_controller.is_none() {
             // Before starting an agent stream, flush any active exec cell group.
             self.flush_unified_exec_wait_streak();
