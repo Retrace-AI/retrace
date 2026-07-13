@@ -8,6 +8,26 @@ Anthropic-compatible — by just giving it a URL and an API key. It probes each
 model's real capabilities live, streams responses and reasoning, and runs
 collaboration modes that are sandboxed by your OS, not by prompt text.
 
+## See it in action
+
+### Detects a model's thinking capabilities
+
+`/model probe` queries a model against its **live** endpoint to detect its thinking
+format, validated reasoning-effort levels, prompt-cache support, streaming shape, and
+real context window — then hot-reloads the catalog. No hardcoded model lists: Retrace
+learns what each model can actually do.
+
+![Retrace detecting a model's thinking capabilities](docs/images/thinking-detection.png)
+
+### Shows live token speeds
+
+A strip above the input reports real-time inference speed for every turn —
+**time-to-first-token**, **current decode tok/s**, a **session-average** decode rate,
+and an estimated **prefill** rate. It's measured client-side straight from the stream,
+so it works with any provider and any model.
+
+![Retrace showing live token speeds: ttft, decode, avg, prefill](docs/images/token-speeds.png)
+
 ## Install (macOS)
 
 ```sh
@@ -57,6 +77,9 @@ curl -fsSL https://raw.githubusercontent.com/Retrace-AI/retrace/main/install.sh 
   a provider upgrades a model or when a model's capabilities look wrong.
 - **Always-streaming.** Tokens and reasoning stream live; `/thinking show|hide`
   controls whether the reasoning block is displayed.
+- **Live token speeds.** A strip above the composer shows **time-to-first-token**,
+  **current decode tok/s**, a **session-average** decode rate, and an estimated
+  **prefill** rate — measured client-side from the stream, so it works with any provider.
 - **Weak-model helper.** `/agent-check` re-checks each answer and auto-retries until
   it's actually complete.
 - **OS-sandboxed modes.** Shift+Tab cycles modes; **Ask** is read-only and **Readonly
