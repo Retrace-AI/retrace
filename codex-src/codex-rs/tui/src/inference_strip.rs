@@ -99,7 +99,8 @@ fn push_sep(spans: &mut Vec<Span<'static>>) {
 
 fn ttft_text(ttft_ms: Option<u64>) -> String {
     match ttft_ms {
-        None => "—".to_string(),
+        // Unmeasured (no request yet): show 0 rather than a dash.
+        None => "0 ms".to_string(),
         Some(ms) if ms < 1000 => format!("{ms} ms"),
         Some(ms) => format!("{:.2} s", ms as f64 / 1000.0),
     }
@@ -107,7 +108,8 @@ fn ttft_text(ttft_ms: Option<u64>) -> String {
 
 fn rate_text(tps: Option<f64>, estimated: bool) -> String {
     match tps {
-        None => "—".to_string(),
+        // Unmeasured (no request yet): show 0 rather than a dash.
+        None => "0 tok/s".to_string(),
         Some(v) => {
             let prefix = if estimated { "~" } else { "" };
             format!("{prefix}{v:.0} tok/s")
@@ -163,14 +165,15 @@ mod tests {
         let line = inference_strip_line(&m).expect("line");
         let t = text(&line);
         assert!(t.contains("avg ~44 tok/s"), "{t}");
-        assert!(t.contains("ttft —"), "{t}");
-        assert!(t.contains("decode —"), "{t}");
+        // Unmeasured metrics render as 0 (not a dash).
+        assert!(t.contains("ttft 0 ms"), "{t}");
+        assert!(t.contains("decode 0 tok/s"), "{t}");
     }
 
     #[test]
     fn ttft_switches_to_seconds_over_one_second() {
         assert_eq!(ttft_text(Some(620)), "620 ms");
         assert_eq!(ttft_text(Some(1240)), "1.24 s");
-        assert_eq!(ttft_text(None), "—");
+        assert_eq!(ttft_text(None), "0 ms");
     }
 }

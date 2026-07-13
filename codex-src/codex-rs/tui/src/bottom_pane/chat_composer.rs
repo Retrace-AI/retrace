@@ -4141,8 +4141,10 @@ impl ChatComposer {
             }
             ActivePopup::None => {
                 let footer_props = self.footer_props();
-                let show_cycle_hint = !footer_props.is_task_running
-                    && self.footer.collaboration_mode_indicator.is_some();
+                // Always surface the "Tab changes mode" hint whenever a mode
+                // indicator is shown (including while a task runs), so users can
+                // discover mode switching.
+                let show_cycle_hint = self.footer.collaboration_mode_indicator.is_some();
                 let show_shortcuts_hint = match footer_props.mode {
                     FooterMode::ComposerEmpty => !self.is_in_paste_burst(),
                     FooterMode::ComposerHasDraft => false,

@@ -945,6 +945,17 @@ fn sanitize_project_config(config: &mut TomlValue) -> Vec<String> {
     ignored_keys
 }
 
+/// True when `folder` is the home-directory `~/.codex`. Retrace remaps
+/// CODEX_HOME to `~/.retrace`, so a foreign `~/.codex` (e.g. from a real Codex
+/// install) is only seen as a project-local layer because the cwd is the home
+/// dir — it should not trigger the ignored-keys warning.
+fn is_home_dot_codex(folder: &AbsolutePathBuf) -> bool {
+    std::env::var_os("HOME")
+        .map(std::path::PathBuf::from)
+        .map(|home| home.join(".codex"))
+        .is_some_and(|home_codex| folder.as_path() == home_codex.as_path())
+}
+
 fn project_ignored_config_keys_warning(
     dot_codex_folder: &AbsolutePathBuf,
     ignored_keys: &[String],
@@ -1266,7 +1277,15 @@ async fn load_project_layers(
                     decision.is_trusted(),
                 )
                 .await?;
-                if disabled_reason.is_none() && !ignored_project_config_keys.is_empty() {
+                // Don't nag about the home-directory `~/.codex`: retrace remaps
+                // CODEX_HOME to `~/.retrace`, so a stray `~/.codex/config.toml`
+                // (e.g. from a real OpenAI Codex install) gets picked up as a
+                // project-local layer only because the cwd is the home dir. The
+                // denylisted keys are still stripped; we just suppress the noise.
+                if disabled_reason.is_none()
+                    && !ignored_project_config_keys.is_empty()
+                    && !is_home_dot_codex(&dot_codex_abs)
+                {
                     startup_warnings.push(project_ignored_config_keys_warning(
                         &dot_codex_abs,
                         &ignored_project_config_keys,

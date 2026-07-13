@@ -5,8 +5,8 @@
 //!
 //! - **Fuzzy search**: Type to filter items by name
 //! - **Toggle selection**: Enter (or Space) toggles the highlighted item
-//! - **Pinned action rows**: confirm/discard rows below the list; reach them
-//!   with Down past the last item (or Tab) and press Enter to activate
+//! - **Pinned action rows**: Submit/discard rows ABOVE the list; reach them
+//!   with Up past the first item (or Tab) and press Enter to activate
 //! - **Reordering**: Optional left/right arrow support to reorder items
 //! - **Live preview**: Optional callback to show a preview of current selections
 //! - **Callbacks**: Hooks for change, confirm, and cancel events
@@ -389,12 +389,9 @@ impl MultiSelectPicker {
         };
         let enabled = self.items.iter().filter(|item| item.enabled).count();
         let confirm_label = (self.confirm_label)(enabled);
+        // Submit + discard on top, then a separator that divides them from the
+        // item list rendered below.
         let rows = vec![
-            GenericDisplayRow {
-                name: SECTION_BREAK_ROW.to_string(),
-                is_disabled: true,
-                ..Default::default()
-            },
             GenericDisplayRow {
                 name: format!("{confirm_prefix} ➤ {confirm_label}"),
                 ..Default::default()
@@ -403,10 +400,15 @@ impl MultiSelectPicker {
                 name: format!("{cancel_prefix} ✕ {}", self.cancel_label),
                 ..Default::default()
             },
+            GenericDisplayRow {
+                name: SECTION_BREAK_ROW.to_string(),
+                is_disabled: true,
+                ..Default::default()
+            },
         ];
         let selected_idx = match self.action_focus {
-            Some(ActionFocus::Confirm) => Some(1),
-            Some(ActionFocus::Cancel) => Some(2),
+            Some(ActionFocus::Confirm) => Some(0),
+            Some(ActionFocus::Cancel) => Some(1),
             None => None,
         };
         BuiltRows {
@@ -762,12 +764,14 @@ impl Renderable for MultiSelectPicker {
         let rows = self.build_rows();
         let rows_width = Self::rows_width(content_area.width);
         let rows_height = self.rows_height(&rows);
-        let [header_area, _, search_area, list_area, actions_area] = Layout::vertical([
+        // Action rows (Submit / discard) render ABOVE the list so the submit
+        // control sits at the top, with the item list below it.
+        let [header_area, _, search_area, actions_area, list_area] = Layout::vertical([
             Constraint::Max(header_height),
             Constraint::Max(1),
             Constraint::Length(2),
-            Constraint::Length(rows_height),
             Constraint::Length(3),
+            Constraint::Length(rows_height),
         ])
         .areas(content_area.inset(Insets::vh(/*v*/ 1, /*h*/ 2)));
 

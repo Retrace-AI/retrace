@@ -8,11 +8,11 @@ expression: model_picker_snapshot(&chat)
 
   Type to search
   >
-› [ ] gpt-5.5      on; upstream gpt-5.5; 98304 ctx; out default; thinking none
-  [ ] gpt-5.5-pro  on; upstream gpt-5.5-pro; 98304 ctx; out default; thinking none
-  ───────────────────────
   ➤ Remove selected models (nothing selected yet)
   ✕ Discard and close
+  ───────────────────────
+› [ ] gpt-5.5      on; upstream gpt-5.5; 98304 ctx; out default; thinking none
+  [ ] gpt-5.5-pro  on; upstream gpt-5.5-pro; 98304 ctx; out default; thinking none
 
   0 selected for removal
   Press enter to select; tab then enter to confirm or discard; esc to close

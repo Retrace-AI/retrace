@@ -209,9 +209,12 @@ impl ChatWidget {
         let running = self.turn_lifecycle.agent_turn_running;
         let t = &self.inference;
 
-        // No turn has ever started: nothing to show.
+        // No turn has ever started yet: still show the strip, with zeros.
         let Some(start) = t.turn_start else {
-            return InferenceMetrics::default();
+            return InferenceMetrics {
+                has_data: true,
+                ..InferenceMetrics::default()
+            };
         };
 
         let ttft_ms = t
@@ -282,7 +285,8 @@ impl ChatWidget {
             prefill_tps,
             decode_estimated,
             running,
-            has_data: ttft_ms.is_some() || decode_tps.is_some() || avg_decode_tps.is_some(),
+            // Always show the strip; unmeasured values render as 0.
+            has_data: true,
         }
     }
 }
