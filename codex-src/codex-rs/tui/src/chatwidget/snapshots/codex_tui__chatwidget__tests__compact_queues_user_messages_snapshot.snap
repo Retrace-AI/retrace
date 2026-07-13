@@ -19,4 +19,4 @@ expression: normalize_snapshot_paths(term.backend().vt100().screen().contents())
 
 › Ask Retrace to do anything
 
-  [Build] · gpt-5.5 default · /tmp/project
+  Tab changes mode · [Build] · gpt-5.5 medium default · /tmp/project

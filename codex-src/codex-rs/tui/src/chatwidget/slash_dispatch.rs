@@ -1945,6 +1945,7 @@ impl ChatWidget {
         )
         .items(items)
         .list_keymap(list_keymap)
+        .default_focus_confirm()
         .confirm_label(|enabled| format!("Apply selection ({enabled} enabled)"))
         .cancel_label("Discard changes")
         .on_change(|items, tx| {
@@ -2298,6 +2299,9 @@ impl ChatWidget {
             }
             SlashCommand::Model => {
                 self.open_model_popup();
+            }
+            SlashCommand::ModelAdd => {
+                self.handle_model_command_args("add".to_string());
             }
             SlashCommand::Provider => {
                 self.open_codexos_provider_url_prompt(String::new());
@@ -3078,6 +3082,7 @@ impl ChatWidget {
             | SlashCommand::Compact
             | SlashCommand::Review
             | SlashCommand::Model
+            | SlashCommand::ModelAdd
             | SlashCommand::Provider
             | SlashCommand::Realtime
             | SlashCommand::Settings

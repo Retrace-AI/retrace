@@ -1234,6 +1234,14 @@ async fn load_project_layers(
         if dot_codex_abs == codex_home_abs || dot_codex_normalized == codex_home_normalized {
             continue;
         }
+        // Retrace remaps CODEX_HOME to `~/.retrace`, so the literal home
+        // `~/.codex` is a FOREIGN config (e.g. a real OpenAI Codex install). It
+        // is only seen here because the cwd is the home dir. Skip it entirely —
+        // otherwise its keys (e.g. `model_reasoning_effort = "medium"`) leak
+        // into retrace even though retrace's models don't share those variants.
+        if is_home_dot_codex(&dot_codex_abs) {
+            continue;
+        }
         let config_file = dot_codex_abs.join(CONFIG_TOML_FILE);
         match fs.read_file_text(&config_file, /*sandbox*/ None).await {
             Ok(contents) => {
@@ -1277,15 +1285,7 @@ async fn load_project_layers(
                     decision.is_trusted(),
                 )
                 .await?;
-                // Don't nag about the home-directory `~/.codex`: retrace remaps
-                // CODEX_HOME to `~/.retrace`, so a stray `~/.codex/config.toml`
-                // (e.g. from a real OpenAI Codex install) gets picked up as a
-                // project-local layer only because the cwd is the home dir. The
-                // denylisted keys are still stripped; we just suppress the noise.
-                if disabled_reason.is_none()
-                    && !ignored_project_config_keys.is_empty()
-                    && !is_home_dot_codex(&dot_codex_abs)
-                {
+                if disabled_reason.is_none() && !ignored_project_config_keys.is_empty() {
                     startup_warnings.push(project_ignored_config_keys_warning(
                         &dot_codex_abs,
                         &ignored_project_config_keys,

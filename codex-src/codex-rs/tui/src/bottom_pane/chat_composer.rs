@@ -4196,7 +4196,7 @@ impl ChatComposer {
                         passive_footer_status_line_with_mode_prefix(
                             &footer_props,
                             self.footer.collaboration_mode_indicator,
-                            /*show_cycle_hint*/ false,
+                            show_cycle_hint,
                         )
                     } else {
                         None

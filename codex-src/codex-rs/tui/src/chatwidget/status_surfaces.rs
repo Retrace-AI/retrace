@@ -786,8 +786,36 @@ impl ChatWidget {
     }
 
     fn reasoning_display_name(&self) -> String {
-        let effort = self.effective_reasoning_effort();
-        Self::status_line_reasoning_effort_label(effort.as_ref())
+        let effective = self.effective_reasoning_effort();
+        // The model's default reasoning variant, per the catalog.
+        let model = self.current_model().to_string();
+        let default = self.model_catalog.try_list_models().ok().and_then(|models| {
+            models
+                .into_iter()
+                .find(|preset| preset.model == model)
+                .map(|preset| preset.default_reasoning_effort)
+        });
+        // The variant actually in effect: an explicit override, else the default.
+        let in_use = effective.clone().or_else(|| default.clone());
+        // Whether that variant IS the model default (so we tag it "default").
+        let is_default = match (&effective, &default) {
+            (None, _) => true,
+            (Some(e), Some(d)) => e.as_str() == d.as_str(),
+            (Some(_), None) => false,
+        };
+        match in_use {
+            Some(effort) => {
+                // Always show the actual variant name; append "default" when it
+                // is the model's default variant (rather than hiding the name).
+                let name = Self::status_line_reasoning_effort_label(Some(&effort));
+                if is_default && name != "default" {
+                    format!("{name} default")
+                } else {
+                    name
+                }
+            }
+            None => "default".to_string(),
+        }
     }
 
     fn model_with_reasoning_display_name(&self) -> String {

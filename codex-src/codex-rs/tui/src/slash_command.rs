@@ -13,6 +13,10 @@ pub enum SlashCommand {
     // DO NOT ALPHA-SORT! Enum order is presentation order in the popup, so
     // more frequently used commands should be listed first.
     Model,
+    /// Same as `/model add`, exposed as its own top-level command that opens the
+    /// add-models picker directly.
+    #[strum(serialize = "ModelAdd", serialize = "model-add")]
+    ModelAdd,
     Provider,
     Thinking,
     AgentCheck,
@@ -117,6 +121,9 @@ impl SlashCommand {
             SlashCommand::Model => {
                 "choose model & reasoning effort; \"/model add\" enables more models from your providers, \"/model probe\" re-detects a model's capabilities"
             }
+            SlashCommand::ModelAdd => {
+                "enable more models from your providers (same as \"/model add\")"
+            }
             SlashCommand::Provider => "add, list, or remove API providers and their models",
             SlashCommand::Thinking => "show or hide the model's thinking: /thinking show|hide",
             SlashCommand::AgentCheck => {
@@ -168,6 +175,7 @@ impl SlashCommand {
                 | SlashCommand::Plan
                 | SlashCommand::Goal
                 | SlashCommand::Model
+                | SlashCommand::ModelAdd
                 | SlashCommand::Provider
                 | SlashCommand::Thinking
                 | SlashCommand::AgentCheck
@@ -207,6 +215,7 @@ impl SlashCommand {
             | SlashCommand::Init
             | SlashCommand::Compact
             | SlashCommand::Model
+            | SlashCommand::ModelAdd
             | SlashCommand::Provider
             | SlashCommand::Personality
             | SlashCommand::Permissions

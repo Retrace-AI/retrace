@@ -881,6 +881,7 @@ pub(crate) struct MultiSelectPickerBuilder {
     instructions: Vec<Span<'static>>,
     items: Vec<MultiSelectItem>,
     ordering_enabled: bool,
+    default_focus_confirm: bool,
     app_event_tx: AppEventSender,
     keymap: ListKeymap,
     confirm_label: Option<ConfirmLabelCallback>,
@@ -900,6 +901,7 @@ impl MultiSelectPickerBuilder {
             instructions: Vec::new(),
             items: Vec::new(),
             ordering_enabled: false,
+            default_focus_confirm: false,
             app_event_tx,
             keymap: RuntimeKeymap::defaults().list,
             confirm_label: None,
@@ -914,6 +916,13 @@ impl MultiSelectPickerBuilder {
     /// Sets the list of selectable items.
     pub fn items(mut self, items: Vec<MultiSelectItem>) -> Self {
         self.items = items;
+        self
+    }
+
+    /// Opens with the Submit ("Apply selection") action row focused by default,
+    /// rather than the first list item, so Enter confirms immediately.
+    pub fn default_focus_confirm(mut self) -> Self {
+        self.default_focus_confirm = true;
         self
     }
 
@@ -1045,7 +1054,13 @@ impl MultiSelectPickerBuilder {
             header: Box::new(header),
             footer_hint: Line::from(instructions),
             ordering_enabled: self.ordering_enabled,
-            action_focus: None,
+            // Optionally default focus to the Submit ("Apply selection") action
+            // row at the top rather than the first list item (opt-in per picker).
+            action_focus: if self.default_focus_confirm {
+                Some(ActionFocus::Confirm)
+            } else {
+                None
+            },
             confirm_label: self
                 .confirm_label
                 .unwrap_or_else(|| Box::new(|n| format!("Confirm ({n} selected)"))),

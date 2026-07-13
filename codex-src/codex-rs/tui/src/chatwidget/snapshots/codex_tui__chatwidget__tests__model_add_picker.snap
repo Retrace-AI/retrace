@@ -1,6 +1,5 @@
 ---
 source: tui/src/chatwidget/tests/model_pickers.rs
-assertion_line: 51
 expression: model_picker_snapshot(&chat)
 ---
   Add models
@@ -8,10 +7,10 @@ expression: model_picker_snapshot(&chat)
 
   Type to search
   >
-  ➤ Apply selection (1 enabled)
+› ➤ Apply selection (1 enabled)
   ✕ Discard changes
   ───────────────────────
-› [ ] ➕  Add a custom mod...  Press Enter to connect a new provider: enter its URL and API key, t…
+  [ ] ➕  Add a custom mod...  Press Enter to connect a new provider: enter its URL and API key, t…
   ───────────────────────
   [x] gpt-5.5                 openai-com; on; upstream gpt-5.5; 98304 ctx; out default; thinking …
   [ ] glm-5                   openai-com; off; upstream glm-5; 98304 ctx; out default; thinking n…
