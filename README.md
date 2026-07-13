@@ -2,6 +2,10 @@
 
 **A local-first, provider-agnostic coding agent for your terminal.**
 
+<p align="center">
+  <img src="docs/images/demo.gif" alt="Retrace demo — live reasoning and a token-speed readout" width="760">
+</p>
+
 Retrace is a community fork of [OpenAI Codex](https://github.com/openai/codex) (Apache-2.0),
 reworked so you can point it at **any** model provider — OpenAI-compatible or
 Anthropic-compatible — by just giving it a URL and an API key. It probes each
