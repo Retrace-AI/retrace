@@ -28,7 +28,10 @@ so it works with any provider and any model.
 
 ![Retrace showing live token speeds: ttft, decode, avg, prefill](docs/images/token-speeds.png)
 
-## Install (macOS)
+## Install (macOS & Linux)
+
+The same one-liner works on both — it auto-detects your platform and installs the
+right binary and background service (launchd on macOS, systemd `--user` on Linux):
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/Retrace-AI/retrace/main/install.sh | bash
@@ -43,9 +46,15 @@ retrace
 On first launch there are no models configured — inside Retrace, run **`/model` →
 "Add custom model"** and paste your provider's base URL and API key. That's it.
 
-> Requires [Node.js](https://nodejs.org) (for the local proxy). Supported on
-> **macOS** (launchd) and **Linux x86_64** (systemd + `zsh`). Windows is on the
-> roadmap.
+**Supported platforms:**
+
+| Platform | Arch | Proxy service | Notes |
+| --- | --- | --- | --- |
+| **macOS** | Apple Silicon + Intel (`arm64`, `x86_64`) | launchd | — |
+| **Linux** | `x86_64` | systemd `--user` | requires `systemd` (`systemctl`) |
+
+> Requires [Node.js](https://nodejs.org) (for the local proxy) on both platforms.
+> Windows is on the roadmap.
 
 ### Browser control (on by default)
 
