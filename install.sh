@@ -176,6 +176,19 @@ else
   say "Existing config found — leaving it untouched."
 fi
 
+# --- Retrace branded fonts (Pixelify Sans + Departure Mono) -----------------
+# A terminal app can't set its own font, so we install the fonts to the user's
+# font directory; they pick one in their terminal settings for the Retrace look.
+if [ -d "$TMP/runtime/fonts" ]; then
+  case "$(uname -s)" in Darwin) FDIR="$HOME/Library/Fonts" ;; Linux) FDIR="$HOME/.local/share/fonts" ;; *) FDIR="" ;; esac
+  if [ -n "$FDIR" ]; then
+    mkdir -p "$FDIR"
+    cp -f "$TMP/runtime/fonts/"*.ttf "$TMP/runtime/fonts/"*.otf "$FDIR/" 2>/dev/null || true
+    command -v fc-cache >/dev/null 2>&1 && fc-cache -f "$FDIR" >/dev/null 2>&1 || true
+    say "Fonts installed — set your terminal font to 'Pixelify Sans' or 'Departure Mono' for the Retrace look."
+  fi
+fi
+
 # --- optional: browser control MCP (Playwright, vision/coordinate mode) -----
 setup_browser_mcp() {
   local cfg="$RETRACE_HOME/config.toml"
