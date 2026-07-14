@@ -446,6 +446,12 @@ pub(crate) const SUBMISSION_CHANNEL_CAPACITY: usize = 512;
 const CYBER_VERIFY_URL: &str = "https://chatgpt.com/cyber";
 const CYBER_SAFETY_URL: &str = "https://developers.openai.com/codex/concepts/cyber-safety";
 
+/// Fallback base prompt used whenever a catalog entry's stored
+/// `base_instructions` still carries the legacy "You are Codex" identity —
+/// covers models added via retrace-admin or a manual catalog edit before or
+/// after this fix, on any install, public or private.
+const UNIFIED_BASE_INSTRUCTIONS: &str = include_str!("unified_base_instructions.md");
+
 impl Codex {
     /// Spawn a new [`Codex`] and initialize the session.
     pub(crate) async fn spawn(args: CodexSpawnArgs) -> CodexResult<CodexSpawnOk> {
@@ -1184,11 +1190,19 @@ impl Session {
             .map(|v| v.trim().to_string())
             .filter(|v| !v.is_empty())
             .unwrap_or_else(|| "Retrace".to_string());
+        // Catalog entries (any model, any install, added now or in the future via
+        // retrace-admin or a manual catalog edit) may still carry the legacy
+        // "You are Codex" identity baked in at add-time, since additions clone
+        // whatever text was current then. Sanitize at the one place every
+        // request actually flows through, instead of chasing every add-path.
+        let stored = &state.session_configuration.base_instructions;
+        let source = if stored.contains("You are Codex") {
+            UNIFIED_BASE_INSTRUCTIONS
+        } else {
+            stored.as_str()
+        };
         BaseInstructions {
-            text: state
-                .session_configuration
-                .base_instructions
-                .replace("{{BRAND}}", &brand),
+            text: source.replace("{{BRAND}}", &brand),
         }
     }
 
