@@ -24,6 +24,7 @@ again. Tuning removed the repeat. Measured across 5 fresh tasks.
 
 | Metric | Before | After | Change |
 |---|--:|--:|--:|
+| Prefix-cache hit rate | 2.3% | 95.6% | +93 pts |
 | Redundant completion round-trips (per 5 tasks) | 5 | 1 | −80% |
 | Model calls / task | 5.0 | 3.6 | −28% |
 | Inference latency (5 tasks) | 50.5 s | 34.4 s | −32% |
