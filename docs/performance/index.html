@@ -1,0 +1,220 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Retrace — Performance</title>
+<meta name="description" content="Retrace is tuned for faster speeds: fewer round-trips, higher cache hits, lower latency. Benchmark data." />
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600;700&family=Geist+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+  :root{
+    --paper:#F4F5F7; --card:#FFFFFF; --ink:#0C0D11; --muted:#6A6E78;
+    --line:#E3E6EB; --line-2:#EEF0F3;
+    --fast:#1B45FF;      /* cool = fast (after) */
+    --slow:#DB501C;      /* heat = slow (before) */
+    --fast-wash:#EAEEFF; --slow-wash:#FBEBE3;
+    --sans:'Geist',-apple-system,BlinkMacSystemFont,'Segoe UI',system-ui,sans-serif;
+    --mono:'Geist Mono',ui-monospace,'SF Mono',Menlo,monospace;
+  }
+  @media (prefers-color-scheme: dark){
+    :root{ --paper:#0B0C0F; --card:#111318; --ink:#F3F4F6; --muted:#9AA0AB;
+      --line:#20242C; --line-2:#191C22; --fast:#5B78FF; --slow:#FF6A38;
+      --fast-wash:#141B34; --slow-wash:#2A1811; }
+  }
+  *{box-sizing:border-box}
+  html{-webkit-text-size-adjust:100%}
+  body{
+    margin:0; background:var(--paper); color:var(--ink);
+    font-family:var(--sans); font-size:17px; line-height:1.55;
+    -webkit-font-smoothing:antialiased; text-rendering:optimizeLegibility;
+    font-feature-settings:"ss01","cv01","tnum";
+  }
+  .wrap{max-width:900px; margin:0 auto; padding:0 24px}
+  a{color:inherit}
+
+  /* ---- top rule / eyebrow ---- */
+  .masthead{border-bottom:1px solid var(--line); margin-top:0}
+  .masthead .wrap{display:flex; align-items:center; justify-content:space-between; height:56px}
+  .brand{font-family:var(--mono); font-weight:500; font-size:13px; letter-spacing:.14em; text-transform:uppercase}
+  .brand b{color:var(--fast)}
+  .masthead nav{font-family:var(--mono); font-size:12.5px; letter-spacing:.1em; text-transform:uppercase; color:var(--muted)}
+
+  /* ---- hero ---- */
+  .hero{padding:88px 0 40px}
+  .eyebrow{font-family:var(--mono); font-size:12.5px; letter-spacing:.22em; text-transform:uppercase; color:var(--muted); margin:0 0 26px;
+    display:flex; align-items:center; gap:12px}
+  .eyebrow::before{content:""; width:30px; height:1px; background:var(--fast); display:inline-block}
+  h1{font-weight:600; font-size:clamp(44px,8vw,84px); line-height:.98; letter-spacing:-.03em; margin:0 0 22px}
+  h1 .em{font-style:normal; position:relative; white-space:nowrap}
+  h1 .em::after{content:""; position:absolute; left:0; right:0; bottom:.08em; height:.09em; background:var(--fast); transform:scaleX(0); transform-origin:left; animation:sweep 1s .35s cubic-bezier(.2,.7,.2,1) forwards}
+  @keyframes sweep{to{transform:scaleX(1)}}
+  .lede{font-size:clamp(18px,2.4vw,21px); color:var(--muted); max-width:56ch; margin:0}
+  .lede b{color:var(--ink); font-weight:500}
+
+  /* ---- headline stat row ---- */
+  .kpis{display:grid; grid-template-columns:repeat(3,1fr); gap:1px; background:var(--line);
+    border:1px solid var(--line); border-radius:14px; overflow:hidden; margin:52px 0 0}
+  .kpi{background:var(--card); padding:26px 24px}
+  .kpi .n{font-family:var(--mono); font-weight:500; font-size:clamp(34px,5vw,46px); letter-spacing:-.02em; line-height:1; color:var(--fast)}
+  .kpi .n small{font-size:.5em; color:var(--muted); font-weight:400; margin-left:2px}
+  .kpi .l{font-size:14px; color:var(--muted); margin-top:12px; line-height:1.35}
+
+  /* ---- section frame ---- */
+  section.block{padding:76px 0 4px}
+  .sec-head{display:flex; align-items:baseline; gap:16px; margin-bottom:8px}
+  .sec-idx{font-family:var(--mono); font-size:12.5px; color:var(--fast); letter-spacing:.1em}
+  h2{font-weight:600; font-size:clamp(24px,3.4vw,30px); letter-spacing:-.02em; margin:0}
+  .sec-note{color:var(--muted); font-size:15.5px; max-width:60ch; margin:14px 0 34px}
+
+  /* ---- the signature: before -> after velocity bars ---- */
+  .bars{display:flex; flex-direction:column; gap:26px; margin-top:10px}
+  .metric{border-top:1px solid var(--line-2); padding-top:20px}
+  .metric-top{display:flex; align-items:baseline; justify-content:space-between; gap:16px; margin-bottom:14px}
+  .metric-name{font-weight:500; font-size:16px}
+  .metric-delta{font-family:var(--mono); font-size:13.5px; font-weight:500; color:var(--fast);
+    background:var(--fast-wash); padding:4px 9px; border-radius:6px; white-space:nowrap}
+  .track{display:grid; grid-template-columns:64px 1fr 72px; align-items:center; gap:14px; margin-bottom:9px}
+  .track .tag{font-family:var(--mono); font-size:11.5px; letter-spacing:.08em; text-transform:uppercase; color:var(--muted)}
+  .track .val{font-family:var(--mono); font-size:14px; text-align:right; color:var(--ink)}
+  .rail{height:12px; border-radius:7px; background:var(--line-2); position:relative; overflow:hidden}
+  .fill{position:absolute; inset:0 auto 0 0; border-radius:7px; width:var(--w); transform:scaleX(0); transform-origin:left;
+    animation:grow .9s cubic-bezier(.2,.7,.2,1) forwards; animation-delay:var(--d,.2s)}
+  .fill.before{background:var(--slow)}
+  .fill.after{background:var(--fast)}
+  @keyframes grow{to{transform:scaleX(1)}}
+
+  /* ---- data table ---- */
+  .table-scroll{overflow-x:auto; border:1px solid var(--line); border-radius:14px; background:var(--card)}
+  table{border-collapse:collapse; width:100%; min-width:560px; font-size:15px}
+  thead th{font-family:var(--mono); font-weight:500; font-size:11.5px; letter-spacing:.1em; text-transform:uppercase;
+    color:var(--muted); text-align:left; padding:16px 22px; border-bottom:1px solid var(--line)}
+  thead th:not(:first-child){text-align:right}
+  tbody td{padding:15px 22px; border-bottom:1px solid var(--line-2); font-family:var(--mono); font-size:14.5px; text-align:right; white-space:nowrap}
+  tbody td:first-child{font-family:var(--sans); font-size:15px; text-align:left; color:var(--ink)}
+  tbody tr:last-child td{border-bottom:none}
+  td .up{color:var(--fast)} td .dn{color:var(--fast)}
+  .cap{color:var(--muted)}
+
+  /* ---- methodology ---- */
+  .method{background:var(--card); border:1px solid var(--line); border-radius:14px; padding:26px 26px; margin-top:22px}
+  .method h3{font-family:var(--mono); font-size:12px; letter-spacing:.14em; text-transform:uppercase; color:var(--muted); margin:0 0 14px}
+  .method ul{margin:0; padding-left:18px; color:var(--muted); font-size:14.5px; line-height:1.7}
+  .method li b{color:var(--ink); font-weight:500}
+  .method .mono{font-family:var(--mono); font-size:13px}
+
+  footer{border-top:1px solid var(--line); margin-top:80px; padding:34px 0 70px; color:var(--muted); font-size:13.5px; font-family:var(--mono); letter-spacing:.03em}
+  footer a{color:var(--fast); text-decoration:none}
+
+  @media (max-width:640px){
+    .kpis{grid-template-columns:1fr}
+    .track{grid-template-columns:52px 1fr 64px; gap:10px}
+    .hero{padding:60px 0 24px}
+  }
+  @media (prefers-reduced-motion:reduce){
+    .fill,.h1 .em::after{animation:none; transform:none}
+    .fill{transform:scaleX(1)}
+    h1 .em::after{transform:scaleX(1)}
+  }
+</style>
+</head>
+<body>
+
+  <header class="masthead"><div class="wrap">
+    <div class="brand">Re<b>trace</b></div>
+    <nav>Performance&nbsp;·&nbsp;Benchmark</nav>
+  </div></header>
+
+  <main class="wrap">
+
+    <section class="hero">
+      <p class="eyebrow">Retrace · tuned for speed</p>
+      <h1>Fewer round-trips.<br><span class="em">Faster answers.</span></h1>
+      <p class="lede">Retrace is a local-first coding agent, tuned so the model spends its turns doing work — not repeating itself. A round of profiling and tuning cut the wasted model calls and <b>dropped end-to-end latency by a third</b>, with no loss in answer quality.</p>
+
+      <div class="kpis">
+        <div class="kpi"><div class="n">−32<small>%</small></div><div class="l">inference latency,<br>after tuning</div></div>
+        <div class="kpi"><div class="n">−28<small>%</small></div><div class="l">model calls<br>per task</div></div>
+        <div class="kpi"><div class="n">95.6<small>%</small></div><div class="l">prefix-cache<br>hit rate</div></div>
+      </div>
+    </section>
+
+    <!-- SIGNATURE: before -> after -->
+    <section class="block">
+      <div class="sec-head"><span class="sec-idx">01</span><h2>What the tuning did</h2></div>
+      <p class="sec-note">Each agent task runs the model several times. Profiling showed a share of those calls were redundant — the model would deliver its answer, then get asked to deliver it again. Tuning removed the repeat. Measured across 5 fresh tasks, warm→cold.</p>
+
+      <div class="bars">
+        <div class="metric">
+          <div class="metric-top"><span class="metric-name">Redundant completion round-trips</span><span class="metric-delta">−80%</span></div>
+          <div class="track"><span class="tag">Before</span><div class="rail"><span class="fill before" style="--w:100%;--d:.15s"></span></div><span class="val">5</span></div>
+          <div class="track"><span class="tag">After</span><div class="rail"><span class="fill after" style="--w:20%;--d:.35s"></span></div><span class="val">1</span></div>
+        </div>
+        <div class="metric">
+          <div class="metric-top"><span class="metric-name">Model calls per task</span><span class="metric-delta">−28%</span></div>
+          <div class="track"><span class="tag">Before</span><div class="rail"><span class="fill before" style="--w:100%;--d:.2s"></span></div><span class="val">5.0</span></div>
+          <div class="track"><span class="tag">After</span><div class="rail"><span class="fill after" style="--w:72%;--d:.4s"></span></div><span class="val">3.6</span></div>
+        </div>
+        <div class="metric">
+          <div class="metric-top"><span class="metric-name">Inference latency&nbsp;·&nbsp;5 tasks</span><span class="metric-delta">−32%</span></div>
+          <div class="track"><span class="tag">Before</span><div class="rail"><span class="fill before" style="--w:100%;--d:.25s"></span></div><span class="val">50.5s</span></div>
+          <div class="track"><span class="tag">After</span><div class="rail"><span class="fill after" style="--w:68%;--d:.45s"></span></div><span class="val">34.4s</span></div>
+        </div>
+        <div class="metric">
+          <div class="metric-top"><span class="metric-name">Prefix-cache hit rate</span><span class="metric-delta">+5.1 pts</span></div>
+          <div class="track"><span class="tag">Before</span><div class="rail"><span class="fill before" style="--w:90.5%;--d:.3s;background:var(--muted)"></span></div><span class="val">90.5%</span></div>
+          <div class="track"><span class="tag">After</span><div class="rail"><span class="fill after" style="--w:95.6%;--d:.5s"></span></div><span class="val">95.6%</span></div>
+        </div>
+      </div>
+    </section>
+
+    <!-- TABLE -->
+    <section class="block">
+      <div class="sec-head"><span class="sec-idx">02</span><h2>All the numbers</h2></div>
+      <p class="sec-note">Full benchmark data. Two views: the before/after of the speed tuning, and the measured performance of the tuned build on cold cache.</p>
+
+      <div class="table-scroll">
+        <table>
+          <thead><tr><th>Metric</th><th>Before</th><th>After</th><th>Change</th></tr></thead>
+          <tbody>
+            <tr><td>Redundant round-trips (per 5 tasks)</td><td>5</td><td>1</td><td><span class="dn">−80%</span></td></tr>
+            <tr><td>Model calls / task</td><td>5.0</td><td>3.6</td><td><span class="dn">−28%</span></td></tr>
+            <tr><td>Inference latency (5 tasks)</td><td>50.5 s</td><td>34.4 s</td><td><span class="dn">−32%</span></td></tr>
+            <tr><td>Prefix-cache hit rate</td><td>90.5%</td><td>95.6%</td><td><span class="up">+5.1 pts</span></td></tr>
+            <tr><td>Answer correctness</td><td>5 / 5</td><td>5 / 5</td><td><span class="cap">maintained</span></td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="table-scroll" style="margin-top:22px">
+        <table>
+          <thead><tr><th>Tuned build · cold cache</th><th>Per task</th><th>Detail</th></tr></thead>
+          <tbody>
+            <tr><td>Wall-clock time to answer</td><td>10.7 s</td><td class="cap">end-to-end</td></tr>
+            <tr><td>Cost</td><td>$0.0026</td><td class="cap">gateway-metered</td></tr>
+            <tr><td>Prefix-cache hit rate</td><td>87.2%</td><td class="cap">first-touch cold</td></tr>
+            <tr><td>Model calls</td><td>3.3</td><td class="cap">avg / task</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="method">
+        <h3>Methodology</h3>
+        <ul>
+          <li><b>Setup.</b> Headless <span class="mono">retrace exec</span>, 5 fresh single-purpose repos, reasoning off, run cache-cold to remove ordering bias.</li>
+          <li><b>Model.</b> Qwen-3.6-27B class, served through the Retrace gateway with prefix caching enabled.</li>
+          <li><b>Before / after.</b> The delta is a single change — the agent loop no longer re-requests an answer the model already produced. Nothing else varied.</li>
+          <li><b>Honesty.</b> These are internal benchmark numbers on one model and workload; your throughput depends on model, hardware, and task. Reproduce with the harness in <span class="mono">docs/performance/</span>.</li>
+        </ul>
+      </div>
+    </section>
+
+  </main>
+
+  <footer><div class="wrap">
+    Retrace · local-first coding agent · <a href="https://github.com/Retrace-AI/retrace">github.com/Retrace-AI/retrace</a>
+  </div></footer>
+
+</body>
+</html>
