@@ -596,15 +596,15 @@ function hasRequestTools(body) {
 // streamed to the client, so they are transparent to the caller.
 const retrySleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 const UPSTREAM_RETRY_STATUS = new Set([429, 500, 502, 503, 504]);
-const upstreamMaxRetries = Math.max(0, Number(process.env.RETRACE_UPSTREAM_MAX_RETRIES ?? 4) || 4);
+const upstreamMaxRetries = Math.max(0, Number(process.env.RETRACE_UPSTREAM_MAX_RETRIES ?? 8) || 8);
 const upstreamRetryBaseMs = Math.max(50, Number(process.env.RETRACE_UPSTREAM_RETRY_BASE_MS ?? 500) || 500);
-const upstreamRetryMaxDelayMs = Math.max(upstreamRetryBaseMs, Number(process.env.RETRACE_UPSTREAM_RETRY_MAX_DELAY_MS ?? 8000) || 8000);
+const upstreamRetryMaxDelayMs = Math.max(upstreamRetryBaseMs, Number(process.env.RETRACE_UPSTREAM_RETRY_MAX_DELAY_MS ?? 10000) || 10000);
 // A Retry-After longer than this is surfaced to the caller instead of silently
 // hanging the turn (a genuine sustained limit, not a transient blip).
 const upstreamRetryAfterCapMs = Math.max(0, Number(process.env.RETRACE_UPSTREAM_RETRY_AFTER_CAP_MS ?? 15000) || 15000);
 // Total wall-clock we will spend waiting across all retries, kept well under the
 // upstream timeout so backpressure never turns into a hang.
-const upstreamRetryTotalMs = Math.max(0, Number(process.env.RETRACE_UPSTREAM_RETRY_TOTAL_MS ?? 20000) || 20000);
+const upstreamRetryTotalMs = Math.max(0, Number(process.env.RETRACE_UPSTREAM_RETRY_TOTAL_MS ?? 45000) || 45000);
 
 function parseRetryAfterMs(response) {
   const raw = response.headers.get("retry-after");
@@ -682,7 +682,7 @@ async function upstreamChat(body, includeTools) {
     const backoff = Math.min(upstreamRetryMaxDelayMs, upstreamRetryBaseMs * 2 ** retry);
     const delay = (retryAfter != null ? retryAfter : backoff) + Math.floor(Math.random() * 200);
     if (waitedMs + delay > upstreamRetryTotalMs) break;
-    console.error(`[upstream-retry] ${result.response.status} on ${route.model}; retry ${retry + 1}/${upstreamMaxRetries} in ${Math.round(delay)}ms`);
+    console.error(`[upstream-retry] ${result.response.status} on ${route.model}; retry ${retry + 1}/${upstreamMaxRetries} in ${Math.round(delay)}ms — body: ${(result.text || "").replace(/\s+/g, " ").slice(0, 280)}`);
     await retrySleep(delay);
     waitedMs += delay;
     result = await attemptOnce();
