@@ -4,6 +4,20 @@ use super::*;
 
 pub(crate) const SESSION_HEADER_MAX_INNER_WIDTH: usize = 56; // Just an eyeballed value
 
+/// "RETRACE" as an ANSI-shadow pixel-block wordmark. Rendered as static ASCII
+/// art so it looks pixel on any terminal font (no dependency on the user's
+/// terminal font). Shown when the terminal is wide enough; otherwise the header
+/// falls back to plain "Retrace" text.
+const RETRACE_WORDMARK: [&str; 6] = [
+    "██████╗ ███████╗████████╗██████╗  █████╗  ██████╗███████╗",
+    "██╔══██╗██╔════╝╚══██╔══╝██╔══██╗██╔══██╗██╔════╝██╔════╝",
+    "██████╔╝█████╗     ██║   ██████╔╝███████║██║     █████╗  ",
+    "██╔══██╗██╔══╝     ██║   ██╔══██╗██╔══██║██║     ██╔══╝  ",
+    "██║  ██║███████╗   ██║   ██║  ██║██║  ██║╚██████╗███████╗",
+    "╚═╝  ╚═╝╚══════╝   ╚═╝   ╚═╝  ╚═╝╚═╝  ╚═╝ ╚═════╝╚══════╝",
+];
+const RETRACE_WORDMARK_WIDTH: usize = 57;
+
 pub(crate) fn card_inner_width(width: u16, max_inner_width: usize) -> Option<usize> {
     if width < 4 {
         return None;
@@ -48,7 +62,7 @@ fn with_border_internal(
 
     let mut out = Vec::with_capacity(lines.len() + 2);
     let border_inner_width = content_width + 2;
-    out.push(vec![format!("╭{}╮", "─".repeat(border_inner_width)).bold()].into());
+    out.push(vec![format!("╭{}╮", "─".repeat(border_inner_width)).black()].into());
 
     for line in lines.into_iter() {
         let used_width: usize = line
@@ -57,16 +71,16 @@ fn with_border_internal(
             .sum();
         let span_count = line.spans.len();
         let mut spans: Vec<Span<'static>> = Vec::with_capacity(span_count + 4);
-        spans.push(Span::from("│ ").bold());
+        spans.push(Span::from("│ ").black());
         spans.extend(line);
         if used_width < content_width {
             spans.push(Span::from(" ".repeat(content_width - used_width)).dim());
         }
-        spans.push(Span::from(" │").bold());
+        spans.push(Span::from(" │").black());
         out.push(Line::from(spans));
     }
 
-    out.push(vec![format!("╰{}╯", "─".repeat(border_inner_width)).bold()].into());
+    out.push(vec![format!("╰{}╯", "─".repeat(border_inner_width)).black()].into());
 
     out
 }
@@ -326,18 +340,28 @@ impl SessionHeaderHistoryCell {
 
 impl HistoryCell for SessionHeaderHistoryCell {
     fn display_lines(&self, width: u16) -> Vec<Line<'static>> {
-        let Some(inner_width) = card_inner_width(width, SESSION_HEADER_MAX_INNER_WIDTH) else {
+        // Box spans the full terminal width so its right border is anchored to
+        // the terminal edge (block-glyph widths inside never push it around).
+        let Some(inner_width) = card_inner_width(width, usize::MAX) else {
             return Vec::new();
         };
 
         let make_row = |spans: Vec<Span<'static>>| Line::from(spans);
 
-        // Title line rendered inside the box: "Retrace  vX" — the brand wordmark
-        // (renders in the pixel font when the terminal font is Pixelify Sans).
-        let title_spans: Vec<Span<'static>> = vec![
-            Span::from("Retrace").bold(),
-            Span::from(format!("  v{}", self.version)).dim(),
-        ];
+        // Brand wordmark: ANSI-shadow "RETRACE" pixel-block art (static ASCII, so
+        // it renders as pixel blocks on any terminal font), with the version
+        // beneath it. Falls back to plain "Retrace" when the box is too narrow.
+        let mut wordmark_lines: Vec<Line<'static>> = if inner_width >= RETRACE_WORDMARK_WIDTH {
+            RETRACE_WORDMARK
+                .iter()
+                .map(|l| Line::from(Span::from(*l).bold()))
+                .collect()
+        } else {
+            vec![Line::from(Span::from("Retrace").bold())]
+        };
+        wordmark_lines.push(make_row(vec![
+            Span::from(format!("v{}", self.version)).dim(),
+        ]));
 
         const CHANGE_MODEL_HINT_COMMAND: &str = "/model";
         const CHANGE_MODEL_HINT_EXPLANATION: &str = " to change";
@@ -381,12 +405,10 @@ impl HistoryCell for SessionHeaderHistoryCell {
         let dir = self.format_directory(Some(dir_max_width));
         let dir_spans = vec![Span::from(dir_prefix).dim(), Span::from(dir)];
 
-        let mut lines = vec![
-            make_row(title_spans),
-            make_row(Vec::new()),
-            make_row(model_spans),
-            make_row(dir_spans),
-        ];
+        let mut lines = wordmark_lines;
+        lines.push(make_row(Vec::new()));
+        lines.push(make_row(model_spans));
+        lines.push(make_row(dir_spans));
 
         if self.yolo_mode {
             let permissions_label = format!("{PERMISSIONS_LABEL:<label_width$}");
@@ -396,7 +418,7 @@ impl HistoryCell for SessionHeaderHistoryCell {
             ]));
         }
 
-        with_border(lines)
+        with_border_with_inner_width(lines, inner_width)
     }
 
     fn raw_lines(&self) -> Vec<Line<'static>> {

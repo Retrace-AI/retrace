@@ -151,6 +151,8 @@ use ratatui::style::Stylize;
 use ratatui::text::Line;
 use ratatui::text::Span;
 use ratatui::widgets::Block;
+use ratatui::widgets::BorderType;
+use ratatui::widgets::Borders;
 use ratatui::widgets::Paragraph;
 use ratatui::widgets::StatefulWidgetRef;
 use ratatui::widgets::WidgetRef;
@@ -759,12 +761,12 @@ impl ChatComposer {
             ActivePopup::None => Constraint::Max(footer_total_height),
         };
         let [composer_rect, popup_rect] =
-            Layout::vertical([Constraint::Min(3), popup_constraint]).areas(area);
+            Layout::vertical([Constraint::Min(6), popup_constraint]).areas(area);
         let mut textarea_rect = composer_rect.inset(Insets::tlbr(
             /*top*/ 1,
-            LIVE_PREFIX_COLS,
+            /*left*/ LIVE_PREFIX_COLS.saturating_add(1), // +1 for the black box's left border
             /*bottom*/ 1,
-            /*right*/ 1u16.saturating_add(textarea_right_reserve),
+            /*right*/ 2u16.saturating_add(textarea_right_reserve), // +1 for the right border
         ));
         let remote_images_height = self
             .attachments
@@ -4096,7 +4098,9 @@ impl ChatComposer {
             .try_into()
             .unwrap_or(u16::MAX);
         let remote_images_separator = u16::from(remote_images_height > 0);
-        self.draft.textarea.desired_height(inner_width)
+        // Taller input box: at least 4 lines of typing room (doubles the old
+        // single-line box). Still grows when the draft has more lines.
+        self.draft.textarea.desired_height(inner_width).max(4)
             + remote_images_height
             + remote_images_separator
             + 2
@@ -4385,7 +4389,13 @@ impl ChatComposer {
             }
         }
         let style = user_message_style();
-        Block::default().style(style).render_ref(composer_rect, buf);
+        // Full-width black-bordered box, white (default) interior — the grey
+        // fill is gone; the input sits inside the border (see the +1 insets).
+        Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(Color::Black))
+            .render_ref(composer_rect, buf);
         if !remote_images_rect.is_empty() {
             Paragraph::new(self.attachments.remote_image_lines())
                 .style(style)
