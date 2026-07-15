@@ -587,6 +587,52 @@ function hasRequestTools(body) {
   return responsesToolsToChatTools(body.tools).length > 0;
 }
 
+// Transient upstream backpressure is retried here with bounded exponential
+// backoff, honoring Retry-After when the provider sends it. This is
+// provider-agnostic: it sits in front of EVERY upstream (OpenAI,
+// Anthropic-compatible, OpenRouter, self-hosted vLLM, ...), so a rate-limit or
+// overload blip from ANY backend is absorbed instead of ending the turn and
+// leaving the session unusable. All retries happen before a single byte is
+// streamed to the client, so they are transparent to the caller.
+const retrySleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+const UPSTREAM_RETRY_STATUS = new Set([429, 500, 502, 503, 504]);
+const upstreamMaxRetries = Math.max(0, Number(process.env.RETRACE_UPSTREAM_MAX_RETRIES ?? 4) || 4);
+const upstreamRetryBaseMs = Math.max(50, Number(process.env.RETRACE_UPSTREAM_RETRY_BASE_MS ?? 500) || 500);
+const upstreamRetryMaxDelayMs = Math.max(upstreamRetryBaseMs, Number(process.env.RETRACE_UPSTREAM_RETRY_MAX_DELAY_MS ?? 8000) || 8000);
+// A Retry-After longer than this is surfaced to the caller instead of silently
+// hanging the turn (a genuine sustained limit, not a transient blip).
+const upstreamRetryAfterCapMs = Math.max(0, Number(process.env.RETRACE_UPSTREAM_RETRY_AFTER_CAP_MS ?? 15000) || 15000);
+// Total wall-clock we will spend waiting across all retries, kept well under the
+// upstream timeout so backpressure never turns into a hang.
+const upstreamRetryTotalMs = Math.max(0, Number(process.env.RETRACE_UPSTREAM_RETRY_TOTAL_MS ?? 20000) || 20000);
+
+function parseRetryAfterMs(response) {
+  const raw = response.headers.get("retry-after");
+  if (!raw) return null;
+  const secs = Number(raw);
+  if (Number.isFinite(secs)) return Math.max(0, secs * 1000);
+  const when = Date.parse(raw);
+  if (!Number.isNaN(when)) return Math.max(0, when - Date.now());
+  return null;
+}
+
+// True when an upstream error reads like an INPUT context-length overflow (from
+// any provider). Deliberately input-context specific so an output max_tokens
+// rejection does not match (dropping history would not help that and would loop).
+function looksLikeContextLengthError(text) {
+  if (!text) return false;
+  const t = String(text).toLowerCase();
+  return (
+    t.includes("context_length_exceeded") ||
+    t.includes("context length") ||
+    t.includes("context window") ||
+    t.includes("maximum context") ||
+    t.includes("reduce the length") ||
+    t.includes("prompt is too long") ||
+    t.includes("input is too long")
+  );
+}
+
 async function upstreamChat(body, includeTools) {
   const route = routeForModel(body.model);
   const chatBody = buildChatBody(body, includeTools, route.model);
@@ -605,21 +651,43 @@ async function upstreamChat(body, includeTools) {
       signal: controller.signal,
     }).finally(() => clearTimeout(timeout));
   };
-  let response = await send(chatBody);
-  if (!response.ok) {
-    const text = await response.text();
-    // Some providers reject stream_options; drop it and retry once before
-    // surfacing the error to the caller.
-    if (chatBody.stream_options && /stream_options/i.test(text)) {
-      const retryBody = { ...chatBody };
-      delete retryBody.stream_options;
-      response = await send(retryBody);
-      if (response.ok) return { response };
-      return { response, text: await response.text() };
+  // A single attempt, including the legacy stream_options fallback. On any
+  // non-OK status it fully drains the body into `text`, so the response can be
+  // safely discarded and re-issued on retry without leaking the socket.
+  const attemptOnce = async () => {
+    let response = await send(chatBody);
+    if (!response.ok) {
+      const text = await response.text();
+      // Some providers reject stream_options; drop it and retry once before
+      // surfacing the error to the caller.
+      if (chatBody.stream_options && /stream_options/i.test(text)) {
+        const retryBody = { ...chatBody };
+        delete retryBody.stream_options;
+        response = await send(retryBody);
+        if (response.ok) return { response };
+        return { response, text: await response.text() };
+      }
+      return { response, text };
     }
-    return { response, text };
+    return { response };
+  };
+
+  let result = await attemptOnce();
+  let waitedMs = 0;
+  for (let retry = 0; retry < upstreamMaxRetries; retry++) {
+    if (result.response.ok || !UPSTREAM_RETRY_STATUS.has(result.response.status)) break;
+    const retryAfter = parseRetryAfterMs(result.response);
+    // A provider asking for a long wait is a real limit, not a blip: surface it.
+    if (retryAfter != null && retryAfter > upstreamRetryAfterCapMs) break;
+    const backoff = Math.min(upstreamRetryMaxDelayMs, upstreamRetryBaseMs * 2 ** retry);
+    const delay = (retryAfter != null ? retryAfter : backoff) + Math.floor(Math.random() * 200);
+    if (waitedMs + delay > upstreamRetryTotalMs) break;
+    console.error(`[upstream-retry] ${result.response.status} on ${route.model}; retry ${retry + 1}/${upstreamMaxRetries} in ${Math.round(delay)}ms`);
+    await retrySleep(delay);
+    waitedMs += delay;
+    result = await attemptOnce();
   }
-  return { response };
+  return result;
 }
 
 function emitMessageStart(state, res) {
@@ -926,12 +994,18 @@ function usageFromChunk(usage) {
     || usage.cache_read_input_tokens
     || 0;
   const reasoningTokens = completionDetails.reasoning_tokens || usage.reasoning_tokens || 0;
+  const inputTokens = usage.prompt_tokens || usage.input_tokens || 0;
+  const outputTokens = usage.completion_tokens || usage.output_tokens || 0;
   return {
-    input_tokens: usage.prompt_tokens || usage.input_tokens || 0,
+    input_tokens: inputTokens,
     input_tokens_details: { cached_tokens: cachedTokens },
-    output_tokens: usage.completion_tokens || usage.output_tokens || 0,
+    output_tokens: outputTokens,
     output_tokens_details: { reasoning_tokens: reasoningTokens },
-    total_tokens: usage.total_tokens || 0,
+    // Some OpenAI-compatible servers omit total_tokens. Falling back to 0 would
+    // make the client believe the context is near-empty, so auto-compaction
+    // never triggers and the conversation grows until the model rejects it.
+    // Derive it from input+output whenever the upstream doesn't supply it.
+    total_tokens: usage.total_tokens || (inputTokens + outputTokens),
   };
 }
 
@@ -1414,11 +1488,32 @@ async function handleResponses(req, res, body) {
     upstream = await upstreamChat(body, false);
   }
   if (!upstream.response.ok) {
+    const errText = upstream.text || `Upstream returned ${upstream.response.status}`;
+    // Normalize a context-length overflow from ANY provider into the code the
+    // client recognizes (context_length_exceeded), emitted as an SSE
+    // response.failed. Without this the client cannot classify the overflow, so
+    // it neither marks the context full nor auto-compacts on the next turn and
+    // the session gets stuck re-overflowing. With it, the overflow marks the
+    // context full so the next turn compacts and recovers.
+    if (looksLikeContextLengthError(errText) && !res.headersSent) {
+      const rid = `resp_ctx_${Math.random().toString(36).slice(2)}`;
+      sseHeaders(res);
+      sendSse(res, "response.created", {
+        type: "response.created",
+        response: responseShell(rid, turnBody.model, "in_progress"),
+      });
+      sendSse(res, "response.failed", {
+        type: "response.failed",
+        response: {
+          ...responseShell(rid, turnBody.model, "failed"),
+          error: { code: "context_length_exceeded", message: errText },
+        },
+      });
+      res.end();
+      return;
+    }
     json(res, upstream.response.status, {
-      error: {
-        message: upstream.text || `Upstream returned ${upstream.response.status}`,
-        type: "upstream_error",
-      },
+      error: { message: errText, type: "upstream_error" },
     });
     return;
   }
