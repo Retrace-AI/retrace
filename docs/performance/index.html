@@ -4,7 +4,7 @@
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>Retrace — Performance</title>
-<meta name="description" content="Retrace is tuned for faster speeds — profiling and tuning results: cache, latency, call efficiency." />
+<meta name="description" content="Retrace is tuned for faster speeds. A head-to-head benchmark vs opencode on the same model and matched tasks: cost per task, wall-clock, and prefix-cache reuse — measured, reproducible." />
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Pixelify+Sans:wght@500;700&family=Space+Grotesk:wght@400;500;700&family=Martian+Mono:wght@400;600&display=swap" rel="stylesheet">
@@ -12,7 +12,7 @@
   :root{
     --bg:#08090c; --panel:#0f1116; --panel-2:#12151b; --fg:#eef0f4; --dim:#828896;
     --line:#1c2029; --line-2:#161a21;
-    --fast:#3d63ff; --fast-2:#6b86ff; --slow:#ff5a2c; --idle:#333a47;
+    --fast:#3d63ff; --fast-2:#6b86ff; --rival:#ff5a2c; --idle:#333a47; --mint:#39e0a8;
     --pixel:'Pixelify Sans'; --disp:'Space Grotesk'; --mono:'Martian Mono';
   }
   *{box-sizing:border-box}
@@ -20,75 +20,106 @@
   body{margin:0;background:var(--bg);color:var(--fg);
     font-family:var(--disp),system-ui,sans-serif;font-size:16px;line-height:1.5;-webkit-font-smoothing:antialiased}
   .wrap{max-width:940px;margin:0 auto;padding:0 26px}
-  a{color:var(--fast-2);text-decoration:none}
+  a{color:var(--fast-2);text-decoration:none} a:hover{text-decoration:underline}
 
-  header.top{border-bottom:1px solid var(--line)}
+  header.top{border-bottom:1px solid var(--line);position:sticky;top:0;z-index:9;background:rgba(8,9,12,.86);backdrop-filter:blur(8px)}
   header.top .wrap{display:flex;align-items:center;justify-content:space-between;height:58px}
   .mark{font-family:var(--pixel);font-weight:700;font-size:22px;letter-spacing:.02em}
   .mark b{color:var(--fast-2)}
-  .top nav{font-family:var(--mono);font-size:11px;letter-spacing:.14em;text-transform:uppercase;color:var(--dim)}
+  .top nav{font-family:var(--mono);font-size:11px;letter-spacing:.14em;text-transform:uppercase;color:var(--dim);display:flex;gap:20px;align-items:center}
+  .top nav a{color:var(--dim)} .top nav a:hover{color:var(--fg);text-decoration:none}
+  .top .star{color:var(--fg);border:1px solid var(--line);padding:6px 11px;border-radius:7px}
+  .top .star:hover{border-color:var(--fast);color:var(--fast-2);text-decoration:none}
 
   /* hero */
-  .hero{padding:76px 0 20px}
+  .hero{padding:70px 0 20px}
   .eyebrow{font-family:var(--mono);font-size:11.5px;letter-spacing:.22em;text-transform:uppercase;color:var(--dim);
     display:flex;align-items:center;gap:12px;margin:0 0 30px}
   .eyebrow::before{content:"";width:28px;height:1px;background:var(--fast)}
   h1{font-family:var(--pixel);font-weight:700;font-size:clamp(52px,11vw,110px);line-height:.9;letter-spacing:.01em;margin:0 0 8px}
   h1 .b{color:var(--fast-2)}
   .tagline{font-size:clamp(19px,2.6vw,24px);font-weight:500;letter-spacing:-.01em;margin:18px 0 0}
-  .lede{color:var(--dim);font-size:17px;max-width:60ch;margin:16px 0 0}
+  .lede{color:var(--dim);font-size:17px;max-width:62ch;margin:16px 0 0}
   .lede b{color:var(--fg);font-weight:500}
+  .clone{display:flex;flex-wrap:wrap;gap:10px;align-items:center;margin:26px 0 0}
+  .clone code{font-family:var(--mono);font-size:13px;color:var(--fg);background:var(--panel);border:1px solid var(--line);
+    border-radius:9px;padding:11px 15px;display:inline-flex;align-items:center;gap:9px}
+  .clone code::before{content:"$";color:var(--fast-2)}
+  .clone .meta{font-family:var(--mono);font-size:11px;letter-spacing:.1em;text-transform:uppercase;color:var(--dim)}
 
   /* kpi strip */
   .kpis{display:grid;grid-template-columns:repeat(4,1fr);gap:1px;background:var(--line);
-    border:1px solid var(--line);border-radius:14px;overflow:hidden;margin:48px 0 0}
+    border:1px solid var(--line);border-radius:14px;overflow:hidden;margin:44px 0 0}
   .kpi{background:var(--panel);padding:22px 20px}
   .kpi .n{font-family:var(--mono);font-weight:600;font-size:clamp(26px,4vw,38px);letter-spacing:-.02em;line-height:1;color:var(--fast-2)}
   .kpi .n small{font-size:.5em;color:var(--dim);margin-left:1px}
   .kpi .l{font-family:var(--mono);font-size:11px;letter-spacing:.06em;text-transform:uppercase;color:var(--dim);margin-top:11px;line-height:1.4}
+  .kpi .was{display:block;font-family:var(--mono);font-size:10px;color:var(--fast-2);margin-top:7px;letter-spacing:.02em;text-transform:none}
+
+  /* demo terminal */
+  .demo{margin:34px 0 0;border:1px solid var(--line);border-radius:16px;overflow:hidden;background:#050609;
+    box-shadow:0 30px 80px -40px rgba(61,99,255,.4)}
+  .demo .bar{display:flex;align-items:center;gap:8px;padding:12px 16px;background:var(--panel);border-bottom:1px solid var(--line)}
+  .demo .dot{width:11px;height:11px;border-radius:50%;background:#2a2f3a}
+  .demo .bar .t{font-family:var(--mono);font-size:11px;letter-spacing:.1em;text-transform:uppercase;color:var(--dim);margin-left:8px}
+  .demo .bar .live{margin-left:auto;font-family:var(--mono);font-size:10.5px;letter-spacing:.1em;color:var(--mint);display:flex;align-items:center;gap:7px}
+  .demo .bar .live::before{content:"";width:7px;height:7px;border-radius:50%;background:var(--mint);box-shadow:0 0 0 0 rgba(57,224,168,.6);animation:pulse 1.8s infinite}
+  @keyframes pulse{70%{box-shadow:0 0 0 7px rgba(57,224,168,0)}100%{box-shadow:0 0 0 0 rgba(57,224,168,0)}}
+  .demo img{display:block;width:100%;height:auto}
+  .demo .cap{font-family:var(--mono);font-size:11.5px;color:var(--dim);padding:13px 16px;border-top:1px solid var(--line);background:var(--panel)}
 
   section.block{padding:70px 0 0}
   .sec-head{display:flex;align-items:baseline;gap:14px;margin-bottom:6px}
   .sec-idx{font-family:var(--mono);font-size:12px;color:var(--fast)}
   h2{font-family:var(--disp);font-weight:700;font-size:clamp(23px,3.2vw,29px);letter-spacing:-.02em;margin:0}
-  .note{color:var(--dim);font-size:15px;max-width:64ch;margin:12px 0 30px}
+  .note{color:var(--dim);font-size:15px;max-width:66ch;margin:12px 0 30px}
 
-  /* headline cache chart */
-  .cache-hero{background:var(--panel);border:1px solid var(--line);border-radius:16px;padding:30px 30px 34px}
-  .cache-hero .cap{font-family:var(--mono);font-size:11px;letter-spacing:.1em;text-transform:uppercase;color:var(--dim);margin:0 0 22px}
-  .cwrap{display:flex;align-items:flex-end;gap:34px;height:210px}
+  /* comparison / cache panel */
+  .panel{background:var(--panel);border:1px solid var(--line);border-radius:16px;padding:28px 30px 30px}
+  .panel .cap{font-family:var(--mono);font-size:11px;letter-spacing:.1em;text-transform:uppercase;color:var(--dim);margin:0 0 22px}
+
+  /* head-to-head bars */
+  .vs{display:flex;flex-direction:column;gap:20px}
+  .vrow .top{display:flex;align-items:baseline;justify-content:space-between;gap:12px;margin-bottom:12px}
+  .vrow .who{display:flex;align-items:center;gap:9px;font-family:var(--mono);font-size:12px}
+  .vrow .who .swatch{width:11px;height:11px;border-radius:3px}
+  .vrow.me .who{color:var(--fg)} .vrow.me .swatch{background:var(--fast)}
+  .vrow.them .who{color:var(--dim)} .vrow.them .swatch{background:var(--rival)}
+  .vrow .edge{font-family:var(--mono);font-size:12px;font-weight:600;color:var(--fast-2);background:rgba(61,99,255,.14);padding:4px 10px;border-radius:6px;white-space:nowrap}
+  .vtrack{display:grid;grid-template-columns:1fr 92px;align-items:center;gap:14px}
+  .vrail{height:26px;border-radius:8px;background:#05060a;box-shadow:inset 0 0 0 1px var(--line-2);overflow:hidden}
+  .vfill{display:block;height:100%;border-radius:8px;transform-origin:left;transform:scaleX(0);animation:grow 1s cubic-bezier(.2,.7,.2,1) forwards}
+  .vfill.me{background:linear-gradient(90deg,var(--fast),var(--fast-2));animation-delay:.15s}
+  .vfill.them{background:linear-gradient(90deg,#ff7a4d,#ff4d1f);animation-delay:.35s}
+  .vval{font-family:var(--mono);font-size:15px;text-align:right}
+  .vrow.me .vval{color:var(--fast-2);font-weight:600} .vrow.them .vval{color:var(--dim)}
+  @keyframes grow{to{transform:scaleX(1)}}
+  .undernote{font-family:var(--mono);font-size:11.5px;color:var(--dim);margin-top:22px;line-height:1.6}
+  .undernote b{color:var(--fg);font-weight:500}
+
+  /* cache before/after (Retrace's own fix) */
+  .cwrap{display:flex;align-items:flex-end;gap:34px;height:200px}
   .cbar{flex:1;display:flex;flex-direction:column;align-items:center;justify-content:flex-end;height:100%}
   .cbar .col{width:100%;max-width:150px;border-radius:9px 9px 0 0;position:relative;transform-origin:bottom;transform:scaleY(0);animation:rise 1s cubic-bezier(.2,.7,.2,1) forwards}
-  .cbar.before .col{background:linear-gradient(180deg,var(--slow),#c23c17);animation-delay:.15s}
-  .cbar.after .col{background:linear-gradient(180deg,var(--fast-2),var(--fast));animation-delay:.4s}
+  .cbar.bug .col{background:linear-gradient(180deg,var(--rival),#c23c17);animation-delay:.15s}
+  .cbar.fixed .col{background:linear-gradient(180deg,var(--fast-2),var(--fast));animation-delay:.4s}
   .cbar .pct{font-family:var(--mono);font-weight:600;font-size:30px;position:absolute;top:-42px;left:0;right:0;text-align:center}
-  .cbar.before .pct{color:var(--slow)} .cbar.after .pct{color:var(--fast-2)}
+  .cbar.bug .pct{color:var(--rival)} .cbar.fixed .pct{color:var(--fast-2)}
   .cbar .who{font-family:var(--mono);font-size:11px;letter-spacing:.08em;text-transform:uppercase;color:var(--dim);margin-top:14px}
   @keyframes rise{to{transform:scaleY(1)}}
-
-  /* before/after bars */
-  .bars{display:flex;flex-direction:column;gap:22px;margin-top:6px}
-  .metric{border-top:1px solid var(--line-2);padding-top:18px}
-  .metric-top{display:flex;align-items:baseline;justify-content:space-between;gap:14px;margin-bottom:13px}
-  .metric-name{font-weight:500;font-size:15.5px}
-  .metric-delta{font-family:var(--mono);font-size:12.5px;font-weight:600;color:var(--fast-2);background:rgba(61,99,255,.14);padding:4px 9px;border-radius:6px;white-space:nowrap}
-  .track{display:grid;grid-template-columns:56px 1fr 74px;align-items:center;gap:13px;margin-bottom:8px}
-  .track .tag{font-family:var(--mono);font-size:10.5px;letter-spacing:.08em;text-transform:uppercase;color:var(--dim)}
-  .track .val{font-family:var(--mono);font-size:13.5px;text-align:right}
-  .rail{height:14px;border-radius:7px;background:#05060a;box-shadow:inset 0 0 0 1px var(--line-2);overflow:hidden}
-  .fill{display:block;height:100%;border-radius:7px;width:var(--w)}
-  .fill.before{background:linear-gradient(90deg,#ff7a4d,#ff4d1f)} .fill.after{background:linear-gradient(90deg,#7a92ff,#3d63ff)} .fill.idle{background:var(--idle)}
-  @keyframes grow{to{transform:scaleX(1)}}
+  .livechip{display:inline-flex;align-items:center;gap:9px;margin-top:22px;font-family:var(--mono);font-size:12.5px;color:var(--dim)}
+  .livechip b{color:var(--fg);font-weight:600} .livechip .d{color:var(--mint)}
 
   /* tables */
   .table-scroll{overflow-x:auto;border:1px solid var(--line);border-radius:14px;background:var(--panel);margin-top:8px}
-  table{border-collapse:collapse;width:100%;min-width:560px;font-size:14.5px}
+  table{border-collapse:collapse;width:100%;min-width:600px;font-size:14.5px}
   thead th{font-family:var(--mono);font-weight:500;font-size:10.5px;letter-spacing:.09em;text-transform:uppercase;color:var(--dim);text-align:left;padding:15px 22px;border-bottom:1px solid var(--line)}
   thead th:not(:first-child){text-align:right}
   tbody td{padding:14px 22px;border-bottom:1px solid var(--line-2);font-family:var(--mono);font-size:13.5px;text-align:right;white-space:nowrap}
   tbody td:first-child{font-family:var(--disp);font-size:14.5px;text-align:left}
   tbody tr:last-child td{border-bottom:none}
-  .g{color:var(--fast-2)} .cap{color:var(--dim)}
+  .g{color:var(--fast-2)} .r{color:var(--rival)} .cap{color:var(--dim)}
+  td.me{color:var(--fast-2);font-weight:600}
 
   .method{background:var(--panel-2);border:1px solid var(--line);border-radius:14px;padding:24px 26px;margin-top:20px}
   .method h3{font-family:var(--mono);font-size:11px;letter-spacing:.14em;text-transform:uppercase;color:var(--dim);margin:0 0 13px}
@@ -96,101 +127,147 @@
   .method li b{color:var(--fg);font-weight:500}
   .method .m{font-family:var(--mono);font-size:12.5px}
 
-  footer{border-top:1px solid var(--line);margin-top:76px;padding:30px 0 66px;color:var(--dim);font-family:var(--mono);font-size:12px;letter-spacing:.03em}
+  /* repo CTA */
+  .repo{margin-top:70px;background:var(--panel);border:1px solid var(--line);border-radius:18px;padding:40px 36px;
+    display:flex;flex-wrap:wrap;gap:26px;align-items:center;justify-content:space-between}
+  .repo .rt{font-family:var(--pixel);font-weight:700;font-size:clamp(26px,5vw,40px);line-height:1;margin:0}
+  .repo .rt .b{color:var(--fast-2)}
+  .repo .rd{color:var(--dim);font-size:14.5px;max-width:44ch;margin:14px 0 0}
+  .repo .cta{display:flex;gap:11px;flex-wrap:wrap}
+  .repo .cta a{font-family:var(--mono);font-size:12.5px;letter-spacing:.04em;padding:13px 18px;border-radius:9px}
+  .repo .cta .primary{background:var(--fast);color:#fff} .repo .cta .primary:hover{background:var(--fast-2);text-decoration:none}
+  .repo .cta .ghost{border:1px solid var(--line);color:var(--fg)} .repo .cta .ghost:hover{border-color:var(--fast);text-decoration:none}
+
+  footer{border-top:1px solid var(--line);margin-top:70px;padding:30px 0 66px;color:var(--dim);font-family:var(--mono);font-size:12px;letter-spacing:.03em}
 
   @media (max-width:680px){ .kpis{grid-template-columns:repeat(2,1fr)} .cwrap{gap:20px} }
-  @media (prefers-reduced-motion:reduce){ .fill{animation:none;transform:scaleX(1)} .cbar .col{animation:none;transform:scaleY(1)} }
+  @media (prefers-reduced-motion:reduce){ .vfill,.cbar .col{animation:none;transform:none} }
 </style>
 </head>
 <body>
 
   <header class="top"><div class="wrap">
     <div class="mark">RE<b>TRACE</b></div>
-    <nav>Performance · Benchmark</nav>
+    <nav>
+      <a href="#cost">Cost</a>
+      <a href="#speed">Speed</a>
+      <a href="#cache">Cache</a>
+      <a href="#data">Data</a>
+      <a class="star" href="https://github.com/Retrace-AI/retrace">★ GitHub</a>
+    </nav>
   </div></header>
 
   <main class="wrap">
     <section class="hero">
-      <p class="eyebrow">Retrace · enterprise coding agent</p>
+      <p class="eyebrow">Retrace vs opencode · same model · matched tasks</p>
       <h1>TUNED<br>FOR <span class="b">SPEED</span></h1>
-      <p class="tagline">We profiled the agent loop and the cache, then cut what was slow.</p>
-      <p class="lede">Retrace is a local-first coding agent built for teams. A round of profiling found redundant model calls and cold caches; tuning removed them — <b>near-total cache reuse, a third less latency, fewer round-trips</b> — with no loss in answer quality.</p>
+      <p class="tagline">We ran both agents on the same model and the same tasks, then measured.</p>
+      <p class="lede">Retrace is a local-first coding agent for engineers who read the methodology. Head-to-head against opencode on the identical model, over five fresh cache-cold tasks, Retrace answers <b>cheaper and faster end-to-end</b> — with the same correctness. Every number below is reproducible from the repo.</p>
+      <div class="clone">
+        <code>git clone https://github.com/Retrace-AI/retrace</code>
+        <span class="meta">Apache-2.0 · Rust · self-hostable</span>
+      </div>
 
       <div class="kpis">
-        <div class="kpi"><div class="n">95.6<small>%</small></div><div class="l">cache<br>hit rate</div></div>
-        <div class="kpi"><div class="n">−32<small>%</small></div><div class="l">inference<br>latency</div></div>
-        <div class="kpi"><div class="n">−28<small>%</small></div><div class="l">calls<br>per task</div></div>
-        <div class="kpi"><div class="n">10.7<small>s</small></div><div class="l">wall-clock<br>per task</div></div>
+        <div class="kpi"><div class="n">−16<small>%</small></div><div class="l">cost per task<span class="was">$0.00257 vs $0.00307</span></div></div>
+        <div class="kpi"><div class="n">−11<small>%</small></div><div class="l">wall-clock / task<span class="was">10.7s vs 12.0s</span></div></div>
+        <div class="kpi"><div class="n">95.6<small>%</small></div><div class="l">prefix-cache reuse<span class="was">▲ tuned, from 2.3%</span></div></div>
+        <div class="kpi"><div class="n">5 / 5</div><div class="l">answer correctness<span class="was">parity, both agents</span></div></div>
+      </div>
+
+      <div class="demo">
+        <div class="bar"><span class="dot"></span><span class="dot"></span><span class="dot"></span>
+          <span class="t">retrace · live session</span>
+          <span class="live">streaming</span></div>
+        <img src="../images/demo.gif" alt="Retrace running live in the terminal — streaming reasoning with an inline token-speed readout" width="760">
+        <div class="cap">Retrace answering live — one streaming pass, tight loop, no redundant round-trips.</div>
       </div>
     </section>
 
-    <!-- 01 cache hero chart -->
-    <section class="block">
-      <div class="sec-head"><span class="sec-idx">01</span><h2>Cache, before &amp; after</h2></div>
-      <p class="note">The biggest win. A cache-busting token in the prompt prefix meant almost nothing was reused between turns. Removing it took prefix-cache reuse from near-zero to near-total.</p>
-      <div class="cache-hero">
-        <p class="cap">Prefix-cache hit rate · same model, same workload</p>
-        <div class="cwrap">
-          <div class="cbar before"><div class="col" style="height:2.3%"><span class="pct">2.3%</span></div><span class="who">Before</span></div>
-          <div class="cbar after"><div class="col" style="height:95.6%"><span class="pct">95.6%</span></div><span class="who">After tuning</span></div>
+    <!-- 01 cost -->
+    <section class="block" id="cost">
+      <div class="sec-head"><span class="sec-idx">01</span><h2>Cost per task</h2></div>
+      <p class="note">The bill for one task, gateway-metered, averaged over five matched cache-cold runs. Retrace’s tighter loop and warm prefix cache mean fewer full-price tokens.</p>
+      <div class="panel">
+        <p class="cap">Metered cost per task · lower is better</p>
+        <div class="vs">
+          <div class="vrow me"><div class="top"><span class="who"><span class="swatch"></span>Retrace</span><span class="edge">−16% cheaper</span></div>
+            <div class="vtrack"><div class="vrail"><span class="vfill me" style="width:83.7%"></span></div><span class="vval">$0.00257</span></div></div>
+          <div class="vrow them"><div class="top"><span class="who"><span class="swatch"></span>opencode</span></div>
+            <div class="vtrack"><div class="vrail"><span class="vfill them" style="width:100%"></span></div><span class="vval">$0.00307</span></div></div>
         </div>
       </div>
     </section>
 
-    <!-- 02 loop tuning -->
-    <section class="block">
-      <div class="sec-head"><span class="sec-idx">02</span><h2>Loop efficiency</h2></div>
-      <p class="note">Each task runs the model several times. Profiling showed a share of those calls were redundant — the model delivered its answer, then got asked to deliver it again. Measured across 5 fresh, cache-cold tasks.</p>
-      <div class="bars">
-        <div class="metric"><div class="metric-top"><span class="metric-name">Redundant completion round-trips</span><span class="metric-delta">−80%</span></div>
-          <div class="track"><span class="tag">Before</span><div class="rail"><span class="fill before" style="--w:100%;--d:.15s"></span></div><span class="val">5</span></div>
-          <div class="track"><span class="tag">After</span><div class="rail"><span class="fill after" style="--w:20%;--d:.35s"></span></div><span class="val">1</span></div></div>
-        <div class="metric"><div class="metric-top"><span class="metric-name">Model calls per task</span><span class="metric-delta">−28%</span></div>
-          <div class="track"><span class="tag">Before</span><div class="rail"><span class="fill before" style="--w:100%;--d:.2s"></span></div><span class="val">5.0</span></div>
-          <div class="track"><span class="tag">After</span><div class="rail"><span class="fill after" style="--w:72%;--d:.4s"></span></div><span class="val">3.6</span></div></div>
-        <div class="metric"><div class="metric-top"><span class="metric-name">Inference latency · 5 tasks</span><span class="metric-delta">−32%</span></div>
-          <div class="track"><span class="tag">Before</span><div class="rail"><span class="fill before" style="--w:100%;--d:.25s"></span></div><span class="val">50.5s</span></div>
-          <div class="track"><span class="tag">After</span><div class="rail"><span class="fill after" style="--w:68%;--d:.45s"></span></div><span class="val">34.4s</span></div></div>
+    <!-- 02 speed -->
+    <section class="block" id="speed">
+      <div class="sec-head"><span class="sec-idx">02</span><h2>Wall-clock to answer</h2></div>
+      <p class="note">End-to-end time a user waits, per task. Retrace spends a hair more time in the model per call, yet wins the clock — because it carries far less non-model overhead around each task.</p>
+      <div class="panel">
+        <p class="cap">Wall-clock per task · lower is better</p>
+        <div class="vs">
+          <div class="vrow me"><div class="top"><span class="who"><span class="swatch"></span>Retrace</span><span class="edge">−11% faster</span></div>
+            <div class="vtrack"><div class="vrail"><span class="vfill me" style="width:89.2%"></span></div><span class="vval">10.7s</span></div></div>
+          <div class="vrow them"><div class="top"><span class="who"><span class="swatch"></span>opencode</span></div>
+            <div class="vtrack"><div class="vrail"><span class="vfill them" style="width:100%"></span></div><span class="vval">12.0s</span></div></div>
+        </div>
+        <p class="undernote">opencode carries <b>~6.9s of non-model overhead</b> per task; Retrace’s leaner loop absorbs that gap and finishes first, even though its per-call model latency is slightly higher.</p>
       </div>
     </section>
 
-    <!-- 03 all numbers -->
-    <section class="block">
-      <div class="sec-head"><span class="sec-idx">03</span><h2>All the numbers</h2></div>
-      <p class="note">Full benchmark data — the before/after of each tuning pass, then the tuned build measured cold.</p>
+    <!-- 03 cache -->
+    <section class="block" id="cache">
+      <div class="sec-head"><span class="sec-idx">03</span><h2>Prefix cache — the bug we fixed</h2></div>
+      <p class="note">A cache-busting token in Retrace’s prompt prefix meant almost nothing was reused between turns. We found it, removed it, and prefix-cache reuse went from near-zero to near-total on the matched workload — the change behind the cost and speed wins above.</p>
+      <div class="panel">
+        <p class="cap">Retrace prefix-cache hit rate · before &amp; after the fix</p>
+        <div class="cwrap">
+          <div class="cbar bug"><div class="col" style="height:2.3%"><span class="pct">2.3%</span></div><span class="who">Cache-buster bug</span></div>
+          <div class="cbar fixed"><div class="col" style="height:95.6%"><span class="pct">95.6%</span></div><span class="who">After fix</span></div>
+        </div>
+        <div class="livechip">Live gateway · Retrace reuses <b>90.5%</b> of its prefix on matched tasks <span class="d">●</span> corroborated across production traffic</div>
+      </div>
+    </section>
+
+    <!-- 04 data -->
+    <section class="block" id="data">
+      <div class="sec-head"><span class="sec-idx">04</span><h2>Every number, both agents</h2></div>
+      <p class="note">The full matched benchmark — where Retrace leads and where opencode does. Nothing cherry-picked: opencode makes marginally fewer calls and is quicker inside a single model call; Retrace wins the two things a user feels — cost and total time.</p>
       <div class="table-scroll">
         <table>
-          <thead><tr><th>Metric</th><th>Before</th><th>After</th><th>Change</th></tr></thead>
+          <thead><tr><th>Per task · 5 cache-cold runs</th><th>Retrace</th><th>opencode</th><th>Edge</th></tr></thead>
           <tbody>
-            <tr><td>Prefix-cache hit rate</td><td>2.3%</td><td>95.6%</td><td><span class="g">+93 pts</span></td></tr>
-            <tr><td>Redundant round-trips (per 5 tasks)</td><td>5</td><td>1</td><td><span class="g">−80%</span></td></tr>
-            <tr><td>Model calls / task</td><td>5.0</td><td>3.6</td><td><span class="g">−28%</span></td></tr>
-            <tr><td>Inference latency (5 tasks)</td><td>50.5 s</td><td>34.4 s</td><td><span class="g">−32%</span></td></tr>
-            <tr><td>Answer correctness</td><td>5 / 5</td><td>5 / 5</td><td><span class="cap">maintained</span></td></tr>
-          </tbody>
-        </table>
-      </div>
-      <div class="table-scroll" style="margin-top:18px">
-        <table>
-          <thead><tr><th>Tuned build · cold cache</th><th>Per task</th><th>Detail</th></tr></thead>
-          <tbody>
-            <tr><td>Wall-clock time to answer</td><td>10.7 s</td><td class="cap">end-to-end</td></tr>
-            <tr><td>Cost</td><td>$0.0026</td><td class="cap">gateway-metered</td></tr>
-            <tr><td>Prefix-cache hit rate</td><td>87.2%</td><td class="cap">first-touch cold</td></tr>
-            <tr><td>Model calls</td><td>3.3</td><td class="cap">avg / task</td></tr>
+            <tr><td>Cost</td><td class="me">$0.00257</td><td>$0.00307</td><td><span class="g">Retrace −16%</span></td></tr>
+            <tr><td>Wall-clock to answer</td><td class="me">10.7s</td><td>12.0s</td><td><span class="g">Retrace −11%</span></td></tr>
+            <tr><td>Prefix-cache reuse</td><td class="me">90.5%</td><td class="cap">conv-dependent</td><td><span class="g">Retrace</span></td></tr>
+            <tr><td>Answer correctness</td><td>5 / 5</td><td>5 / 5</td><td><span class="cap">tie</span></td></tr>
+            <tr><td>Model calls / task</td><td>3.3</td><td>3.0</td><td><span class="r">opencode</span></td></tr>
+            <tr><td>Per-call model latency</td><td>2.12s</td><td>1.71s</td><td><span class="r">opencode</span></td></tr>
           </tbody>
         </table>
       </div>
       <div class="method">
         <h3>Methodology</h3>
         <ul>
-          <li><b>Setup.</b> Headless <span class="m">retrace exec</span>, 5 fresh single-purpose repos, reasoning off, run cache-cold to remove ordering bias.</li>
-          <li><b>Model.</b> Qwen-3.6-27B class, served through the Retrace gateway with prefix caching enabled.</li>
-          <li><b>Tuning.</b> Two changes — a cache-busting prefix token removed (cache), and the loop no longer re-requests an answer the model already produced (round-trips). Nothing else varied.</li>
-          <li><b>Honesty.</b> Internal benchmark on one model and workload; real throughput depends on model, hardware, and task.</li>
+          <li><b>Setup.</b> Both agents run headless on 5 fresh single-purpose repos, reasoning off, run cache-cold to remove ordering bias. Same tasks, same prompts.</li>
+          <li><b>Model.</b> Identical model for both — Qwen-3.6-27B class — served through one gateway with prefix caching enabled. The only variable is the agent.</li>
+          <li><b>Measurement.</b> Cost and latency read from gateway spend logs per request; cache reuse from <span class="m">usage.prompt_tokens_details.cached_tokens</span>; correctness graded on task completion.</li>
+          <li><b>On cache.</b> The 90.5% is per-task on matched runs. In blended production traffic a single long conversation can inflate either agent’s aggregate, so we report the matched figure, not the blend.</li>
+          <li><b>Honesty.</b> One model, one workload; opencode leads on raw call count and per-call latency. Real-world results depend on model, hardware, and task.</li>
         </ul>
       </div>
     </section>
+
+    <div class="repo">
+      <div>
+        <p class="rt">Read the code,<br>not just the <span class="b">chart.</span></p>
+        <p class="rd">Retrace is Apache-2.0 and self-hostable. Clone it, point it at your own gateway, and reproduce every figure on this page.</p>
+      </div>
+      <div class="cta">
+        <a class="primary" href="https://github.com/Retrace-AI/retrace">★ Star on GitHub</a>
+        <a class="ghost" href="https://github.com/Retrace-AI/retrace#readme">Read the docs</a>
+      </div>
+    </div>
   </main>
 
   <footer><div class="wrap">Retrace · enterprise coding agent · github.com/Retrace-AI/retrace</div></footer>
