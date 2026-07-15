@@ -48,7 +48,7 @@ fn with_border_internal(
 
     let mut out = Vec::with_capacity(lines.len() + 2);
     let border_inner_width = content_width + 2;
-    out.push(vec![format!("╭{}╮", "─".repeat(border_inner_width)).dim()].into());
+    out.push(vec![format!("╭{}╮", "─".repeat(border_inner_width)).bold()].into());
 
     for line in lines.into_iter() {
         let used_width: usize = line
@@ -57,16 +57,16 @@ fn with_border_internal(
             .sum();
         let span_count = line.spans.len();
         let mut spans: Vec<Span<'static>> = Vec::with_capacity(span_count + 4);
-        spans.push(Span::from("│ ").dim());
+        spans.push(Span::from("│ ").bold());
         spans.extend(line);
         if used_width < content_width {
             spans.push(Span::from(" ".repeat(content_width - used_width)).dim());
         }
-        spans.push(Span::from(" │").dim());
+        spans.push(Span::from(" │").bold());
         out.push(Line::from(spans));
     }
 
-    out.push(vec![format!("╰{}╯", "─".repeat(border_inner_width)).dim()].into());
+    out.push(vec![format!("╰{}╯", "─".repeat(border_inner_width)).bold()].into());
 
     out
 }
@@ -332,12 +332,11 @@ impl HistoryCell for SessionHeaderHistoryCell {
 
         let make_row = |spans: Vec<Span<'static>>| Line::from(spans);
 
-        // Title line rendered inside the box: ">_ retrace-tui (vX)"
+        // Title line rendered inside the box: "Retrace  vX" — the brand wordmark
+        // (renders in the pixel font when the terminal font is Pixelify Sans).
         let title_spans: Vec<Span<'static>> = vec![
-            Span::from(">_ ").dim(),
-            Span::from(crate::version::APP_NAME).bold(),
-            Span::from(" ").dim(),
-            Span::from(format!("(v{})", self.version)).dim(),
+            Span::from("Retrace").bold(),
+            Span::from(format!("  v{}", self.version)).dim(),
         ];
 
         const CHANGE_MODEL_HINT_COMMAND: &str = "/model";
