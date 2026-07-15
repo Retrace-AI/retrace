@@ -6,6 +6,31 @@
   <img src="docs/images/demo.gif" alt="Retrace demo — live reasoning and a token-speed readout" width="760">
 </p>
 
+## Performance — measured, not claimed
+
+We ran Retrace and [opencode](https://github.com/sst/opencode) on the **same model**,
+over five fresh cache-cold tasks. Retrace answers **cheaper and faster end-to-end**,
+with the same correctness. Every figure below is reproducible from this repo.
+
+**Cost per task — Retrace −16%**
+
+![Cost per task: Retrace $0.00257 vs opencode $0.00307](docs/images/bench-cost.png)
+
+**Wall-clock to answer — Retrace −11%**
+
+![Wall-clock per task: Retrace 10.7s vs opencode 12.0s](docs/images/bench-speed.png)
+
+**Prefix cache — the bug we found and fixed (2.3% → 95.6%)**
+
+![Retrace prefix-cache reuse before and after the fix, corroborated live at 90.5%](docs/images/bench-cache.png)
+
+**Every number, both agents — including where opencode leads**
+
+![Full per-task benchmark table comparing Retrace and opencode](docs/images/bench-table.png)
+
+Full methodology and interactive charts live in
+[`docs/performance/`](docs/performance/index.html).
+
 Retrace is a community fork of [OpenAI Codex](https://github.com/openai/codex) (Apache-2.0),
 reworked so you can point it at **any** model provider — OpenAI-compatible or
 Anthropic-compatible — by just giving it a URL and an API key. It probes each
@@ -31,31 +56,6 @@ and an estimated **prefill** rate. It's measured client-side straight from the s
 so it works with any provider and any model.
 
 ![Retrace showing live token speeds: ttft, decode, avg, prefill](docs/images/token-speeds.png)
-
-## Performance — measured, not claimed
-
-We ran Retrace and [opencode](https://github.com/sst/opencode) on the **same model**,
-over five fresh cache-cold tasks. Retrace answers **cheaper and faster end-to-end**,
-with the same correctness. Every figure below is reproducible from this repo.
-
-**Cost per task — Retrace −16%**
-
-![Cost per task: Retrace $0.00257 vs opencode $0.00307](docs/images/bench-cost.png)
-
-**Wall-clock to answer — Retrace −11%**
-
-![Wall-clock per task: Retrace 10.7s vs opencode 12.0s](docs/images/bench-speed.png)
-
-**Prefix cache — the bug we found and fixed (2.3% → 95.6%)**
-
-![Retrace prefix-cache reuse before and after the fix, corroborated live at 90.5%](docs/images/bench-cache.png)
-
-**Every number, both agents — including where opencode leads**
-
-![Full per-task benchmark table comparing Retrace and opencode](docs/images/bench-table.png)
-
-Full methodology and interactive charts live in
-[`docs/performance/`](docs/performance/index.html).
 
 ## Install (macOS & Linux)
 
