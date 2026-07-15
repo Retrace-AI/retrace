@@ -462,6 +462,29 @@ impl App {
                     .on_codexos_model_add_selection_confirmed(rows, model_ids);
                 tui.frame_requester().schedule_frame();
             }
+            AppEvent::CodexOsModelAddContextSelected {
+                rows,
+                model_ids,
+                context_window,
+            } => {
+                self.chat_widget
+                    .on_codexos_model_add_context_selected(rows, model_ids, context_window);
+                tui.frame_requester().schedule_frame();
+            }
+            AppEvent::CodexOsModelAddOutputSelected {
+                rows,
+                model_ids,
+                context_window,
+                output_tokens,
+            } => {
+                self.chat_widget.on_codexos_model_add_output_selected(
+                    rows,
+                    model_ids,
+                    context_window,
+                    output_tokens,
+                );
+                tui.frame_requester().schedule_frame();
+            }
             AppEvent::CodexOsOpenProviderPrompt => {
                 self.chat_widget
                     .open_codexos_provider_url_prompt(String::new());

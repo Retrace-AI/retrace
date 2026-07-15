@@ -26,7 +26,7 @@ Usage:
   retrace-admin models enable <model>...
   retrace-admin models disable <model>...
   retrace-admin models remove <model>... [--provider <id>]
-  retrace-admin models set <model> [--context <tokens>] [--output <tokens|none|default>] [--thinking <on|off|auto|level>] [--normalize-system <ascii|off>] [--provider <id>] [--upstream-model <id>] [--display-name <name>]
+  retrace-admin models set <model> [--context <tokens>] [--effective-percent <1-100>] [--output <tokens|none|default>] [--thinking <on|off|auto|level>] [--normalize-system <ascii|off>] [--provider <id>] [--upstream-model <id>] [--display-name <name>]
   retrace-admin catalog build
 
 Notes:
@@ -1262,6 +1262,16 @@ async function commandModels(registry, subcommand, args) {
     if (opts.context) {
       config.contextWindow = toInt(opts.context, "--context");
       config.maxContextWindow = config.contextWindow;
+      // An explicitly asserted window is authoritative: honor it literally instead
+      // of applying the safety haircut meant for windows we could not probe.
+      // Without this, asking for 131072 would still surface as ~124k (95%).
+      // --effective-percent below can still override.
+      config.effectiveContextWindowPercent = 100;
+    }
+    if (opts["effective-percent"] !== undefined) {
+      const percent = toInt(opts["effective-percent"], "--effective-percent");
+      if (percent < 1 || percent > 100) throw new Error("--effective-percent must be between 1 and 100");
+      config.effectiveContextWindowPercent = percent;
     }
     if (opts.output !== undefined) {
       const value = String(opts.output).toLowerCase();

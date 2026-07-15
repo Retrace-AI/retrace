@@ -745,9 +745,30 @@ async fn reprobe_codexos_model(
 /// Applies a `/model add` selection diff: newly checked models are probed and
 /// enabled (grouped per provider), unchecked previously-enabled models are
 /// disabled, and the refreshed catalog is returned for hot reload.
+/// Parses a user-entered token count. Rejects anything that is not a whole
+/// number of at least 1024, so a typo cannot silently shrink a context window.
+/// Accepts thousands separators and a `k`/`m` suffix (e.g. `128k`, `1m`).
+fn parse_token_count(value: &str) -> Option<i64> {
+    let text = value.trim().replace([',', '_'], "").to_lowercase();
+    let (digits, multiplier) = match text.strip_suffix('k') {
+        Some(rest) => (rest, 1_024),
+        None => match text.strip_suffix('m') {
+            // A bare "1m" means a round 1,000,000: overstating a 1M window
+            // causes context-overflow rejections, so never round it up.
+            Some(rest) => (rest, 1_000_000),
+            None => (text.as_str(), 1),
+        },
+    };
+    let parsed: i64 = digits.trim().parse().ok()?;
+    let tokens = parsed.checked_mul(multiplier)?;
+    (tokens >= 1024).then_some(tokens)
+}
+
 async fn apply_model_add_selection(
     rows: Vec<CodexOsProviderModelRow>,
     selected_ids: Vec<String>,
+    context_window: Option<i64>,
+    output_tokens: Option<i64>,
     tx: AppEventSender,
 ) -> Result<CodexOsProviderConfigureResult, String> {
     use std::collections::BTreeMap;
@@ -786,6 +807,27 @@ async fn apply_model_add_selection(
             &run_codexos_local_command_checked(codexos_admin_command(enable_args)).await?,
         );
         output.push('\n');
+        // Write the limits the user chose. This runs after probe/enable so it
+        // wins over whatever the probe defaulted to — an explicitly chosen
+        // window is authoritative (`models set --context` also drops the
+        // effective-percent haircut, so the number shown is the number picked).
+        if context_window.is_some() || output_tokens.is_some() {
+            for model_id in model_ids {
+                let mut set_args = vec!["models".to_string(), "set".to_string(), model_id.clone()];
+                if let Some(context_window) = context_window {
+                    set_args.push("--context".to_string());
+                    set_args.push(context_window.to_string());
+                }
+                if let Some(output_tokens) = output_tokens {
+                    set_args.push("--output".to_string());
+                    set_args.push(output_tokens.to_string());
+                }
+                output.push_str(
+                    &run_codexos_local_command_checked(codexos_admin_command(set_args)).await?,
+                );
+                output.push('\n');
+            }
+        }
     }
     if !to_disable.is_empty() {
         let mut disable_args = vec!["models".to_string(), "disable".to_string()];
@@ -1988,6 +2030,238 @@ impl ChatWidget {
         rows: Vec<CodexOsProviderModelRow>,
         model_ids: Vec<String>,
     ) {
+        // Nothing newly added means there is no model to size; skip straight to
+        // applying (this path still handles un-checking / disabling).
+        if model_ids.is_empty() {
+            self.apply_model_add(rows, model_ids, /*context_window*/ None, /*output_tokens*/ None);
+            return;
+        }
+        self.open_model_add_context_picker(rows, model_ids);
+    }
+
+    /// Step 1 of 2: pick the context window for the models being added.
+    ///
+    /// This is asked rather than detected on purpose: providers commonly do not
+    /// publish a context window (z.ai's `/models` returns none), so probing
+    /// silently falls back to a default and reports a number that is not the
+    /// model's real window. Asking costs nothing and is authoritative.
+    fn open_model_add_context_picker(
+        &mut self,
+        rows: Vec<CodexOsProviderModelRow>,
+        model_ids: Vec<String>,
+    ) {
+        const PRESETS: [(&str, i64); 5] = [
+            ("96k", 98_304),
+            ("128k", 131_072),
+            ("256k", 262_144),
+            ("512k", 524_288),
+            // A round 1,000,000 — deliberately not 1048576, which would
+            // overstate a 1M model and cause context-overflow rejections.
+            ("1M", 1_000_000),
+        ];
+        let mut items: Vec<SelectionItem> = PRESETS
+            .iter()
+            .map(|(label, tokens)| {
+                let rows = rows.clone();
+                let model_ids = model_ids.clone();
+                let tokens = *tokens;
+                SelectionItem {
+                    name: (*label).to_string(),
+                    description: Some(format!("{tokens} tokens")),
+                    actions: vec![Box::new(move |tx| {
+                        tx.send(AppEvent::CodexOsModelAddContextSelected {
+                            rows: rows.clone(),
+                            model_ids: model_ids.clone(),
+                            context_window: Some(tokens),
+                        });
+                    })],
+                    dismiss_on_select: true,
+                    ..Default::default()
+                }
+            })
+            .collect();
+        let rows_custom = rows.clone();
+        let ids_custom = model_ids.clone();
+        items.push(SelectionItem {
+            name: "Custom…".to_string(),
+            description: Some("Enter an exact number of tokens".to_string()),
+            actions: vec![Box::new(move |tx| {
+                tx.send(AppEvent::CodexOsModelAddContextSelected {
+                    rows: rows_custom.clone(),
+                    model_ids: ids_custom.clone(),
+                    context_window: None,
+                });
+            })],
+            dismiss_on_select: true,
+            ..Default::default()
+        });
+        self.bottom_pane.show_selection_view(SelectionViewParams {
+            title: Some("Context window".to_string()),
+            subtitle: Some(format!(
+                "Step 1 of 2 — set the context limit for: {}",
+                model_ids.join(", ")
+            )),
+            footer_hint: Some(standard_popup_hint_line()),
+            items,
+            ..Default::default()
+        });
+        self.request_redraw();
+    }
+
+    pub(crate) fn on_codexos_model_add_context_selected(
+        &mut self,
+        rows: Vec<CodexOsProviderModelRow>,
+        model_ids: Vec<String>,
+        context_window: Option<i64>,
+    ) {
+        match context_window {
+            Some(context_window) => self.open_model_add_output_picker(rows, model_ids, context_window),
+            // "Custom…": ask for the exact number, then continue to step 2.
+            None => {
+                let tx = self.app_event_tx.clone();
+                let view = CustomPromptView::new(
+                    "Context window".to_string(),
+                    "Enter context window in tokens, for example 1000000".to_string(),
+                    String::new(),
+                    Some("Step 1 of 2: custom context window".to_string()),
+                    Box::new(move |value: String| {
+                        match parse_token_count(&value) {
+                            Some(context_window) => {
+                                tx.send(AppEvent::CodexOsModelAddContextSelected {
+                                    rows: rows.clone(),
+                                    model_ids: model_ids.clone(),
+                                    context_window: Some(context_window),
+                                });
+                            }
+                            None => {
+                                tx.send(AppEvent::InsertHistoryCell(Box::new(
+                                    history_cell::new_error_event(
+                                        "Context window must be a whole number of tokens (at least 1024)."
+                                            .to_string(),
+                                    ),
+                                )));
+                            }
+                        }
+                    }),
+                );
+                self.bottom_pane.show_view(Box::new(view));
+                self.request_redraw();
+            }
+        }
+    }
+
+    /// Step 2 of 2: pick the output-token limit for the models being added.
+    fn open_model_add_output_picker(
+        &mut self,
+        rows: Vec<CodexOsProviderModelRow>,
+        model_ids: Vec<String>,
+        context_window: i64,
+    ) {
+        const PRESETS: [(&str, i64); 3] = [("8k", 8_192), ("16k", 16_384), ("32k", 32_768)];
+        let mut items: Vec<SelectionItem> = PRESETS
+            .iter()
+            .map(|(label, tokens)| {
+                let rows = rows.clone();
+                let model_ids = model_ids.clone();
+                let tokens = *tokens;
+                SelectionItem {
+                    name: (*label).to_string(),
+                    description: Some(format!("{tokens} tokens")),
+                    actions: vec![Box::new(move |tx| {
+                        tx.send(AppEvent::CodexOsModelAddOutputSelected {
+                            rows: rows.clone(),
+                            model_ids: model_ids.clone(),
+                            context_window,
+                            output_tokens: Some(tokens),
+                        });
+                    })],
+                    dismiss_on_select: true,
+                    ..Default::default()
+                }
+            })
+            .collect();
+        let rows_custom = rows.clone();
+        let ids_custom = model_ids.clone();
+        items.push(SelectionItem {
+            name: "Custom…".to_string(),
+            description: Some("Enter an exact number of tokens".to_string()),
+            actions: vec![Box::new(move |tx| {
+                tx.send(AppEvent::CodexOsModelAddOutputSelected {
+                    rows: rows_custom.clone(),
+                    model_ids: ids_custom.clone(),
+                    context_window,
+                    output_tokens: None,
+                });
+            })],
+            dismiss_on_select: true,
+            ..Default::default()
+        });
+        self.bottom_pane.show_selection_view(SelectionViewParams {
+            title: Some("Output tokens".to_string()),
+            subtitle: Some(format!(
+                "Step 2 of 2 — context {context_window}; set the output limit for: {}",
+                model_ids.join(", ")
+            )),
+            footer_hint: Some(standard_popup_hint_line()),
+            items,
+            ..Default::default()
+        });
+        self.request_redraw();
+    }
+
+    pub(crate) fn on_codexos_model_add_output_selected(
+        &mut self,
+        rows: Vec<CodexOsProviderModelRow>,
+        model_ids: Vec<String>,
+        context_window: i64,
+        output_tokens: Option<i64>,
+    ) {
+        match output_tokens {
+            Some(output_tokens) => {
+                self.apply_model_add(rows, model_ids, Some(context_window), Some(output_tokens))
+            }
+            // "Custom…": ask for the exact number, then apply.
+            None => {
+                let tx = self.app_event_tx.clone();
+                let view = CustomPromptView::new(
+                    "Output tokens".to_string(),
+                    "Enter output limit in tokens, for example 8192".to_string(),
+                    String::new(),
+                    Some("Step 2 of 2: custom output limit".to_string()),
+                    Box::new(move |value: String| {
+                        match parse_token_count(&value) {
+                            Some(output_tokens) => {
+                                tx.send(AppEvent::CodexOsModelAddOutputSelected {
+                                    rows: rows.clone(),
+                                    model_ids: model_ids.clone(),
+                                    context_window,
+                                    output_tokens: Some(output_tokens),
+                                });
+                            }
+                            None => {
+                                tx.send(AppEvent::InsertHistoryCell(Box::new(
+                                    history_cell::new_error_event(
+                                        "Output limit must be a whole number of tokens (at least 1024)."
+                                            .to_string(),
+                                    ),
+                                )));
+                            }
+                        }
+                    }),
+                );
+                self.bottom_pane.show_view(Box::new(view));
+                self.request_redraw();
+            }
+        }
+    }
+
+    fn apply_model_add(
+        &mut self,
+        rows: Vec<CodexOsProviderModelRow>,
+        model_ids: Vec<String>,
+        context_window: Option<i64>,
+        output_tokens: Option<i64>,
+    ) {
         self.add_info_message(
             "Applying model selection…".to_string(),
             Some("Newly added models are probed live before they are enabled.".to_string()),
@@ -1995,7 +2269,14 @@ impl ChatWidget {
         self.begin_probe_status("Probing model capabilities".to_string());
         let tx = self.app_event_tx.clone();
         tokio::spawn(async move {
-            let result = apply_model_add_selection(rows, model_ids, tx.clone()).await;
+            let result = apply_model_add_selection(
+                rows,
+                model_ids,
+                context_window,
+                output_tokens,
+                tx.clone(),
+            )
+            .await;
             tx.send(AppEvent::CodexOsProviderConfigured {
                 result,
                 success_message: Some(
@@ -3161,5 +3442,37 @@ impl ChatWidget {
         ));
         self.bottom_pane.drain_pending_submission_state();
         false
+    }
+}
+
+#[cfg(test)]
+mod token_count_tests {
+    use super::parse_token_count;
+
+    #[test]
+    fn parses_plain_numbers_and_separators() {
+        assert_eq!(parse_token_count("1000000"), Some(1_000_000));
+        assert_eq!(parse_token_count("1,000,000"), Some(1_000_000));
+        assert_eq!(parse_token_count("  131072 "), Some(131_072));
+    }
+
+    #[test]
+    fn k_suffix_is_binary_but_m_suffix_is_round() {
+        assert_eq!(parse_token_count("128k"), Some(131_072));
+        // A 1M model means a round 1,000,000. Rounding up to 1048576 would
+        // overstate the window and cause context-overflow rejections.
+        assert_eq!(parse_token_count("1m"), Some(1_000_000));
+        assert_ne!(parse_token_count("1m"), Some(1_048_576));
+    }
+
+    #[test]
+    fn rejects_junk_and_implausibly_small_windows() {
+        assert_eq!(parse_token_count("abc"), None);
+        assert_eq!(parse_token_count(""), None);
+        assert_eq!(parse_token_count("0"), None);
+        // Below 1024 is almost certainly a typo; silently shrinking a context
+        // window is worse than refusing the input.
+        assert_eq!(parse_token_count("512"), None);
+        assert_eq!(parse_token_count("-5"), None);
     }
 }
