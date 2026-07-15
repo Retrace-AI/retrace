@@ -537,8 +537,271 @@ function shouldNormalizeSystemForModel(model) {
   return registryModelConfig(model)?.normalizeSystem === "ascii" || model === "Chitti-Fast-Think";
 }
 
+// Mid-turn context compaction.
+//
+// The client (Codex binary) only compacts BETWEEN turns, and only once its own
+// accounted usage crosses a threshold. A single turn whose assembled request
+// (system + full history + tool outputs + tools) exceeds the model's context
+// window therefore fails hard ("ran out of room ... start a new thread"), and
+// because the overflow is already baked into the stored thread, even a trivial
+// next message re-overflows and the whole session is stuck and unusable.
+//
+// To keep a session usable we compact the OUTBOUND chat payload here, inside the
+// turn, so an over-budget request is shrunk to fit and the turn proceeds instead
+// of dying. Two layers:
+//   1. Proactive: before every upstream call, if the estimated payload exceeds
+//      the model's input budget, shrink it to fit.
+//   2. Reactive: if the upstream still rejects with a context-length error
+//      (estimator under-shot), retry with a progressively smaller target.
+//
+// Compaction is a strict no-op when the payload already fits, so normal turns
+// are byte-identical (upstream KV prefix-cache stays intact).
+// ---------------------------------------------------------------------------
+const compactionEnabled = parseOnOff(
+  process.env.RETRACE_CONTEXT_COMPACTION ?? process.env.CODEXOS_CONTEXT_COMPACTION,
+  true,
+);
+const compactCharsPerToken = Math.max(1, Number(process.env.RETRACE_COMPACT_CHARS_PER_TOKEN) || 4);
+// Fraction of the raw context window we treat as usable (matches the product's
+// effective-window convention; a per-model catalog percent overrides this).
+const compactWindowSafety = clamp01(Number(process.env.RETRACE_COMPACT_WINDOW_SAFETY ?? 0.95) || 0.95);
+// Tokens held back for the model's OWN output so input alone never fills the window.
+const compactOutputReserveTokens = Math.max(0, Number(process.env.RETRACE_COMPACT_OUTPUT_RESERVE_TOKENS ?? 24000) || 24000);
+// Extra slack for the tools array + fixed prompt scaffolding not counted in messages.
+const compactOverheadReserveTokens = Math.max(0, Number(process.env.RETRACE_COMPACT_OVERHEAD_RESERVE_TOKENS ?? 8000) || 8000);
+// Never let the input budget collapse below this many tokens.
+const compactMinInputTokens = Math.max(2000, Number(process.env.RETRACE_COMPACT_MIN_INPUT_TOKENS ?? 4000) || 4000);
+// Most-recent non-system messages always kept verbatim (the live task state).
+const compactKeepRecentMessages = Math.max(2, Number(process.env.RETRACE_COMPACT_KEEP_RECENT ?? 8) || 8);
+// A single content longer than this many chars is a truncation candidate.
+const compactMaxContentChars = Math.max(500, Number(process.env.RETRACE_COMPACT_MAX_CONTENT_CHARS ?? 6000) || 6000);
+// Hard floor when squeezing content in messages we must keep.
+const compactMinContentChars = Math.max(200, Number(process.env.RETRACE_COMPACT_MIN_CONTENT_CHARS ?? 800) || 800);
+// Reactive retries with progressively smaller targets after an upstream overflow.
+const compactMaxReactiveRetries = Math.max(0, Number(process.env.RETRACE_COMPACT_MAX_RETRIES ?? 3) || 3);
+const COMPACT_ELISION = "\n…[retrace: content truncated to fit context]…\n";
+const COMPACT_DROP_NOTE = "[retrace: earlier conversation turns omitted to fit the context window]";
+
+function clamp01(n) {
+  if (!Number.isFinite(n)) return 0.95;
+  if (n <= 0) return 0.01;
+  if (n > 1) return 1;
+  return n;
+}
+
+function estTokens(chars) {
+  return Math.ceil(Math.max(0, chars) / compactCharsPerToken);
+}
+
+function partChars(part) {
+  if (typeof part === "string") return part.length;
+  if (part && typeof part === "object") {
+    if (part.type === "image_url" || part.image_url) return 1200;
+    return String(part.text || part.input_text || part.output_text || part.encrypted_content || "").length;
+  }
+  return 0;
+}
+
+function contentChars(content) {
+  if (typeof content === "string") return content.length;
+  if (Array.isArray(content)) return content.reduce((n, p) => n + partChars(p), 0);
+  return 0;
+}
+
+function messageChars(message) {
+  let n = contentChars(message.content) + 8;
+  if (Array.isArray(message.tool_calls)) {
+    for (const call of message.tool_calls) {
+      n += String(call?.function?.name || "").length;
+      n += String(call?.function?.arguments || "").length;
+      n += 24;
+    }
+  }
+  return n;
+}
+
+function messagesTokens(messages) {
+  let n = 0;
+  for (const message of messages) n += messageChars(message);
+  return estTokens(n);
+}
+
+// Raw context window for a model from registry override, then catalog, then a
+// conservative default. Provider-agnostic: uses the same catalog the client and
+// admin tooling use.
+function modelContextWindowTokens(model) {
+  const reg = registryModelConfig(model);
+  if (Number.isInteger(reg?.contextWindow) && reg.contextWindow > 0) return reg.contextWindow;
+  if (Number.isInteger(reg?.context_window) && reg.context_window > 0) return reg.context_window;
+  try {
+    for (const entry of localModelCatalog().models) {
+      const slug = entry?.slug || entry?.id || entry?.name || entry?.model;
+      if (slug === String(model || "")) {
+        const win = Number(entry.context_window || entry.max_context_window);
+        if (Number.isInteger(win) && win > 0) return win;
+      }
+    }
+  } catch {}
+  return 128000;
+}
+
+function percentToSafety(value) {
+  const n = Number(value);
+  if (!Number.isFinite(n) || n <= 0) return null;
+  if (n <= 1) return clamp01(n);
+  return clamp01(n / 100);
+}
+
+function modelEffectiveWindowSafety(model) {
+  const reg = registryModelConfig(model);
+  const fromRegistry = percentToSafety(reg?.effectiveContextWindowPercent ?? reg?.effective_context_window_percent);
+  if (fromRegistry != null) return fromRegistry;
+  try {
+    for (const entry of localModelCatalog().models) {
+      const slug = entry?.slug || entry?.id || entry?.name || entry?.model;
+      if (slug === String(model || "")) {
+        const fromCatalog = percentToSafety(entry.effective_context_window_percent ?? entry.effectiveContextWindowPercent);
+        if (fromCatalog != null) return fromCatalog;
+      }
+    }
+  } catch {}
+  return compactWindowSafety;
+}
+
+// Token budget for INPUT (history) alone: usable window minus output + overhead
+// reservations. This is the target the outbound payload must fit under.
+function inputBudgetTokens(model) {
+  const usable = Math.floor(modelContextWindowTokens(model) * modelEffectiveWindowSafety(model));
+  const budget = usable - compactOutputReserveTokens - compactOverheadReserveTokens;
+  return Math.max(compactMinInputTokens, budget);
+}
+
+function truncateMiddle(text, maxChars) {
+  const s = String(text || "");
+  if (s.length <= maxChars) return s;
+  const keep = Math.max(0, maxChars - COMPACT_ELISION.length);
+  const head = Math.ceil(keep * 0.6);
+  const tail = Math.floor(keep * 0.4);
+  return s.slice(0, head) + COMPACT_ELISION + (tail > 0 ? s.slice(s.length - tail) : "");
+}
+
+function truncateMessageContent(message, maxChars) {
+  if (typeof message.content === "string") {
+    if (message.content.length <= maxChars) return false;
+    message.content = truncateMiddle(message.content, maxChars);
+    return true;
+  }
+  if (Array.isArray(message.content)) {
+    let changed = false;
+    for (const part of message.content) {
+      if (part && typeof part === "object" && typeof part.text === "string" && part.text.length > maxChars) {
+        part.text = truncateMiddle(part.text, maxChars);
+        changed = true;
+      }
+    }
+    return changed;
+  }
+  return false;
+}
+
+// Split messages into pairing-safe groups so an assistant tool_call and its
+// tool results are always dropped/kept together (a lone half would 400 upstream).
+function groupMessages(messages) {
+  const groups = [];
+  let i = 0;
+  if (messages[0]?.role === "system") { groups.push({ role: "system", idx: [0] }); i = 1; }
+  while (i < messages.length) {
+    const m = messages[i];
+    if (m.role === "assistant" && Array.isArray(m.tool_calls) && m.tool_calls.length) {
+      const ids = new Set(m.tool_calls.map((c) => c.id).filter(Boolean));
+      const idx = [i];
+      let j = i + 1;
+      while (j < messages.length && messages[j].role === "tool" && (ids.size === 0 || ids.has(messages[j].tool_call_id))) {
+        idx.push(j); j++;
+      }
+      groups.push({ role: "assistant_tools", idx });
+      i = j;
+    } else {
+      groups.push({ role: m.role, idx: [i] });
+      i++;
+    }
+  }
+  return groups;
+}
+
+// Compact `messages` in place to fit `targetTokens`. Returns true if changed.
+// Order of operations preserves the most useful context:
+//   1. Truncate oversized content in OLD (droppable) messages.
+//   2. Drop whole old groups (pairing-safe), keeping system + first user goal
+//      + the most recent messages, inserting a single omission note.
+//   3. If still over, truncate content inside kept messages down to a floor.
+function compactMessages(messages, targetTokens) {
+  if (!Array.isArray(messages) || messages.length === 0) return false;
+  if (messagesTokens(messages) <= targetTokens) return false;
+
+  let changed = false;
+  const lastKeepStart = Math.max(0, messages.length - compactKeepRecentMessages);
+  const firstUserIndex = messages.findIndex((m) => m.role === "user");
+  const isTailIndex = (idx) => idx >= lastKeepStart;
+  const isProtectedIndex = (idx) =>
+    (messages[idx]?.role === "system") || idx === firstUserIndex || isTailIndex(idx);
+
+  // Step 1: truncate big content in non-protected (old) messages.
+  for (let i = 0; i < messages.length && messagesTokens(messages) > targetTokens; i++) {
+    if (isProtectedIndex(i)) continue;
+    if (truncateMessageContent(messages[i], compactMaxContentChars)) changed = true;
+  }
+
+  // Step 2: drop whole old groups, oldest first, pairing-safe.
+  if (messagesTokens(messages) > targetTokens) {
+    const groups = groupMessages(messages);
+    const dropIdx = new Set();
+    for (const group of groups) {
+      if (messagesTokens(messages.filter((_, i) => !dropIdx.has(i))) <= targetTokens) break;
+      if (group.idx.some((i) => isProtectedIndex(i))) continue;
+      for (const i of group.idx) dropIdx.add(i);
+    }
+    if (dropIdx.size) {
+      const kept = messages.filter((_, i) => !dropIdx.has(i));
+      const noteAt = kept[0]?.role === "system" ? 1 : 0;
+      kept.splice(noteAt, 0, { role: "user", content: COMPACT_DROP_NOTE });
+      messages.length = 0;
+      messages.push(...kept);
+      changed = true;
+    }
+  }
+
+  // Step 3: last resort — squeeze content inside kept messages to a floor.
+  if (messagesTokens(messages) > targetTokens) {
+    let floor = compactMaxContentChars;
+    while (messagesTokens(messages) > targetTokens && floor >= compactMinContentChars) {
+      for (let i = 0; i < messages.length && messagesTokens(messages) > targetTokens; i++) {
+        if (messages[i].role === "system") continue;
+        if (truncateMessageContent(messages[i], floor)) changed = true;
+      }
+      floor = Math.floor(floor / 2);
+    }
+  }
+
+  return changed;
+}
+
+// Entry point used by buildChatBody. Chooses the target (explicit override for
+// reactive retries, otherwise the model's input budget) and logs when it fires.
+function applyContextCompaction(messages, body) {
+  if (!compactionEnabled) return;
+  const override = Number(body?.__compactTargetTokens);
+  const target = Number.isFinite(override) && override > 0 ? override : inputBudgetTokens(body.model);
+  const before = messagesTokens(messages);
+  if (before <= target) return;
+  if (compactMessages(messages, target)) {
+    console.error(`[context-compaction] ${body.model}: ~${before} tok -> ~${messagesTokens(messages)} tok (target ${target}, ${messages.length} msgs)`);
+  }
+}
+
 function buildChatBody(body, includeTools = true, upstreamModel = body.model) {
   const messages = responsesInputToChatMessages(body);
+  applyContextCompaction(messages, body);
   if (shouldNormalizeSystemForModel(body.model)) {
     for (const message of messages) {
       if (message.role === "system" && typeof message.content === "string") {
@@ -635,7 +898,7 @@ function looksLikeContextLengthError(text) {
 
 async function upstreamChat(body, includeTools) {
   const route = routeForModel(body.model);
-  const chatBody = buildChatBody(body, includeTools, route.model);
+  let chatBody = buildChatBody(body, includeTools, route.model);
   const send = async (payload) => {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), upstreamTimeoutMs);
@@ -686,6 +949,31 @@ async function upstreamChat(body, includeTools) {
     await retrySleep(delay);
     waitedMs += delay;
     result = await attemptOnce();
+  }
+  if (compactionEnabled) {
+    for (
+      let attempt = 0;
+      attempt < compactMaxReactiveRetries
+        && !result.response.ok
+        && looksLikeContextLengthError(result.text);
+      attempt++
+    ) {
+      // The estimator under-shot: the provider counts this payload as too big
+      // even though our estimate fit. Target is relative to the CURRENT payload
+      // size (not the input budget), so each retry is strictly smaller than what
+      // just failed and progress is guaranteed regardless of estimator drift.
+      const currentTokens = messagesTokens(chatBody.messages || []);
+      const compactTarget = Math.max(compactMinInputTokens, Math.floor(currentTokens * 0.6));
+      // Already at the floor and can't shrink below what just failed: stop and
+      // surface the error rather than resending an identical payload forever.
+      if (compactTarget >= currentTokens) break;
+      const shrunkBody = buildChatBody({ ...body, __compactTargetTokens: compactTarget }, includeTools, route.model);
+      const afterTokens = messagesTokens(shrunkBody.messages || []);
+      if (afterTokens >= currentTokens) break;
+      chatBody = shrunkBody;
+      console.error(`[context-compaction] reactive retry ${attempt + 1}/${compactMaxReactiveRetries} on ${route.model}: target ${compactTarget} tok, ${shrunkBody.messages?.length ?? 0} msgs (~${afterTokens} tok)`);
+      result = await attemptOnce();
+    }
   }
   return result;
 }
