@@ -407,7 +407,12 @@ impl ChatWidget {
                         effort: selected_effort,
                     });
             } else {
-                self.apply_model_and_effort(selected_model, selected_effort);
+                // Only one variant, so it is chosen implicitly — still size this
+                // model before applying, same as the multi-variant path.
+                self.app_event_tx.send(AppEvent::OpenModelContextPopup {
+                    model: selected_model,
+                    effort: selected_effort,
+                });
             }
             return;
         }
@@ -475,9 +480,10 @@ impl ChatWidget {
                         effort: choice_effort.clone(),
                     });
                 } else {
-                    tx.send(AppEvent::UpdateModel(model_for_action.clone()));
-                    tx.send(AppEvent::UpdateReasoningEffort(choice_effort.clone()));
-                    tx.send(AppEvent::PersistModelSelection {
+                    // Variant chosen; now size THIS model. The limits are
+                    // per-model (each has its own real window), so the context
+                    // and output steps carry this one model only.
+                    tx.send(AppEvent::OpenModelContextPopup {
                         model: model_for_action.clone(),
                         effort: choice_effort.clone(),
                     });
@@ -506,6 +512,231 @@ impl ChatWidget {
             items,
             initial_selected_idx,
             ..Default::default()
+        });
+    }
+
+    /// `/model` step 3: the context window for THIS model.
+    ///
+    /// Asked rather than probed: providers commonly do not publish a context
+    /// window (z.ai's /models returns none), so detection silently falls back to
+    /// a default and reports a number that is not the model's real window. The
+    /// limit is per-model, so this only ever writes the one model named here.
+    pub(crate) fn open_model_context_popup(
+        &mut self,
+        model: String,
+        effort: Option<ReasoningEffortConfig>,
+    ) {
+        const PRESETS: [(&str, i64); 5] = [
+            ("96k", 98_304),
+            ("128k", 131_072),
+            ("256k", 262_144),
+            ("512k", 524_288),
+            // A round 1,000,000 — deliberately not 1048576, which would overstate
+            // a 1M model and cause context-overflow rejections.
+            ("1M", 1_000_000),
+        ];
+        let mut items: Vec<SelectionItem> = Vec::new();
+        for (label, tokens) in PRESETS {
+            let model = model.clone();
+            let effort = effort.clone();
+            items.push(SelectionItem {
+                name: label.to_string(),
+                description: Some(format!("{tokens} tokens")),
+                actions: vec![Box::new(move |tx| {
+                    tx.send(AppEvent::ModelContextSelected {
+                        model: model.clone(),
+                        effort: effort.clone(),
+                        context_window: Some(tokens),
+                    });
+                })],
+                dismiss_on_select: true,
+                ..Default::default()
+            });
+        }
+        let custom_model = model.clone();
+        let custom_effort = effort.clone();
+        items.push(SelectionItem {
+            name: "Custom\u{2026}".to_string(),
+            description: Some("Enter an exact number of tokens".to_string()),
+            actions: vec![Box::new(move |tx| {
+                tx.send(AppEvent::ModelContextSelected {
+                    model: custom_model.clone(),
+                    effort: custom_effort.clone(),
+                    context_window: None,
+                });
+            })],
+            dismiss_on_select: true,
+            ..Default::default()
+        });
+
+        let mut header = ColumnRenderable::new();
+        header.push(Line::from(format!("Select Context Window for {model}").bold()));
+        self.bottom_pane.show_selection_view(SelectionViewParams {
+            header: Box::new(header),
+            footer_hint: Some(standard_popup_hint_line()),
+            items,
+            ..Default::default()
+        });
+    }
+
+    pub(crate) fn on_model_context_selected(
+        &mut self,
+        model: String,
+        effort: Option<ReasoningEffortConfig>,
+        context_window: Option<i64>,
+    ) {
+        match context_window {
+            Some(context_window) => self.open_model_output_popup(model, effort, context_window),
+            None => {
+                let tx = self.app_event_tx.clone();
+                let view = CustomPromptView::new(
+                    format!("Context window for {model}"),
+                    "Enter context window in tokens, for example 1000000".to_string(),
+                    String::new(),
+                    Some("Custom context window".to_string()),
+                    Box::new(move |value: String| match super::slash_dispatch::parse_token_count(&value) {
+                        Some(context_window) => tx.send(AppEvent::ModelContextSelected {
+                            model: model.clone(),
+                            effort: effort.clone(),
+                            context_window: Some(context_window),
+                        }),
+                        None => tx.send(AppEvent::InsertHistoryCell(Box::new(
+                            crate::history_cell::new_error_event(
+                                "Context window must be a whole number of tokens (at least 1024)."
+                                    .to_string(),
+                            ),
+                        ))),
+                    }),
+                );
+                self.bottom_pane.show_view(Box::new(view));
+                self.request_redraw();
+            }
+        }
+    }
+
+    /// `/model` step 4: the output limit for THIS model.
+    pub(crate) fn open_model_output_popup(
+        &mut self,
+        model: String,
+        effort: Option<ReasoningEffortConfig>,
+        context_window: i64,
+    ) {
+        const PRESETS: [(&str, i64); 3] = [("8k", 8_192), ("16k", 16_384), ("32k", 32_768)];
+        let mut items: Vec<SelectionItem> = Vec::new();
+        for (label, tokens) in PRESETS {
+            let model = model.clone();
+            let effort = effort.clone();
+            items.push(SelectionItem {
+                name: label.to_string(),
+                description: Some(format!("{tokens} tokens")),
+                actions: vec![Box::new(move |tx| {
+                    tx.send(AppEvent::ModelOutputSelected {
+                        model: model.clone(),
+                        effort: effort.clone(),
+                        context_window,
+                        output_tokens: Some(tokens),
+                    });
+                })],
+                dismiss_on_select: true,
+                ..Default::default()
+            });
+        }
+        let custom_model = model.clone();
+        let custom_effort = effort.clone();
+        items.push(SelectionItem {
+            name: "Custom\u{2026}".to_string(),
+            description: Some("Enter an exact number of tokens".to_string()),
+            actions: vec![Box::new(move |tx| {
+                tx.send(AppEvent::ModelOutputSelected {
+                    model: custom_model.clone(),
+                    effort: custom_effort.clone(),
+                    context_window,
+                    output_tokens: None,
+                });
+            })],
+            dismiss_on_select: true,
+            ..Default::default()
+        });
+
+        let mut header = ColumnRenderable::new();
+        header.push(Line::from(format!("Select Output Tokens for {model}").bold()));
+        let mut sub = ColumnRenderable::new();
+        sub.push(Line::from(format!("Context window: {context_window} tokens")));
+        self.bottom_pane.show_selection_view(SelectionViewParams {
+            header: Box::new(header),
+            subtitle: Some(format!("Context window: {context_window} tokens")),
+            footer_hint: Some(standard_popup_hint_line()),
+            items,
+            ..Default::default()
+        });
+    }
+
+    pub(crate) fn on_model_output_selected(
+        &mut self,
+        model: String,
+        effort: Option<ReasoningEffortConfig>,
+        context_window: i64,
+        output_tokens: Option<i64>,
+    ) {
+        let Some(output_tokens) = output_tokens else {
+            let tx = self.app_event_tx.clone();
+            let view = CustomPromptView::new(
+                format!("Output tokens for {model}"),
+                "Enter output limit in tokens, for example 8192".to_string(),
+                String::new(),
+                Some("Custom output limit".to_string()),
+                Box::new(move |value: String| match super::slash_dispatch::parse_token_count(&value) {
+                    Some(output_tokens) => tx.send(AppEvent::ModelOutputSelected {
+                        model: model.clone(),
+                        effort: effort.clone(),
+                        context_window,
+                        output_tokens: Some(output_tokens),
+                    }),
+                    None => tx.send(AppEvent::InsertHistoryCell(Box::new(
+                        crate::history_cell::new_error_event(
+                            "Output limit must be a whole number of tokens (at least 1024)."
+                                .to_string(),
+                        ),
+                    ))),
+                }),
+            );
+            self.bottom_pane.show_view(Box::new(view));
+            self.request_redraw();
+            return;
+        };
+
+        // Persist this one model's limits, then apply the model/effort selection.
+        let model_for_apply = model.clone();
+        let effort_for_apply = effort.clone();
+        let tx = self.app_event_tx.clone();
+        tokio::spawn(async move {
+            let args = vec![
+                "models".to_string(),
+                "set".to_string(),
+                model.clone(),
+                "--context".to_string(),
+                context_window.to_string(),
+                "--output".to_string(),
+                output_tokens.to_string(),
+            ];
+            let command = super::slash_dispatch::codexos_admin_command(args);
+            match super::slash_dispatch::run_codexos_local_command_checked(command).await {
+                Ok(_) => {
+                    tx.send(AppEvent::UpdateModel(model_for_apply.clone()));
+                    tx.send(AppEvent::UpdateReasoningEffort(effort_for_apply.clone()));
+                    tx.send(AppEvent::PersistModelSelection {
+                        model: model_for_apply,
+                        effort: effort_for_apply,
+                    });
+                }
+                Err(message) => {
+                    tx.send(AppEvent::InsertHistoryCell(Box::new(
+                        crate::history_cell::new_error_event(format!(
+                            "Could not set limits for {model}: {message}"
+                        )),
+                    )));
+                }
+            }
         });
     }
 

@@ -420,26 +420,34 @@ pub(crate) enum AppEvent {
         result: Result<Vec<CodexOsProviderModelRow>, String>,
     },
 
-    /// Confirmed `/model add` selection: ask for the context window, then the
-    /// output limit, before enabling the newly checked models.
+    /// Confirmed `/model add` selection: enable newly checked models (probing
+    /// them first) and disable unchecked ones.
     CodexOsModelAddSelectionConfirmed {
         rows: Vec<CodexOsProviderModelRow>,
         model_ids: Vec<String>,
     },
 
-    /// The context window chosen for the models being added. `None` means the
-    /// user picked "Custom" and still has to type an exact number.
-    CodexOsModelAddContextSelected {
-        rows: Vec<CodexOsProviderModelRow>,
-        model_ids: Vec<String>,
+    /// `/model`: after a model and its variant are chosen, ask for that model's
+    /// context window. Limits are per-model — each model has its own real
+    /// window — so this carries the single selected model, never a set.
+    OpenModelContextPopup {
+        model: String,
+        effort: Option<ReasoningEffort>,
+    },
+
+    /// The context window chosen for `model`. `None` means "Custom", which
+    /// still needs an exact number typed in.
+    ModelContextSelected {
+        model: String,
+        effort: Option<ReasoningEffort>,
         context_window: Option<i64>,
     },
 
-    /// The output-token limit chosen for the models being added; applies the
-    /// selection (enable + `models set --context --output`).
-    CodexOsModelAddOutputSelected {
-        rows: Vec<CodexOsProviderModelRow>,
-        model_ids: Vec<String>,
+    /// The output limit chosen for `model`; writes both limits for that model
+    /// and then applies the model/effort selection.
+    ModelOutputSelected {
+        model: String,
+        effort: Option<ReasoningEffort>,
         context_window: i64,
         output_tokens: Option<i64>,
     },
