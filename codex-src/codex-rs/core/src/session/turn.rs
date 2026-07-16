@@ -54,8 +54,10 @@ use crate::stream_events_utils::record_completed_response_item_with_finalized_fa
 use crate::tasks::emit_compact_metric;
 use crate::tools::ToolRouter;
 use crate::tools::context::SharedTurnDiffTracker;
-use crate::tools::handlers::rampage::active_mission_status_for_thread;
+use crate::tools::handlers::rampage::current_mission_id_for_thread;
+use crate::tools::handlers::rampage::incomplete_mission_status_for_thread;
 use crate::tools::handlers::rampage::support_agent_spawn_gate_status_for_thread;
+use crate::tools::handlers::rampage::tools_enabled_for_turn as rampage_controller_tools_enabled;
 use crate::tools::parallel::ToolCallRuntime;
 use crate::tools::registry::ToolArgumentDiffConsumer;
 use crate::tools::router::ToolRouterParams;
@@ -103,6 +105,9 @@ use codex_protocol::protocol::ReasoningContentDeltaEvent;
 use codex_protocol::protocol::ReasoningRawContentDeltaEvent;
 use codex_protocol::protocol::TurnDiffEvent;
 use codex_protocol::protocol::WarningEvent;
+use codex_protocol::request_user_input::RequestUserInputArgs;
+use codex_protocol::request_user_input::RequestUserInputQuestion;
+use codex_protocol::request_user_input::RequestUserInputResponse;
 use codex_protocol::user_input::UserInput;
 use codex_tools::ToolName;
 use codex_tools::filter_request_plugin_install_discoverable_tools_for_client;
@@ -196,21 +201,36 @@ pub(crate) async fn run_turn(
     // fire for a brand-new mission. If a mission is already active for this thread, a
     // mid-mission user message must not re-trigger the questions or block tools; the
     // controller should just answer/incorporate it and keep the mission running.
-    let rampage_mission_already_active = matches!(
+    let rampage_controller_turn = rampage_controller_tools_enabled(
         turn_context.collaboration_mode.mode,
-        ModeKind::AbsoluteRampage | ModeKind::ReadonlyResearch
-    ) && active_mission_status_for_thread(
-        turn_context.config.codex_home.as_path(),
-        &sess.thread_id.to_string(),
-    )
-    .await
-    .ok()
-    .flatten()
-    .is_some();
+        &turn_context.session_source,
+    );
+    let rampage_mission_already_active = rampage_controller_turn
+        && incomplete_mission_status_for_thread(
+            turn_context.config.codex_home.as_path(),
+            &sess.thread_id.to_string(),
+        )
+        .await
+        .ok()
+        .flatten()
+        .is_some();
+    let rampage_preexisting_mission_id = if rampage_controller_turn {
+        current_mission_id_for_thread(
+            turn_context.config.codex_home.as_path(),
+            &sess.thread_id.to_string(),
+        )
+        .await
+        .ok()
+        .flatten()
+    } else {
+        None
+    };
     let mut rampage_startup_guard = RampageStartupGuard::new(
         turn_context.collaboration_mode.mode,
         &input,
         rampage_mission_already_active,
+        rampage_preexisting_mission_id,
+        rampage_controller_turn,
     );
     // Although from the perspective of codex.rs, TurnDiffTracker has the lifecycle of a Task which contains
     // many turns, from the perspective of the user, it is a single turn.
@@ -323,9 +343,11 @@ pub(crate) async fn run_turn(
                     last_agent_message = sampling_request_last_agent_message;
                     if let Some(hook_prompt_message) = rampage_startup_guard
                         .build_completion_blocker_message(
+                            sess.as_ref(),
                             turn_context.as_ref(),
                             last_agent_message.as_deref(),
                         )
+                        .await
                     {
                         sess.record_conversation_items(
                             &turn_context,
@@ -467,31 +489,74 @@ pub(crate) async fn run_turn(
     last_agent_message
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RampageStartupQuestionCategory {
+    SupportAgents,
+    VerifierPassThreshold,
+    VerifierMaxFailures,
+}
+
+#[derive(Debug)]
+struct RampageStartupQuestion {
+    id: String,
+    category: RampageStartupQuestionCategory,
+}
+
+#[derive(Debug)]
+struct RampageStartupAnswer<T> {
+    question_id: String,
+    value: T,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RampageVerifierMaxFailures {
+    Bounded(u64),
+    Infinite,
+}
+
+#[derive(Debug, PartialEq)]
+struct RampageStartupConfiguration {
+    support_agents: String,
+    verifier_pass_threshold: f64,
+    verifier_max_failures: RampageVerifierMaxFailures,
+}
+
 #[derive(Debug, Default)]
 struct RampageStartupGuard {
     mode: Option<ModeKind>,
     startup_required: bool,
     spawn_agent_calls: usize,
-    rampage_control_calls: usize,
+    rampage_start_calls: usize,
     rampage_spawn_calls: usize,
     request_user_input_calls: usize,
-    /// The mandatory support-agent opt-in question was asked via request_user_input.
-    support_agent_question_asked: bool,
-    /// The mandatory verifier-config question (failures + pass percentage) was asked.
-    verifier_question_asked: bool,
+    support_agents_answer: Option<RampageStartupAnswer<String>>,
+    verifier_pass_threshold_answer: Option<RampageStartupAnswer<f64>>,
+    verifier_max_failures_answer: Option<RampageStartupAnswer<RampageVerifierMaxFailures>>,
+    pending_startup_questions: HashMap<String, Vec<RampageStartupQuestion>>,
+    pending_rampage_starts: HashSet<String>,
+    rampage_start_succeeded: bool,
     blocked_tool_calls: usize,
     completion_blocks: usize,
+    preexisting_mission_id: Option<String>,
 }
 
 impl RampageStartupGuard {
-    fn new(mode: ModeKind, input: &[TurnInput], mission_already_active: bool) -> Self {
+    fn new(
+        mode: ModeKind,
+        input: &[TurnInput],
+        mission_already_active: bool,
+        preexisting_mission_id: Option<String>,
+        controller_turn: bool,
+    ) -> Self {
         // Never re-run the startup gate once a mission is live; mid-mission user
         // messages must flow straight through to the controller.
-        let startup_required =
-            !mission_already_active && rampage_runtime_enforcement_required(mode, input);
+        let startup_required = controller_turn
+            && !mission_already_active
+            && rampage_runtime_enforcement_required(mode, input);
         Self {
             mode: startup_required.then_some(mode),
             startup_required,
+            preexisting_mission_id,
             ..Default::default()
         }
     }
@@ -501,24 +566,60 @@ impl RampageStartupGuard {
     }
 
     fn is_satisfied(&self) -> bool {
-        !self.is_required()
-            || (self.support_agent_question_asked
-                && self.verifier_question_asked
-                && self.rampage_control_calls > 0)
+        !self.is_required() || (self.has_distinct_startup_answers() && self.rampage_start_succeeded)
+    }
+
+    fn has_distinct_startup_answers(&self) -> bool {
+        let (Some(support), Some(pass), Some(failures)) = (
+            self.support_agents_answer.as_ref(),
+            self.verifier_pass_threshold_answer.as_ref(),
+            self.verifier_max_failures_answer.as_ref(),
+        ) else {
+            return false;
+        };
+        support.question_id != pass.question_id
+            && support.question_id != failures.question_id
+            && pass.question_id != failures.question_id
+    }
+
+    fn selected_startup_configuration(&self) -> Option<RampageStartupConfiguration> {
+        let (Some(support), Some(pass), Some(failures)) = (
+            self.support_agents_answer.as_ref(),
+            self.verifier_pass_threshold_answer.as_ref(),
+            self.verifier_max_failures_answer.as_ref(),
+        ) else {
+            return None;
+        };
+        if !self.has_distinct_startup_answers() {
+            return None;
+        }
+        Some(RampageStartupConfiguration {
+            support_agents: support.value.clone(),
+            verifier_pass_threshold: pass.value,
+            verifier_max_failures: failures.value,
+        })
+    }
+
+    fn start_arguments_match_answers(&self, arguments: &str) -> bool {
+        let Some(selected) = self.selected_startup_configuration() else {
+            return false;
+        };
+        rampage_startup_configuration(arguments).is_some_and(|requested| requested == selected)
     }
 
     fn missing_startup_steps(&self) -> Vec<&'static str> {
         let mut steps = Vec::new();
-        if !self.support_agent_question_asked {
+        if self.support_agents_answer.is_none() {
             steps.push("request_user_input for the mandatory support-agent opt-in question");
         }
-        if !self.verifier_question_asked {
-            steps.push(
-                "request_user_input for the mandatory verifier-config question (max verification failures before flagging the user, and the pass percentage)",
-            );
+        if self.verifier_pass_threshold_answer.is_none() {
+            steps.push("request_user_input for the mandatory verifier pass-percentage question");
         }
-        if self.rampage_control_calls == 0 {
-            steps.push("rampage_control action=start");
+        if self.verifier_max_failures_answer.is_none() {
+            steps.push("request_user_input for the mandatory verifier max-failures question");
+        }
+        if !self.rampage_start_succeeded {
+            steps.push("a successful rampage_control action=start matching the user answers");
         }
         steps
     }
@@ -526,32 +627,101 @@ impl RampageStartupGuard {
     fn observe_tool_call(&mut self, tool_name: &ToolCallIdentity, arguments: Option<&str>) {
         match tool_name.name.as_str() {
             "spawn_agent" => self.spawn_agent_calls += 1,
-            "rampage_control" => self.rampage_control_calls += 1,
+            "rampage_control"
+                if arguments.is_some_and(|arguments| {
+                    rampage_control_arguments_start_mission(arguments)
+                        && self.start_arguments_match_answers(arguments)
+                }) =>
+            {
+                self.rampage_start_calls += 1;
+                self.pending_rampage_starts
+                    .insert(tool_name.call_id.clone());
+            }
             "rampage_spawn" => self.rampage_spawn_calls += 1,
             "request_user_input" => {
                 self.request_user_input_calls += 1;
                 if let Some(arguments) = arguments {
-                    let lower = arguments.to_ascii_lowercase();
-                    if lower.contains("support agent") {
-                        self.support_agent_question_asked = true;
-                    }
-                    // The verifier-config question mentions verification alongside the
-                    // failure count and/or the pass percentage.
-                    if lower.contains("verif")
-                        && (lower.contains("fail")
-                            || lower.contains("pass")
-                            || lower.contains("percent"))
-                    {
-                        self.verifier_question_asked = true;
-                    }
+                    self.pending_startup_questions.insert(
+                        tool_name.call_id.clone(),
+                        request_user_input_questions(arguments),
+                    );
                 }
             }
             _ => {}
         }
     }
 
-    fn should_block_tool_call(&self, tool_name: &ToolCallIdentity) -> bool {
+    fn observe_tool_output(&mut self, item: &ResponseItem) {
+        let ResponseItem::FunctionCallOutput { call_id, output } = item else {
+            return;
+        };
+        if self.pending_rampage_starts.remove(call_id) {
+            if rampage_start_output_reports_success(output) {
+                self.rampage_start_succeeded = true;
+            }
+            return;
+        }
+        let Some(questions) = self.pending_startup_questions.remove(call_id) else {
+            return;
+        };
+        if output.success != Some(true) {
+            return;
+        }
+        let FunctionCallOutputBody::Text(body) = &output.body else {
+            return;
+        };
+        let Ok(response) = serde_json::from_str::<RequestUserInputResponse>(body) else {
+            return;
+        };
+        for question in questions {
+            let Some(answer) = response.answers.get(&question.id) else {
+                continue;
+            };
+            let [answer] = answer.answers.as_slice() else {
+                continue;
+            };
+            match question.category {
+                RampageStartupQuestionCategory::SupportAgents => {
+                    if let Some(value) = parse_support_agents_answer(answer) {
+                        self.support_agents_answer = Some(RampageStartupAnswer {
+                            question_id: question.id,
+                            value,
+                        });
+                    }
+                }
+                RampageStartupQuestionCategory::VerifierPassThreshold => {
+                    if let Some(value) = parse_verifier_pass_threshold(answer) {
+                        self.verifier_pass_threshold_answer = Some(RampageStartupAnswer {
+                            question_id: question.id,
+                            value,
+                        });
+                    }
+                }
+                RampageStartupQuestionCategory::VerifierMaxFailures => {
+                    if let Some(value) = parse_verifier_max_failures(answer) {
+                        self.verifier_max_failures_answer = Some(RampageStartupAnswer {
+                            question_id: question.id,
+                            value,
+                        });
+                    }
+                }
+            };
+        }
+    }
+
+    fn should_block_tool_call(
+        &self,
+        tool_name: &ToolCallIdentity,
+        arguments: Option<&str>,
+    ) -> bool {
         if self.is_required() && tool_name.name == "spawn_agent" {
+            return true;
+        }
+        if self.is_required()
+            && tool_name.name == "rampage_control"
+            && arguments.is_some_and(rampage_control_arguments_start_mission)
+            && !arguments.is_some_and(|arguments| self.start_arguments_match_answers(arguments))
+        {
             return true;
         }
         self.is_required() && !self.is_satisfied() && !is_rampage_startup_tool(tool_name)
@@ -575,17 +745,35 @@ impl RampageStartupGuard {
         }
         let missing = self.missing_startup_steps().join(", ");
         format!(
-            "{mode_name} startup enforcement blocked `{}` before durable Mission Control startup was satisfied.\n\nComplete these startup steps first: {missing}. Do not call shell, file, network, or other work tools until the durable mission exists.",
+            "{mode_name} startup enforcement blocked `{}` before durable Mission Control startup was satisfied.\n\nComplete these startup steps first: {missing}. The three user-owned choices must be collected before action=start. Do not call shell, file, network, or other work tools until the durable mission exists.",
             tool_name.display()
         )
     }
 
-    fn build_completion_blocker_message(
+    async fn build_completion_blocker_message(
         &mut self,
+        sess: &Session,
         turn_context: &TurnContext,
         last_agent_message: Option<&str>,
     ) -> Option<ResponseItem> {
-        if self.is_satisfied() {
+        if !self.is_required() {
+            return None;
+        }
+        let durable_mission_exists = if self.is_satisfied() {
+            current_mission_id_for_thread(
+                turn_context.config.codex_home.as_path(),
+                &sess.thread_id.to_string(),
+            )
+            .await
+            .ok()
+            .flatten()
+            .is_some_and(|mission_id| {
+                self.preexisting_mission_id.as_deref() != Some(mission_id.as_str())
+            })
+        } else {
+            false
+        };
+        if self.is_satisfied() && durable_mission_exists {
             return None;
         }
         self.completion_blocks += 1;
@@ -600,15 +788,159 @@ impl RampageStartupGuard {
         } else {
             ""
         };
-        let missing = self.missing_startup_steps().join(", ");
+        let mut missing = self.missing_startup_steps();
+        if self.rampage_start_succeeded && !durable_mission_exists {
+            missing.push(
+                "a successful rampage_control action=start that created durable mission state",
+            );
+        }
+        let missing = missing.join(", ");
         let prompt = format!(
-            "{mode_name} startup gate is not satisfied.{previous}\n\nBefore normal work may continue, complete these durable startup steps: {missing}. Ask the support-agent startup question with `request_user_input`, then call `rampage_control action=start` with the selected support_agents value. Use `rampage_spawn` for workers after the mission exists.{repeated}"
+            "{mode_name} startup gate is not satisfied.{previous}\n\nBefore normal work may continue, complete these durable startup steps: {missing}. Ask all three separate startup questions with `request_user_input`, then call `rampage_control action=start` with the selected support_agents, verifier_pass_threshold, and verifier_max_failures values. Use `rampage_spawn` for workers after the mission exists.{repeated}"
         );
         build_hook_prompt_message(&[HookPromptFragment::from_single_hook(
             prompt,
             "rampage-startup-enforce",
         )])
     }
+}
+
+fn request_user_input_questions(arguments: &str) -> Vec<RampageStartupQuestion> {
+    let Ok(args) = serde_json::from_str::<RequestUserInputArgs>(arguments) else {
+        return Vec::new();
+    };
+    args.questions
+        .iter()
+        .filter_map(|question| {
+            let id = question.id.trim();
+            if id.is_empty() {
+                return None;
+            }
+            rampage_startup_question_category(question).map(|category| RampageStartupQuestion {
+                id: id.to_string(),
+                category,
+            })
+        })
+        .collect()
+}
+
+fn rampage_startup_question_category(
+    question: &RequestUserInputQuestion,
+) -> Option<RampageStartupQuestionCategory> {
+    let text = format!("{} {}", question.header, question.question).to_ascii_lowercase();
+    let support = text.contains("support") && text.contains("agent");
+    let verifier = text.contains("verif");
+    let pass = verifier
+        && (text.contains("pass") || text.contains("percent") || text.contains("threshold"));
+    let failures = verifier
+        && (text.contains("fail")
+            || text.contains("attempt")
+            || text.contains("round")
+            || text.contains("max"));
+    match (support, pass, failures) {
+        (true, false, false) => Some(RampageStartupQuestionCategory::SupportAgents),
+        (false, true, false) => Some(RampageStartupQuestionCategory::VerifierPassThreshold),
+        (false, false, true) => Some(RampageStartupQuestionCategory::VerifierMaxFailures),
+        _ => None,
+    }
+}
+
+fn normalize_rampage_token(value: &str) -> String {
+    value.trim().to_ascii_lowercase().replace([' ', '-'], "_")
+}
+
+fn strip_recommended_suffix(answer: &str) -> &str {
+    answer
+        .trim()
+        .trim_end_matches("(Recommended)")
+        .trim_end_matches("(recommended)")
+        .trim()
+}
+
+fn parse_support_agents_answer(answer: &str) -> Option<String> {
+    match normalize_rampage_token(strip_recommended_suffix(answer)).as_str() {
+        "both" | "both_support_agents" => Some("both".to_string()),
+        "new_ideas_only" | "new_ideas_agent_only" => Some("new_ideas_only".to_string()),
+        "efficiency_only" | "efficiency_monitoring_only" | "efficiency_monitoring_agent_only" => {
+            Some("efficiency_only".to_string())
+        }
+        "none" | "no_support_agents" => Some("none".to_string()),
+        _ => None,
+    }
+}
+
+fn parse_verifier_pass_threshold(answer: &str) -> Option<f64> {
+    let answer = strip_recommended_suffix(answer);
+    let value = answer.strip_suffix('%').unwrap_or(answer).trim();
+    let value = value.parse::<f64>().ok()?;
+    (value.is_finite() && (0.0..=100.0).contains(&value)).then_some(value)
+}
+
+fn parse_verifier_max_failures(answer: &str) -> Option<RampageVerifierMaxFailures> {
+    parse_verifier_max_failures_value(strip_recommended_suffix(answer))
+}
+
+fn parse_verifier_max_failures_value(value: &str) -> Option<RampageVerifierMaxFailures> {
+    let normalized = normalize_rampage_token(value);
+    if matches!(normalized.as_str(), "infinite" | "unlimited" | "none") {
+        return Some(RampageVerifierMaxFailures::Infinite);
+    }
+    normalized
+        .parse::<u64>()
+        .ok()
+        .map(RampageVerifierMaxFailures::Bounded)
+}
+
+fn rampage_startup_configuration(arguments: &str) -> Option<RampageStartupConfiguration> {
+    let value = serde_json::from_str::<serde_json::Value>(arguments).ok()?;
+    let support_agents = value.get("support_agents")?.as_str()?;
+    let support_agents = match normalize_rampage_token(support_agents).as_str() {
+        "both" => "both",
+        "new_ideas_only" => "new_ideas_only",
+        "efficiency_only" => "efficiency_only",
+        "none" => "none",
+        _ => return None,
+    }
+    .to_string();
+    let verifier_pass_threshold = value.get("verifier_pass_threshold")?.as_f64()?;
+    if !verifier_pass_threshold.is_finite() || !(0.0..=100.0).contains(&verifier_pass_threshold) {
+        return None;
+    }
+    let verifier_max_failures = match value.get("verifier_max_failures")? {
+        serde_json::Value::Number(number) => RampageVerifierMaxFailures::Bounded(number.as_u64()?),
+        serde_json::Value::String(value) => parse_verifier_max_failures_value(value)?,
+        _ => return None,
+    };
+    Some(RampageStartupConfiguration {
+        support_agents,
+        verifier_pass_threshold,
+        verifier_max_failures,
+    })
+}
+
+fn rampage_start_output_reports_success(output: &FunctionCallOutputPayload) -> bool {
+    if output.success != Some(true) {
+        return false;
+    }
+    let FunctionCallOutputBody::Text(body) = &output.body else {
+        return false;
+    };
+    serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|value| value.get("ok").and_then(serde_json::Value::as_bool))
+        == Some(true)
+}
+
+fn rampage_control_arguments_start_mission(arguments: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(arguments)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("action")
+                .and_then(|action| action.as_str())
+                .map(str::to_owned)
+        })
+        .is_some_and(|action| action.trim().eq_ignore_ascii_case("start"))
 }
 
 #[derive(Debug, Clone)]
@@ -665,25 +997,19 @@ fn turn_input_is_nontrivial_user_task(input: &TurnInput) -> bool {
     ) {
         return false;
     }
-    let word_count = lower.split_whitespace().count();
-    word_count >= 8
-        || [
-            "fix",
-            "build",
-            "modify",
-            "implement",
-            "research",
-            "evaluate",
-            "benchmark",
-            "load",
-            "check",
-            "verify",
-            "server",
-            "docker",
-            "ssh",
-        ]
-        .iter()
-        .any(|marker| lower.contains(marker))
+    !matches!(
+        lower.as_str(),
+        "thanks"
+            | "thank you"
+            | "ok"
+            | "okay"
+            | "yes"
+            | "no"
+            | "stop"
+            | "cancel"
+            | "/stop"
+            | "/cancel"
+    )
 }
 
 fn is_rampage_startup_tool(tool_name: &ToolCallIdentity) -> bool {
@@ -700,10 +1026,27 @@ fn is_rampage_startup_tool(tool_name: &ToolCallIdentity) -> bool {
     )
 }
 
+fn is_rampage_controller_tool(tool_name: &ToolCallIdentity) -> bool {
+    matches!(
+        tool_name.name.as_str(),
+        "request_user_input"
+            | "rampage_control"
+            | "rampage_board"
+            | "rampage_compact"
+            | "rampage_spawn"
+            | "update_plan"
+            | "list_agents"
+            | "wait_agent"
+            | "send_message"
+            | "interrupt_agent"
+    )
+}
+
 async fn rampage_runtime_tool_block_message(
     sess: &Session,
     turn_context: &TurnContext,
     tool_name: &ToolCallIdentity,
+    startup_mission_required: bool,
 ) -> Option<String> {
     if !matches!(
         turn_context.collaboration_mode.mode,
@@ -713,6 +1056,17 @@ async fn rampage_runtime_tool_block_message(
     }
 
     let mode_name = turn_context.collaboration_mode.mode.display_name();
+    if !rampage_controller_tools_enabled(
+        turn_context.collaboration_mode.mode,
+        &turn_context.session_source,
+    ) {
+        return (tool_name.name == "spawn_agent").then(|| {
+            format!(
+                "{mode_name} worker blocked raw `{}`. This worker must complete its assigned task and return structured evidence to Mission Control; it must not create child workers.",
+                tool_name.display()
+            )
+        });
+    }
     if tool_name.name == "spawn_agent" {
         return Some(format!(
             "{mode_name} blocks raw `{}`. Follow the durable Mission Control architecture: create all workers through `rampage_spawn` so each worker has a rampage_task row, mission brief, Questboard context, and routed result.",
@@ -720,12 +1074,38 @@ async fn rampage_runtime_tool_block_message(
         ));
     }
 
-    if is_rampage_startup_tool(tool_name) {
+    if is_rampage_controller_tool(tool_name) {
         return None;
     }
 
     let thread_id = sess.thread_id.to_string();
-    match support_agent_spawn_gate_status_for_thread(
+    let active_mission = match incomplete_mission_status_for_thread(
+        turn_context.config.codex_home.as_path(),
+        &thread_id,
+    )
+    .await
+    {
+        Ok(Some(status)) => status,
+        Ok(None) => {
+            let detail = if startup_mission_required {
+                "startup has not created durable mission state. Complete the mandatory questions and a successful `rampage_control` action=start"
+            } else {
+                "no incomplete durable mission exists. Start one with `rampage_control` action=start"
+            };
+            return Some(format!(
+                "{mode_name} blocked `{}` because {detail} before doing any mission work. Mission Control remains coordination-only even for short requests.",
+                tool_name.display()
+            ));
+        }
+        Err(err) => {
+            return Some(format!(
+                "{mode_name} blocked `{}` because the durable Rampage state could not be read: {err}.\n\nDo not continue normal work. Recover Mission Control state with `rampage_control` action=status or fix the state file, then continue through the Questboard and `rampage_spawn` path.",
+                tool_name.display()
+            ));
+        }
+    };
+
+    let support_guidance = match support_agent_spawn_gate_status_for_thread(
         turn_context.config.codex_home.as_path(),
         &thread_id,
     )
@@ -753,23 +1133,25 @@ async fn rampage_runtime_tool_block_message(
                 })
                 .collect::<Vec<_>>()
                 .join("\n");
-            Some(format!(
-                "{mode_name} blocked `{}` before selected support agents were spawned.\n\nMission: {} ({})\nSelected support_agents: {}\nMissing spawned workers: {}\nState file: {}\n\nFollow the Rampage architecture now: Mission Control remains the controller, workers do not coordinate with each other, and selected support agents must exist as durable `rampage_spawn` tasks before shell/file/network work continues. Spawn the missing advisory workers first:\n{}",
-                tool_name.display(),
-                status.title,
-                status.mission_id,
-                status.support_agents,
-                missing_names,
-                status.state_path,
-                spawn_plan
-            ))
+            format!(
+                "\n\nMission {} ({}) selected support_agents={}. Missing advisory workers: {missing_names}. Spawn them only after focused mission workers exist, and re-run them after worker results so their advice is current:\n{spawn_plan}\nSupport state: {}",
+                status.title, status.mission_id, status.support_agents, status.state_path,
+            )
         }
-        Ok(None) => None,
-        Err(err) => Some(format!(
-            "{mode_name} blocked `{}` because the durable Rampage state could not be read: {err}.\n\nDo not continue normal work. Recover Mission Control state with `rampage_control` action=status or fix the state file, then continue through the Questboard and `rampage_spawn` path.",
-            tool_name.display()
-        )),
-    }
+        Ok(None) => String::new(),
+        Err(err) => format!(
+            "\n\nThe selected support-agent state could not be read: {err}. Recover it with `rampage_control` action=status before continuing."
+        ),
+    };
+
+    Some(format!(
+        "{mode_name} blocked `{}` because Mission Control is coordination-only while mission `{}` ({}) is active. Mission Control must not perform shell, file, search, network, edit, or other mission work directly. Create a focused non-support worker with `rampage_spawn`, wait for its result, record the result on the Questboard, then retask or verify through durable Rampage tools.{}\n\nMission state: {}",
+        tool_name.display(),
+        active_mission.title,
+        active_mission.id,
+        support_guidance,
+        active_mission.state_path,
+    ))
 }
 
 fn tool_call_arguments(item: &ResponseItem) -> Option<String> {
@@ -848,7 +1230,10 @@ async fn build_active_exec_continuation_message(
     // so their turns must finalize and deliver the answer immediately rather than
     // being pinned open (re-prompting the model to poll) until the background
     // process exits.
-    if !matches!(turn_context.collaboration_mode.mode, ModeKind::AbsoluteRampage) {
+    if !matches!(
+        turn_context.collaboration_mode.mode,
+        ModeKind::AbsoluteRampage
+    ) {
         return None;
     }
     if !sess
@@ -887,7 +1272,7 @@ async fn build_rampage_active_mission_continuation_message(
     }
 
     let thread_id = sess.thread_id.to_string();
-    let status = match active_mission_status_for_thread(
+    let status = match incomplete_mission_status_for_thread(
         turn_context.config.codex_home.as_path(),
         &thread_id,
     )
@@ -2401,7 +2786,8 @@ async fn drain_in_flight(
     in_flight: &mut FuturesOrdered<BoxFuture<'static, CodexResult<ResponseInputItem>>>,
     sess: Arc<Session>,
     turn_context: Arc<TurnContext>,
-) -> CodexResult<()> {
+) -> CodexResult<Vec<ResponseItem>> {
+    let mut completed_outputs = Vec::new();
     while let Some(res) = in_flight.next().await {
         match res {
             Ok(response_input) => {
@@ -2414,13 +2800,14 @@ async fn drain_in_flight(
                     &response_item,
                 )
                 .await;
+                completed_outputs.push(response_item);
             }
             Err(err) => {
                 error_or_panic(format!("in-flight tool future failed during drain: {err}"));
             }
         }
     }
-    Ok(())
+    Ok(completed_outputs)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2575,7 +2962,10 @@ async fn try_run_sampling_request(
                 }
 
                 if let Some(tool_name) = tool_call_identity(&item) {
-                    if rampage_startup_guard.should_block_tool_call(&tool_name) {
+                    let tool_arguments = tool_call_arguments(&item);
+                    if rampage_startup_guard
+                        .should_block_tool_call(&tool_name, tool_arguments.as_deref())
+                    {
                         let message = rampage_startup_guard.blocked_tool_message(&tool_name);
                         rampage_startup_guard.record_blocked_tool_call();
                         record_completed_response_item(sess.as_ref(), turn_context.as_ref(), &item)
@@ -2589,8 +2979,13 @@ async fn try_run_sampling_request(
                         needs_follow_up = true;
                         continue;
                     }
-                    if let Some(message) =
-                        rampage_runtime_tool_block_message(&sess, &turn_context, &tool_name).await
+                    if let Some(message) = rampage_runtime_tool_block_message(
+                        &sess,
+                        &turn_context,
+                        &tool_name,
+                        rampage_startup_guard.is_required(),
+                    )
+                    .await
                     {
                         record_completed_response_item(sess.as_ref(), turn_context.as_ref(), &item)
                             .await;
@@ -2603,8 +2998,7 @@ async fn try_run_sampling_request(
                         needs_follow_up = true;
                         continue;
                     }
-                    rampage_startup_guard
-                        .observe_tool_call(&tool_name, tool_call_arguments(&item).as_deref());
+                    rampage_startup_guard.observe_tool_call(&tool_name, tool_arguments.as_deref());
                 }
 
                 let mut ctx = HandleOutputCtx {
@@ -2918,7 +3312,11 @@ async fn try_run_sampling_request(
     } else {
         Some(turn_context.turn_timing_state.begin_tool_blocking())
     };
-    drain_in_flight(&mut in_flight, sess.clone(), turn_context.clone()).await?;
+    let completed_tool_outputs =
+        drain_in_flight(&mut in_flight, sess.clone(), turn_context.clone()).await?;
+    for output in &completed_tool_outputs {
+        rampage_startup_guard.observe_tool_output(output);
+    }
     drop(tool_blocking_timing_guard);
 
     if should_emit_token_count {

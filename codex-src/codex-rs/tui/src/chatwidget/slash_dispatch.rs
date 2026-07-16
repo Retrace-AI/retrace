@@ -2366,6 +2366,12 @@ impl ChatWidget {
                     );
                 }
             }
+            SlashCommand::Loop => {
+                self.handle_loop_command_args(String::new());
+            }
+            SlashCommand::RalphaLoop => {
+                self.handle_ralphaloop_command_args(String::new());
+            }
             SlashCommand::Side | SlashCommand::Btw => {
                 self.request_empty_side_conversation(cmd);
             }
@@ -2730,6 +2736,12 @@ impl ChatWidget {
             SlashCommand::AgentCheck => {
                 self.handle_agentcheck_command_args(args);
             }
+            SlashCommand::Loop => {
+                self.handle_loop_command_args(args);
+            }
+            SlashCommand::RalphaLoop => {
+                self.handle_ralphaloop_command_args(args);
+            }
             SlashCommand::Keymap => match trimmed.to_ascii_lowercase().as_str() {
                 "" => self.open_keymap_picker(),
                 "debug" => {
@@ -2982,6 +2994,9 @@ impl ChatWidget {
         if rest.is_empty() {
             return match command {
                 SlashCommandItem::Builtin(cmd) => {
+                    if Self::queued_command_cancels_prompt_loop(cmd) {
+                        self.cancel_prompt_loop_for_thread_change();
+                    }
                     self.dispatch_command(cmd);
                     self.queued_command_drain_result(cmd)
                 }
@@ -3025,6 +3040,9 @@ impl ChatWidget {
             && !self.goal_objective_is_allowed(trimmed_rest, GoalObjectiveValidationSource::Queued)
         {
             return QueueDrain::Continue;
+        }
+        if Self::queued_command_cancels_prompt_loop(cmd) {
+            self.cancel_prompt_loop_for_thread_change();
         }
         self.dispatch_prepared_command_with_args(
             cmd,
@@ -3087,6 +3105,8 @@ impl ChatWidget {
             | SlashCommand::Rename
             | SlashCommand::AgentCheck
             | SlashCommand::Thinking
+            | SlashCommand::Loop
+            | SlashCommand::RalphaLoop
             | SlashCommand::TestApproval => QueueDrain::Continue,
             SlashCommand::Feedback
             | SlashCommand::New
@@ -3128,6 +3148,23 @@ impl ChatWidget {
             | SlashCommand::Theme
             | SlashCommand::Pets => QueueDrain::Stop,
         }
+    }
+
+    pub(super) fn queued_command_cancels_prompt_loop(cmd: SlashCommand) -> bool {
+        matches!(
+            cmd,
+            SlashCommand::New
+                | SlashCommand::Archive
+                | SlashCommand::Clear
+                | SlashCommand::Resume
+                | SlashCommand::Delete
+                | SlashCommand::Fork
+                | SlashCommand::Side
+                | SlashCommand::Btw
+                | SlashCommand::Quit
+                | SlashCommand::Exit
+                | SlashCommand::Logout
+        )
     }
 
     fn slash_command_args_elements(

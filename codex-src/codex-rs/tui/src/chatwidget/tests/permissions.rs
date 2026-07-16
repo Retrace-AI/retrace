@@ -9,6 +9,14 @@ use codex_protocol::permissions::FileSystemSpecialPath;
 use codex_protocol::permissions::NetworkSandboxPolicy;
 use pretty_assertions::assert_eq;
 
+#[test]
+fn readonly_research_uses_the_os_read_only_preset() {
+    assert_eq!(
+        ChatWidget::mode_gate_preset_id(ModeKind::ReadonlyResearch),
+        Some("read-only")
+    );
+}
+
 fn app_server_workspace_write_profile(extra_root: AbsolutePathBuf) -> PermissionProfile {
     PermissionProfile::Managed {
         network: NetworkSandboxPolicy::Restricted,

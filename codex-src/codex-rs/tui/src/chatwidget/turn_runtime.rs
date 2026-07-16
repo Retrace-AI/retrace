@@ -186,8 +186,21 @@ impl ChatWidget {
         if !from_replay {
             self.transcript.saw_plan_item_this_turn = false;
         }
+        // Resolve the loop that owned the completed turn before draining queued
+        // commands. A queued `/ralphaloop` must not consume this older response.
+        let defer_loop_submission = self.has_queued_follow_up_messages()
+            || had_pending_steers
+            || matches!(
+                self.rate_limit_switch_prompt,
+                RateLimitSwitchPromptState::Pending
+            );
+        if !from_replay {
+            self.on_prompt_loop_turn_complete(&notification_response, defer_loop_submission);
+        }
+        let loop_follow_up_started = self.is_user_turn_pending_or_running();
         // If there is a queued user message, send exactly one now to begin the next turn.
-        let follow_up_started = self.maybe_send_next_queued_input();
+        let queued_follow_up_started = self.maybe_send_next_queued_input();
+        let follow_up_started = loop_follow_up_started || queued_follow_up_started;
         let active_goal_continuing = self
             .current_goal_status
             .as_ref()
@@ -322,6 +335,7 @@ impl ChatWidget {
         self.request_status_line_branch_refresh();
         self.request_status_line_git_summary_refresh();
         self.maybe_show_pending_rate_limit_prompt();
+        self.on_prompt_loop_turn_failed();
     }
 
     pub(super) fn on_server_overloaded_error(&mut self, message: String) {

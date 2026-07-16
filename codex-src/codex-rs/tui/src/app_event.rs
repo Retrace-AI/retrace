@@ -184,6 +184,12 @@ pub(crate) struct CodexOsProviderConfigureResult {
     pub(crate) model_catalog: Vec<ModelPreset>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PromptLoopWakeupReason {
+    Interval,
+    Retry,
+}
+
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug)]
 pub(crate) enum AppEvent {
@@ -284,6 +290,14 @@ pub(crate) enum AppEvent {
     /// Forward a command to the Agent. Using an `AppEvent` for this avoids
     /// bubbling channels through layers of widgets.
     CodexOp(AppCommand),
+
+    /// Wake a session-scoped `/loop` timer. Generation and thread checks keep
+    /// replaced schedules from submitting into the wrong conversation.
+    PromptLoopWakeup {
+        thread_id: ThreadId,
+        generation: u64,
+        reason: PromptLoopWakeupReason,
+    },
 
     /// Restore an output-free interrupted turn into the composer and roll it back.
     RestoreCancelledTurn(UserMessage),

@@ -46,6 +46,9 @@ pub enum SlashCommand {
     Compact,
     Plan,
     Goal,
+    Loop,
+    #[strum(serialize = "ralphaloop")]
+    RalphaLoop,
     Agent,
     Side,
     Btw,
@@ -137,6 +140,10 @@ impl SlashCommand {
             SlashCommand::Settings => "configure realtime microphone/speaker",
             SlashCommand::Plan => "switch to Plan mode",
             SlashCommand::Goal => "set or view the goal for a long-running task",
+            SlashCommand::Loop => "repeat a prompt on a timer: /loop [10m] <prompt>",
+            SlashCommand::RalphaLoop => {
+                "repeat the same prompt until its completion promise or iteration limit"
+            }
             SlashCommand::Agent | SlashCommand::MultiAgents => "switch the active agent thread",
             SlashCommand::Side | SlashCommand::Btw => {
                 "start a side conversation in an ephemeral fork"
@@ -174,6 +181,8 @@ impl SlashCommand {
                 | SlashCommand::Rename
                 | SlashCommand::Plan
                 | SlashCommand::Goal
+                | SlashCommand::Loop
+                | SlashCommand::RalphaLoop
                 | SlashCommand::Model
                 | SlashCommand::ModelAdd
                 | SlashCommand::Provider
@@ -244,6 +253,8 @@ impl SlashCommand {
             | SlashCommand::Stop
             | SlashCommand::App
             | SlashCommand::Goal
+            | SlashCommand::Loop
+            | SlashCommand::RalphaLoop
             | SlashCommand::Mcp
             | SlashCommand::Apps
             | SlashCommand::Plugins
@@ -323,6 +334,20 @@ mod tests {
         assert!(!SlashCommand::Provider.available_during_task());
         assert!(SlashCommand::AgentCheck.supports_inline_args());
         assert!(SlashCommand::AgentCheck.available_during_task());
+        assert!(SlashCommand::Loop.supports_inline_args());
+        assert!(SlashCommand::RalphaLoop.supports_inline_args());
+        assert!(SlashCommand::Loop.available_during_task());
+        assert!(SlashCommand::RalphaLoop.available_during_task());
+    }
+
+    #[test]
+    fn prompt_loop_command_names_are_stable() {
+        assert_eq!(SlashCommand::Loop.command(), "loop");
+        assert_eq!(SlashCommand::RalphaLoop.command(), "ralphaloop");
+        assert_eq!(
+            SlashCommand::from_str("ralphaloop"),
+            Ok(SlashCommand::RalphaLoop)
+        );
     }
 
     #[test]

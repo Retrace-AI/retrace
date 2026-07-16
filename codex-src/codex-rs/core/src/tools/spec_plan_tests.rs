@@ -8,6 +8,7 @@ use codex_mcp::ToolInfo;
 use codex_model_provider::create_model_provider;
 use codex_model_provider_info::AMAZON_BEDROCK_PROVIDER_ID;
 use codex_model_provider_info::ModelProviderInfo;
+use codex_protocol::ThreadId;
 use codex_protocol::config_types::ModeKind;
 use codex_protocol::config_types::WebSearchMode;
 use codex_protocol::dynamic_tools::DynamicToolSpec;
@@ -1186,7 +1187,10 @@ async fn multi_agent_v2_can_use_configured_tool_namespace() {
 #[tokio::test]
 async fn rampage_modes_expose_durable_tools_only_on_root_controller() {
     let rampage = probe(|turn| {
-        set_feature(turn, Feature::MultiAgentV2, /*enabled*/ true);
+        set_features(turn, &[Feature::MultiAgentV2, Feature::SpawnCsv]);
+        update_config(turn, |config| {
+            config.experimental_request_user_input_enabled = false;
+        });
         turn.collaboration_mode.mode = ModeKind::AbsoluteRampage;
     })
     .await;
@@ -1195,7 +1199,21 @@ async fn rampage_modes_expose_durable_tools_only_on_root_controller() {
         "rampage_board",
         "rampage_compact",
         "rampage_spawn",
+        "request_user_input",
     ]);
+    rampage.assert_visible_lacks(&[
+        "spawn_agent",
+        "exec_command",
+        "shell_command",
+        "apply_patch",
+        "view_image",
+        "web_search",
+        "image_generation",
+        "followup_task",
+        "spawn_agents_on_csv",
+        "rampage_checkpoint",
+    ]);
+    rampage.assert_registered_lacks(&["spawn_agent", "followup_task", "spawn_agents_on_csv"]);
 
     let readonly = probe(|turn| {
         set_feature(turn, Feature::MultiAgentV2, /*enabled*/ true);
@@ -1208,6 +1226,7 @@ async fn rampage_modes_expose_durable_tools_only_on_root_controller() {
         "rampage_compact",
         "rampage_spawn",
     ]);
+    readonly.assert_visible_lacks(&["rampage_checkpoint"]);
 
     let normal = probe(|turn| {
         set_feature(turn, Feature::MultiAgentV2, /*enabled*/ true);
@@ -1219,6 +1238,7 @@ async fn rampage_modes_expose_durable_tools_only_on_root_controller() {
         "rampage_board",
         "rampage_compact",
         "rampage_spawn",
+        "rampage_checkpoint",
     ]);
 
     let worker = probe(|turn| {
@@ -1233,7 +1253,244 @@ async fn rampage_modes_expose_durable_tools_only_on_root_controller() {
         "rampage_board",
         "rampage_compact",
         "rampage_spawn",
+        "rampage_checkpoint",
+        "spawn_agent",
+        "spawn_agents_on_csv",
+        "send_message",
+        "followup_task",
+        "wait_agent",
+        "interrupt_agent",
+        "list_agents",
     ]);
+    worker.assert_registered_lacks(&["spawn_agent", "spawn_agents_on_csv"]);
+
+    let bound_worker = probe(|turn| {
+        set_feature(turn, Feature::MultiAgentV2, /*enabled*/ true);
+        turn.collaboration_mode.mode = ModeKind::AbsoluteRampage;
+        turn.session_source = SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+            parent_thread_id: ThreadId::new(),
+            depth: 1,
+            agent_path: None,
+            agent_nickname: None,
+            agent_role: Some("rampage-worker".to_string()),
+        });
+    })
+    .await;
+    bound_worker.assert_visible_contains(&["rampage_checkpoint"]);
+    bound_worker.assert_visible_lacks(&[
+        "rampage_control",
+        "rampage_board",
+        "rampage_compact",
+        "rampage_spawn",
+    ]);
+
+    let code_mode_worker = probe(|turn| {
+        set_features(
+            turn,
+            &[
+                Feature::CodeMode,
+                Feature::CodeModeOnly,
+                Feature::MultiAgentV2,
+                Feature::SpawnCsv,
+            ],
+        );
+        turn.collaboration_mode.mode = ModeKind::AbsoluteRampage;
+        turn.session_source =
+            SessionSource::SubAgent(SubAgentSource::Other("rampage-worker".to_string()));
+    })
+    .await;
+    code_mode_worker.assert_visible_contains(&[
+        codex_code_mode::PUBLIC_TOOL_NAME,
+        codex_code_mode::WAIT_TOOL_NAME,
+    ]);
+    code_mode_worker.assert_registered_lacks(&["spawn_agent", "spawn_agents_on_csv"]);
+
+    let code_mode_controller = probe(|turn| {
+        set_features(
+            turn,
+            &[
+                Feature::CodeMode,
+                Feature::CodeModeOnly,
+                Feature::MultiAgentV2,
+            ],
+        );
+        turn.collaboration_mode.mode = ModeKind::AbsoluteRampage;
+    })
+    .await;
+    code_mode_controller.assert_visible_contains(&[
+        "rampage_control",
+        "rampage_board",
+        "rampage_compact",
+        "rampage_spawn",
+    ]);
+    code_mode_controller.assert_visible_lacks(&[
+        codex_code_mode::PUBLIC_TOOL_NAME,
+        codex_code_mode::WAIT_TOOL_NAME,
+        "spawn_agent",
+        "exec_command",
+        "apply_patch",
+        "view_image",
+    ]);
+
+    let isolated_controller = probe_with(
+        |turn| {
+            set_feature(turn, Feature::MultiAgentV2, /*enabled*/ true);
+            turn.collaboration_mode.mode = ModeKind::ReadonlyResearch;
+        },
+        ToolPlanInputs {
+            mcp_tools: Some(vec![mcp_tool("private", "mcp__private", "lookup")]),
+            extension_tool_executors: vec![Arc::new(DeferredExtensionTool)],
+            dynamic_tools: vec![dynamic_tool(Some("dynamic"), "lookup", false)],
+            ..ToolPlanInputs::default()
+        },
+    )
+    .await;
+    isolated_controller.assert_visible_lacks(&[
+        "mcp__private",
+        "extension_echo",
+        "dynamic",
+        "list_mcp_resources",
+        "tool_search",
+    ]);
+    isolated_controller.assert_registered_lacks(&[
+        &ToolName::namespaced("mcp__private", "lookup").to_string(),
+        "extension_echo",
+        &ToolName::namespaced("dynamic", "lookup").to_string(),
+    ]);
+}
+
+#[tokio::test]
+async fn rampage_controllers_do_not_receive_hosted_work_tools() {
+    for mode in [ModeKind::AbsoluteRampage, ModeKind::ReadonlyResearch] {
+        let controller = probe(|turn| {
+            use_chatgpt_auth(turn);
+            set_feature(turn, Feature::ImageGeneration, /*enabled*/ true);
+            set_web_search_mode(turn, WebSearchMode::Live);
+            turn.model_info.input_modalities = vec![InputModality::Image];
+            turn.collaboration_mode.mode = mode;
+        })
+        .await;
+        controller.assert_visible_lacks(&["web_search", "image_generation"]);
+    }
+
+    let worker = probe(|turn| {
+        use_chatgpt_auth(turn);
+        set_feature(turn, Feature::ImageGeneration, /*enabled*/ true);
+        set_web_search_mode(turn, WebSearchMode::Live);
+        turn.model_info.input_modalities = vec![InputModality::Image];
+        turn.collaboration_mode.mode = ModeKind::ReadonlyResearch;
+        turn.session_source =
+            SessionSource::SubAgent(SubAgentSource::Other("research-worker".to_string()));
+    })
+    .await;
+    worker.assert_visible_contains(&["web_search"]);
+    worker.assert_visible_lacks(&["image_generation"]);
+}
+
+#[tokio::test]
+async fn rampage_advisors_and_verifiers_have_evidence_only_capabilities() {
+    let advisor = probe_with(
+        |turn| {
+            set_features(
+                turn,
+                &[
+                    Feature::CodeMode,
+                    Feature::CodeModeOnly,
+                    Feature::MultiAgentV2,
+                ],
+            );
+            turn.collaboration_mode.mode = ModeKind::AbsoluteRampage;
+            turn.session_source = SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+                parent_thread_id: ThreadId::new(),
+                depth: 1,
+                agent_path: None,
+                agent_nickname: None,
+                agent_role: Some("rampage-advisor".to_string()),
+            });
+        },
+        ToolPlanInputs {
+            mcp_tools: Some(vec![mcp_tool("private", "mcp__private", "mutate")]),
+            extension_tool_executors: vec![Arc::new(DeferredExtensionTool)],
+            dynamic_tools: vec![dynamic_tool(Some("dynamic"), "mutate", false)],
+            ..ToolPlanInputs::default()
+        },
+    )
+    .await;
+    assert!(
+        advisor.visible_names.is_empty(),
+        "{:?}",
+        advisor.visible_names
+    );
+    assert!(
+        advisor.registered_names.is_empty(),
+        "{:?}",
+        advisor.registered_names
+    );
+
+    let verifier = probe_with(
+        |turn| {
+            set_feature(turn, Feature::MultiAgentV2, /*enabled*/ true);
+            turn.collaboration_mode.mode = ModeKind::AbsoluteRampage;
+            turn.session_source = SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+                parent_thread_id: ThreadId::new(),
+                depth: 1,
+                agent_path: None,
+                agent_nickname: None,
+                agent_role: Some("rampage-verifier".to_string()),
+            });
+        },
+        ToolPlanInputs {
+            mcp_tools: Some(vec![mcp_tool("private", "mcp__private", "mutate")]),
+            extension_tool_executors: vec![Arc::new(DeferredExtensionTool)],
+            dynamic_tools: vec![dynamic_tool(Some("dynamic"), "mutate", false)],
+            ..ToolPlanInputs::default()
+        },
+    )
+    .await;
+    verifier.assert_visible_lacks(&[
+        "apply_patch",
+        "request_permissions",
+        "spawn_agent",
+        "send_message",
+        "followup_task",
+        "mcp__private",
+        "extension_echo",
+        "dynamic",
+        "image_generation",
+        "rampage_checkpoint",
+    ]);
+
+    let readonly_worker = probe_with(
+        |turn| {
+            set_feature(turn, Feature::MultiAgentV2, /*enabled*/ true);
+            turn.collaboration_mode.mode = ModeKind::ReadonlyResearch;
+            turn.session_source = SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+                parent_thread_id: ThreadId::new(),
+                depth: 1,
+                agent_path: None,
+                agent_nickname: None,
+                agent_role: Some("rampage-readonly-worker".to_string()),
+            });
+        },
+        ToolPlanInputs {
+            mcp_tools: Some(vec![mcp_tool("private", "mcp__private", "mutate")]),
+            extension_tool_executors: vec![Arc::new(DeferredExtensionTool)],
+            dynamic_tools: vec![dynamic_tool(Some("dynamic"), "mutate", false)],
+            ..ToolPlanInputs::default()
+        },
+    )
+    .await;
+    readonly_worker.assert_visible_lacks(&[
+        "apply_patch",
+        "request_permissions",
+        "spawn_agent",
+        "send_message",
+        "mcp__private",
+        "extension_echo",
+        "dynamic",
+        "image_generation",
+    ]);
+    readonly_worker.assert_visible_contains(&["rampage_checkpoint"]);
 }
 
 #[tokio::test]

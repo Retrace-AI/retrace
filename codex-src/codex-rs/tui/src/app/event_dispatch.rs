@@ -329,6 +329,14 @@ impl App {
                 self.chat_widget.prepare_local_op_submission(&op);
                 self.submit_active_thread_op(app_server, op).await?;
             }
+            AppEvent::PromptLoopWakeup {
+                thread_id,
+                generation,
+                reason,
+            } => {
+                self.chat_widget
+                    .on_prompt_loop_wakeup(thread_id, generation, reason);
+            }
             AppEvent::RestoreCancelledTurn(prompt) => {
                 self.apply_cancelled_turn_edit(prompt);
             }

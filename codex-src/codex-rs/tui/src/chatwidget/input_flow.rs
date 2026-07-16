@@ -134,7 +134,7 @@ impl ChatWidget {
         }
         // Update the list to reflect the remaining queued messages (if any).
         self.refresh_pending_input_preview();
-        submitted_follow_up
+        submitted_follow_up || self.is_user_turn_pending_or_running()
     }
 
     pub(super) fn is_user_turn_pending_or_running(&self) -> bool {

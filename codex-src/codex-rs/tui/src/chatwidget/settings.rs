@@ -729,17 +729,12 @@ impl ChatWidget {
 
     /// Sandbox preset enforced while a restricted collaboration mode is active.
     ///
-    /// Ask mode maps to the read-only OS sandbox; Readonly Research maps to the
-    /// workspace sandbox (writes allowed only inside the working directory).
-    /// Both use on-request approval, so a genuinely needed mutating action
-    /// escalates to an approval prompt instead of silently failing — and runs
-    /// once approved. This is enforced by the OS sandbox (Seatbelt/Landlock),
-    /// not by prompt text, and spawned Rampage/research workers inherit it via
-    /// the turn context.
-    fn mode_gate_preset_id(mode: ModeKind) -> Option<&'static str> {
+    /// Ask and Readonly Research both map to the read-only OS sandbox. This is
+    /// enforced by Seatbelt/Landlock rather than prompt text, and spawned
+    /// research workers inherit it through the turn context.
+    pub(super) fn mode_gate_preset_id(mode: ModeKind) -> Option<&'static str> {
         match mode {
-            ModeKind::Ask => Some("read-only"),
-            ModeKind::ReadonlyResearch => Some("auto"),
+            ModeKind::Ask | ModeKind::ReadonlyResearch => Some("read-only"),
             _ => None,
         }
     }
@@ -766,19 +761,12 @@ impl ChatWidget {
                 else {
                     return;
                 };
-                let scope = if next == ModeKind::Ask {
-                    "read-only; edits will ask for approval"
-                } else {
-                    "writes limited to the working directory; anything further asks for approval"
-                };
+                let scope = "read-only; edits will ask for approval";
                 self.apply_mode_gate_permissions(
                     AskForApproval::from(preset.approval),
                     preset.permission_profile.clone(),
                     Some(preset.active_permission_profile.clone()),
-                    format!(
-                        "{} mode sandbox enforced: {scope}.",
-                        next.display_name()
-                    ),
+                    format!("{} mode sandbox enforced: {scope}.", next.display_name()),
                 );
             }
             None => {
@@ -798,10 +786,7 @@ impl ChatWidget {
                         approval,
                         profile,
                         active,
-                        format!(
-                            "{} mode: your permissions restored.",
-                            next.display_name()
-                        ),
+                        format!("{} mode: your permissions restored.", next.display_name()),
                     );
                 }
             }

@@ -4,12 +4,19 @@ use crate::agent::control::SpawnAgentOptions;
 use crate::agent::next_thread_spawn_depth;
 use crate::agent::role::DEFAULT_ROLE_NAME;
 use crate::agent::role::apply_role_to_config;
+use crate::config::PermissionProfileSnapshot;
 use crate::tools::handlers::multi_agents_spec::SpawnAgentToolOptions;
 use crate::tools::handlers::multi_agents_spec::create_spawn_agent_tool_v2;
 use crate::turn_timing::now_unix_timestamp_ms;
 use codex_protocol::AgentPath;
+use codex_protocol::ThreadId;
+use codex_protocol::models::PermissionProfile;
+use codex_protocol::permissions::FileSystemAccessMode;
+use codex_protocol::permissions::FileSystemPath;
+use codex_protocol::permissions::FileSystemSandboxEntry;
 use codex_protocol::protocol::Op;
 use codex_tools::ToolSpec;
+use codex_utils_absolute_path::AbsolutePathBuf;
 
 #[derive(Default)]
 pub(crate) struct Handler {
@@ -64,6 +71,12 @@ pub(crate) async fn spawn_agent_with_args(
         .as_deref()
         .map(str::trim)
         .filter(|role| !role.is_empty());
+    let source_role_name = args
+        .internal_agent_role
+        .as_deref()
+        .map(str::trim)
+        .filter(|role| !role.is_empty())
+        .or(role_name);
 
     let message = args.message.clone();
     let initial_operation = parse_collab_input(Some(args.message), /*items*/ None)?;
@@ -118,12 +131,17 @@ pub(crate) async fn spawn_agent_with_args(
     )
     .await?;
     apply_spawn_agent_runtime_overrides(&mut config, turn.as_ref())?;
+    if args.force_read_only {
+        enforce_spawn_read_only(&mut config)?;
+    } else if let Some(denied_path) = args.workspace_write_denied_path.as_ref() {
+        enforce_spawn_workspace_write_with_denied_path(&mut config, denied_path)?;
+    }
 
     let spawn_source = thread_spawn_source(
         session.thread_id,
         &turn.session_source,
         child_depth,
-        role_name,
+        source_role_name,
         Some(args.task_name.clone()),
     )?;
     let result = Box::pin(
@@ -215,7 +233,8 @@ pub(crate) async fn spawn_agent_with_args(
             .into(),
         )
         .await;
-    let _ = result?;
+    let spawned_agent = result?;
+    let thread_id = spawned_agent.thread_id;
     let role_tag = role_name.unwrap_or(DEFAULT_ROLE_NAME);
     turn.session_telemetry.counter(
         "codex.multi_agent.spawn",
@@ -230,13 +249,62 @@ pub(crate) async fn spawn_agent_with_args(
 
     let hide_agent_metadata = turn.config.multi_agent_v2.hide_spawn_agent_metadata;
     if hide_agent_metadata {
-        Ok(SpawnAgentResult::HiddenMetadata { task_name })
+        Ok(SpawnAgentResult::HiddenMetadata {
+            task_name,
+            thread_id,
+        })
     } else {
         Ok(SpawnAgentResult::WithNickname {
             task_name,
             nickname,
+            thread_id,
         })
     }
+}
+
+fn enforce_spawn_read_only(config: &mut crate::config::Config) -> Result<(), FunctionCallError> {
+    config
+        .permissions
+        .replace_permission_profile_from_session_snapshot(PermissionProfileSnapshot::legacy(
+            PermissionProfile::read_only(),
+        ))
+        .map_err(|err| {
+            FunctionCallError::RespondToModel(format!(
+                "failed to enforce the spawned agent's read-only permission profile: {err}"
+            ))
+        })
+}
+
+fn enforce_spawn_workspace_write_with_denied_path(
+    config: &mut crate::config::Config,
+    denied_path: &AbsolutePathBuf,
+) -> Result<(), FunctionCallError> {
+    let network = config.permissions.network_sandbox_policy();
+    let mut file_system = PermissionProfile::workspace_write_with(
+        &[],
+        network,
+        /*exclude_tmpdir_env_var*/ false,
+        /*exclude_slash_tmp*/ false,
+    )
+    .file_system_sandbox_policy();
+    file_system.entries.push(FileSystemSandboxEntry {
+        path: FileSystemPath::Path {
+            path: denied_path.clone(),
+        },
+        access: FileSystemAccessMode::Deny,
+    });
+    let permission_profile = PermissionProfile::from_runtime_permissions(&file_system, network);
+
+    config
+        .permissions
+        .replace_permission_profile_from_session_snapshot(PermissionProfileSnapshot::legacy(
+            permission_profile,
+        ))
+        .map_err(|err| {
+            FunctionCallError::RespondToModel(format!(
+                "failed to enforce the spawned agent's workspace-write permission profile: {err}"
+            ))
+        })
 }
 
 impl CoreToolRuntime for Handler {
@@ -256,6 +324,17 @@ pub(crate) struct SpawnAgentArgs {
     pub(crate) service_tier: Option<String>,
     pub(crate) fork_turns: Option<String>,
     pub(crate) fork_context: Option<bool>,
+    /// Trusted caller-only role metadata. It tags the child SessionSource
+    /// without resolving a user-configured agent type.
+    #[serde(skip)]
+    pub(crate) internal_agent_role: Option<String>,
+    /// Trusted caller-only permission override for evidence-only children.
+    #[serde(skip)]
+    pub(crate) force_read_only: bool,
+    /// Trusted caller-only workspace-write override. The child inherits the
+    /// parent's network policy but cannot read or write this absolute subtree.
+    #[serde(skip)]
+    pub(crate) workspace_write_denied_path: Option<AbsolutePathBuf>,
 }
 
 impl SpawnAgentArgs {
@@ -301,16 +380,30 @@ pub(crate) enum SpawnAgentResult {
     WithNickname {
         task_name: String,
         nickname: Option<String>,
+        #[serde(skip)]
+        thread_id: ThreadId,
     },
     HiddenMetadata {
         task_name: String,
+        #[serde(skip)]
+        thread_id: ThreadId,
     },
 }
 
 impl SpawnAgentResult {
     pub(crate) fn task_name(&self) -> &str {
         match self {
-            Self::WithNickname { task_name, .. } | Self::HiddenMetadata { task_name } => task_name,
+            Self::WithNickname { task_name, .. } | Self::HiddenMetadata { task_name, .. } => {
+                task_name
+            }
+        }
+    }
+
+    pub(crate) fn thread_id(&self) -> ThreadId {
+        match self {
+            Self::WithNickname { thread_id, .. } | Self::HiddenMetadata { thread_id, .. } => {
+                *thread_id
+            }
         }
     }
 }
@@ -330,5 +423,107 @@ impl ToolOutput for SpawnAgentResult {
 
     fn code_mode_result(&self, _payload: &ToolPayload) -> JsonValue {
         tool_output_code_mode_result(self, "spawn_agent")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use codex_protocol::permissions::NetworkSandboxPolicy;
+
+    #[tokio::test]
+    async fn trusted_spawn_readonly_override_replaces_parent_write_profile() {
+        let mut config = crate::config::test_config().await;
+        config
+            .permissions
+            .replace_permission_profile_from_session_snapshot(PermissionProfileSnapshot::legacy(
+                PermissionProfile::workspace_write(),
+            ))
+            .expect("parent permission profile");
+
+        enforce_spawn_read_only(&mut config).expect("read-only override");
+
+        assert_eq!(
+            config.permissions.permission_profile(),
+            &PermissionProfile::read_only()
+        );
+    }
+
+    #[tokio::test]
+    async fn trusted_workspace_write_override_denies_path_and_preserves_network() {
+        let workspace_dir = tempfile::tempdir().expect("workspace tempdir");
+        let workspace =
+            AbsolutePathBuf::from_absolute_path(workspace_dir.path()).expect("absolute workspace");
+        let protected_path =
+            AbsolutePathBuf::resolve_path_against_base("rampage", workspace.as_path());
+        let mut config = crate::config::test_config().await;
+        config.cwd = workspace.clone();
+        config
+            .permissions
+            .set_workspace_roots(vec![workspace.clone()]);
+        config
+            .permissions
+            .replace_permission_profile_from_session_snapshot(PermissionProfileSnapshot::legacy(
+                PermissionProfile::workspace_write_with(
+                    &[],
+                    NetworkSandboxPolicy::Enabled,
+                    /*exclude_tmpdir_env_var*/ false,
+                    /*exclude_slash_tmp*/ false,
+                ),
+            ))
+            .expect("parent permission profile");
+
+        enforce_spawn_workspace_write_with_denied_path(&mut config, &protected_path)
+            .expect("workspace-write override");
+
+        let child_profile = config.permissions.effective_permission_profile();
+        assert_eq!(
+            child_profile.network_sandbox_policy(),
+            NetworkSandboxPolicy::Enabled
+        );
+        let child_file_system = child_profile.file_system_sandbox_policy();
+        assert!(
+            child_file_system.can_write_path_with_cwd(
+                &workspace.as_path().join("src/lib.rs"),
+                workspace.as_path(),
+            )
+        );
+        assert!(!child_file_system.can_write_path_with_cwd(
+            &protected_path.as_path().join("mission.json"),
+            workspace.as_path(),
+        ));
+        assert!(!child_file_system.can_read_path_with_cwd(
+            &protected_path.as_path().join("mission.json"),
+            workspace.as_path(),
+        ));
+    }
+
+    #[test]
+    fn spawn_result_thread_id_is_internal_only() {
+        let thread_id =
+            ThreadId::from_string("00000000-0000-0000-0000-000000000001").expect("valid thread id");
+        let with_nickname = SpawnAgentResult::WithNickname {
+            task_name: "/root/worker".to_string(),
+            nickname: Some("worker".to_string()),
+            thread_id,
+        };
+        assert_eq!(with_nickname.thread_id(), thread_id);
+        assert_eq!(
+            serde_json::to_value(&with_nickname).expect("serialize spawn result"),
+            serde_json::json!({
+                "task_name": "/root/worker",
+                "nickname": "worker",
+            })
+        );
+
+        let hidden = SpawnAgentResult::HiddenMetadata {
+            task_name: "/root/worker".to_string(),
+            thread_id,
+        };
+        assert_eq!(hidden.thread_id(), thread_id);
+        assert_eq!(
+            serde_json::to_value(&hidden).expect("serialize hidden spawn result"),
+            serde_json::json!({"task_name": "/root/worker"})
+        );
     }
 }

@@ -44,6 +44,7 @@ use crate::tools::handlers::multi_agents_v2::SendMessageHandler as SendMessageHa
 use crate::tools::handlers::multi_agents_v2::SpawnAgentHandler as SpawnAgentHandlerV2;
 use crate::tools::handlers::multi_agents_v2::WaitAgentHandler as WaitAgentHandlerV2;
 use crate::tools::handlers::rampage::RampageBoardHandler;
+use crate::tools::handlers::rampage::RampageCheckpointHandler;
 use crate::tools::handlers::rampage::RampageCompactHandler;
 use crate::tools::handlers::rampage::RampageControlHandler;
 use crate::tools::handlers::rampage::RampageSpawnHandler;
@@ -62,6 +63,7 @@ use crate::tools::router::ToolRouterParams;
 use codex_features::Feature;
 use codex_login::AuthManager;
 use codex_mcp::ToolInfo;
+use codex_protocol::config_types::ModeKind;
 use codex_protocol::config_types::WebSearchMode;
 use codex_protocol::dynamic_tools::DynamicToolSpec;
 use codex_protocol::openai_models::ConfigShellToolType;
@@ -238,10 +240,12 @@ fn spec_for_model_request(
     tool_name: &ToolName,
     spec: ToolSpec,
 ) -> ToolSpec {
-    if matches!(
-        turn_context.tool_mode,
-        ToolMode::CodeMode | ToolMode::CodeModeOnly
-    ) && exposure != ToolExposure::DirectModelOnly
+    if !rampage_controller_turn(turn_context)
+        && matches!(
+            turn_context.tool_mode,
+            ToolMode::CodeMode | ToolMode::CodeModeOnly
+        )
+        && exposure != ToolExposure::DirectModelOnly
         && !is_excluded_from_code_mode(turn_context, tool_name)
         && codex_code_mode::is_code_mode_nested_tool(spec.name())
     {
@@ -254,12 +258,19 @@ fn spec_for_model_request(
 fn hosted_model_tool_specs(context: &CoreToolPlanContext<'_>) -> Vec<ToolSpec> {
     let turn_context = context.turn_context;
     // Responses Lite accepts schemas for client-executed tools, not hosted Responses tools.
-    if turn_context.model_info.use_responses_lite {
+    if turn_context.model_info.use_responses_lite
+        || rampage_tools_enabled_for_turn(
+            turn_context.collaboration_mode.mode,
+            &turn_context.session_source,
+        )
+    {
         return Vec::new();
     }
 
     let mut specs = Vec::new();
-    let standalone_web_search_available = standalone_web_search_enabled(turn_context)
+    let standalone_web_search_available = !rampage_verifier_turn(turn_context)
+        && !readonly_rampage_worker_turn(turn_context)
+        && standalone_web_search_enabled(turn_context)
         && context
             .extension_tool_executors
             .iter()
@@ -280,7 +291,9 @@ fn hosted_model_tool_specs(context: &CoreToolPlanContext<'_>) -> Vec<ToolSpec> {
         specs.push(hosted_web_search_tool);
     }
     // TODO: Remove hosted image generation once the standalone extension is ready.
-    if image_generation_tool_enabled(turn_context)
+    if !rampage_verifier_turn(turn_context)
+        && turn_context.collaboration_mode.mode != ModeKind::ReadonlyResearch
+        && image_generation_tool_enabled(turn_context)
         && !standalone_image_generation_available(turn_context, context.extension_tool_executors)
     {
         specs.push(create_image_generation_tool("png"));
@@ -307,7 +320,59 @@ fn multi_agent_v2_enabled(turn_context: &TurnContext) -> bool {
     turn_context.multi_agent_version == MultiAgentVersion::V2
 }
 
+fn rampage_controller_turn(turn_context: &TurnContext) -> bool {
+    rampage_tools_enabled_for_turn(
+        turn_context.collaboration_mode.mode,
+        &turn_context.session_source,
+    )
+}
+
+fn rampage_internal_subagent_role(turn_context: &TurnContext) -> Option<&str> {
+    if !matches!(
+        turn_context.collaboration_mode.mode,
+        ModeKind::AbsoluteRampage | ModeKind::ReadonlyResearch
+    ) {
+        return None;
+    }
+    match &turn_context.session_source {
+        SessionSource::SubAgent(SubAgentSource::ThreadSpawn { agent_role, .. }) => {
+            agent_role.as_deref()
+        }
+        _ => None,
+    }
+}
+
+fn rampage_advisor_turn(turn_context: &TurnContext) -> bool {
+    rampage_internal_subagent_role(turn_context) == Some("rampage-advisor")
+}
+
+fn rampage_verifier_turn(turn_context: &TurnContext) -> bool {
+    rampage_internal_subagent_role(turn_context) == Some("rampage-verifier")
+}
+
+fn rampage_checkpoint_worker_turn(turn_context: &TurnContext) -> bool {
+    matches!(
+        rampage_internal_subagent_role(turn_context),
+        Some("rampage-worker" | "rampage-readonly-worker")
+    )
+}
+
+fn readonly_rampage_worker_turn(turn_context: &TurnContext) -> bool {
+    turn_context.collaboration_mode.mode == ModeKind::ReadonlyResearch
+        && matches!(&turn_context.session_source, SessionSource::SubAgent(_))
+        && !rampage_advisor_turn(turn_context)
+        && !rampage_verifier_turn(turn_context)
+}
+
 fn collab_tools_enabled(turn_context: &TurnContext) -> bool {
+    if matches!(
+        turn_context.collaboration_mode.mode,
+        ModeKind::AbsoluteRampage | ModeKind::ReadonlyResearch
+    ) && matches!(&turn_context.session_source, SessionSource::SubAgent(_))
+    {
+        return false;
+    }
+
     match turn_context.multi_agent_version {
         MultiAgentVersion::Disabled => false,
         MultiAgentVersion::V1 => !exceeds_thread_spawn_depth_limit(
@@ -319,7 +384,9 @@ fn collab_tools_enabled(turn_context: &TurnContext) -> bool {
 }
 
 fn agent_jobs_tools_enabled(turn_context: &TurnContext) -> bool {
-    turn_context.features.get().enabled(Feature::SpawnCsv) && collab_tools_enabled(turn_context)
+    !rampage_controller_turn(turn_context)
+        && turn_context.features.get().enabled(Feature::SpawnCsv)
+        && collab_tools_enabled(turn_context)
 }
 
 fn agent_jobs_worker_tools_enabled(turn_context: &TurnContext) -> bool {
@@ -416,7 +483,8 @@ fn is_hidden_by_code_mode_only(
     tool_name: &ToolName,
     exposure: ToolExposure,
 ) -> bool {
-    turn_context.tool_mode == ToolMode::CodeModeOnly
+    !rampage_controller_turn(turn_context)
+        && turn_context.tool_mode == ToolMode::CodeModeOnly
         && exposure != ToolExposure::DirectModelOnly
         && codex_code_mode::is_code_mode_nested_tool(&codex_tools::code_mode_name_for_tool_name(
             tool_name,
@@ -564,9 +632,53 @@ fn code_mode_namespace_descriptions(
 }
 
 fn add_tool_sources(context: &CoreToolPlanContext<'_>, planned_tools: &mut PlannedTools) {
+    if rampage_advisor_turn(context.turn_context) {
+        return;
+    }
+    if rampage_controller_turn(context.turn_context) {
+        add_rampage_controller_utility_tools(context, planned_tools);
+        add_rampage_tools(context, planned_tools);
+        add_collaboration_tools(context, planned_tools);
+        return;
+    }
+    if rampage_verifier_turn(context.turn_context) {
+        add_shell_tools(context, planned_tools);
+        add_mcp_resource_tools(context, planned_tools);
+        let turn_context = context.turn_context;
+        let environment_mode = turn_context.tool_environment_mode();
+        if environment_mode.has_environment() {
+            let include_environment_id = matches!(environment_mode, ToolEnvironmentMode::Multiple);
+            planned_tools.add(ViewImageHandler::new(ViewImageToolOptions {
+                can_request_original_image_detail: can_request_original_image_detail(
+                    &turn_context.model_info,
+                ),
+                include_environment_id,
+            }));
+        }
+        for spec in hosted_model_tool_specs(context) {
+            planned_tools.add_hosted_spec(spec);
+        }
+        return;
+    }
+    if readonly_rampage_worker_turn(context.turn_context) {
+        add_shell_tools(context, planned_tools);
+        add_mcp_resource_tools(context, planned_tools);
+        add_core_utility_tools(context, planned_tools);
+        if rampage_checkpoint_worker_turn(context.turn_context) {
+            planned_tools.add(RampageCheckpointHandler::new());
+        }
+        for spec in hosted_model_tool_specs(context) {
+            planned_tools.add_hosted_spec(spec);
+        }
+        return;
+    }
+
     add_shell_tools(context, planned_tools);
     add_mcp_resource_tools(context, planned_tools);
     add_core_utility_tools(context, planned_tools);
+    if rampage_checkpoint_worker_turn(context.turn_context) {
+        planned_tools.add(RampageCheckpointHandler::new());
+    }
     add_rampage_tools(context, planned_tools);
     add_collaboration_tools(context, planned_tools);
     add_mcp_runtime_tools(context, planned_tools);
@@ -575,6 +687,20 @@ fn add_tool_sources(context: &CoreToolPlanContext<'_>, planned_tools: &mut Plann
     for spec in hosted_model_tool_specs(context) {
         planned_tools.add_hosted_spec(spec);
     }
+}
+
+fn add_rampage_controller_utility_tools(
+    context: &CoreToolPlanContext<'_>,
+    planned_tools: &mut PlannedTools,
+) {
+    let turn_context = context.turn_context;
+    planned_tools.add(PlanHandler);
+    // Rampage startup cannot proceed without the three user-owned choices, so
+    // this tool is mandatory for its controller even when the experimental
+    // global toggle is off.
+    planned_tools.add(RequestUserInputHandler {
+        available_modes: request_user_input_available_modes(turn_context.features.get()),
+    });
 }
 
 fn add_rampage_tools(context: &CoreToolPlanContext<'_>, planned_tools: &mut PlannedTools) {
@@ -667,20 +793,22 @@ fn add_core_utility_tools(context: &CoreToolPlanContext<'_>, planned_tools: &mut
     let turn_context = context.turn_context;
     let features = turn_context.features.get();
     let environment_mode = turn_context.tool_environment_mode();
+    let readonly_worker = readonly_rampage_worker_turn(turn_context);
 
     planned_tools.add(PlanHandler);
 
-    if turn_context.config.experimental_request_user_input_enabled {
+    if !readonly_worker && turn_context.config.experimental_request_user_input_enabled {
         planned_tools.add(RequestUserInputHandler {
             available_modes: request_user_input_available_modes(features),
         });
     }
 
-    if features.enabled(Feature::RequestPermissionsTool) {
+    if !readonly_worker && features.enabled(Feature::RequestPermissionsTool) {
         planned_tools.add(RequestPermissionsHandler);
     }
 
-    if tool_suggest_enabled(turn_context)
+    if !readonly_worker
+        && tool_suggest_enabled(turn_context)
         && let Some(discoverable_tools) =
             context.discoverable_tools.filter(|tools| !tools.is_empty())
     {
@@ -692,7 +820,9 @@ fn add_core_utility_tools(context: &CoreToolPlanContext<'_>, planned_tools: &mut
         ));
     }
 
-    if environment_mode.has_environment() && turn_context.model_info.apply_patch_tool_type.is_some()
+    if !readonly_worker
+        && environment_mode.has_environment()
+        && turn_context.model_info.apply_patch_tool_type.is_some()
     {
         let include_environment_id = matches!(environment_mode, ToolEnvironmentMode::Multiple);
         planned_tools.add(ApplyPatchHandler::new(include_environment_id));
@@ -732,33 +862,44 @@ fn add_collaboration_tools(context: &CoreToolPlanContext<'_>, planned_tools: &mu
                 .flatten();
             let agent_type_description =
                 agent_type_description(turn_context, context.default_agent_type_description);
-            planned_tools.add_arc(override_tool_exposure(
-                multi_agent_v2_handler(
-                    SpawnAgentHandlerV2::new(SpawnAgentToolOptions {
-                        available_models: turn_context.available_models.clone(),
-                        agent_type_description,
-                        hide_agent_type_model_reasoning: turn_context
-                            .config
-                            .multi_agent_v2
-                            .hide_spawn_agent_metadata,
-                        include_usage_hint: turn_context.config.multi_agent_v2.usage_hint_enabled,
-                        usage_hint_text: turn_context.config.multi_agent_v2.usage_hint_text.clone(),
-                        max_concurrent_threads_per_session: max_concurrent_threads_per_session(
-                            turn_context,
-                        ),
-                    }),
-                    tool_namespace,
-                ),
-                exposure,
-            ));
+            if !rampage_controller_turn(turn_context) {
+                planned_tools.add_arc(override_tool_exposure(
+                    multi_agent_v2_handler(
+                        SpawnAgentHandlerV2::new(SpawnAgentToolOptions {
+                            available_models: turn_context.available_models.clone(),
+                            agent_type_description,
+                            hide_agent_type_model_reasoning: turn_context
+                                .config
+                                .multi_agent_v2
+                                .hide_spawn_agent_metadata,
+                            include_usage_hint: turn_context
+                                .config
+                                .multi_agent_v2
+                                .usage_hint_enabled,
+                            usage_hint_text: turn_context
+                                .config
+                                .multi_agent_v2
+                                .usage_hint_text
+                                .clone(),
+                            max_concurrent_threads_per_session: max_concurrent_threads_per_session(
+                                turn_context,
+                            ),
+                        }),
+                        tool_namespace,
+                    ),
+                    exposure,
+                ));
+            }
             planned_tools.add_arc(override_tool_exposure(
                 multi_agent_v2_handler(SendMessageHandlerV2, tool_namespace),
                 exposure,
             ));
-            planned_tools.add_arc(override_tool_exposure(
-                multi_agent_v2_handler(FollowupTaskHandlerV2, tool_namespace),
-                exposure,
-            ));
+            if !rampage_controller_turn(turn_context) {
+                planned_tools.add_arc(override_tool_exposure(
+                    multi_agent_v2_handler(FollowupTaskHandlerV2, tool_namespace),
+                    exposure,
+                ));
+            }
             planned_tools.add_arc(override_tool_exposure(
                 multi_agent_v2_handler(
                     WaitAgentHandlerV2::new(context.wait_agent_timeouts),
@@ -774,7 +915,7 @@ fn add_collaboration_tools(context: &CoreToolPlanContext<'_>, planned_tools: &mu
                 multi_agent_v2_handler(ListAgentsHandlerV2, tool_namespace),
                 exposure,
             ));
-        } else {
+        } else if !rampage_controller_turn(turn_context) {
             let agent_type_description =
                 agent_type_description(turn_context, context.default_agent_type_description);
             let exposure =
@@ -867,7 +1008,9 @@ fn append_tool_search_executor(
     planned_tools: &mut PlannedTools,
 ) {
     let turn_context = context.turn_context;
-    if !(search_tool_enabled(turn_context) && namespace_tools_enabled(turn_context)) {
+    if rampage_controller_turn(turn_context)
+        || !(search_tool_enabled(turn_context) && namespace_tools_enabled(turn_context))
+    {
         return;
     }
 
@@ -889,6 +1032,9 @@ fn prepend_code_mode_executors(
     planned_tools: &mut PlannedTools,
 ) {
     let turn_context = context.turn_context;
+    if rampage_controller_turn(turn_context) || rampage_advisor_turn(turn_context) {
+        return;
+    }
     let code_mode_executors = build_code_mode_executors(turn_context, planned_tools.runtimes());
     planned_tools.runtimes.splice(0..0, code_mode_executors);
 }

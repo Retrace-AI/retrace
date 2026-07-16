@@ -260,6 +260,7 @@ fn queued_message_edit_hint_binding(
 use crate::app_event::AppEvent;
 use crate::app_event::ExitMode;
 use crate::app_event::PermissionProfileSelection;
+use crate::app_event::PromptLoopWakeupReason;
 use crate::app_event::RateLimitRefreshOrigin;
 #[cfg(any(target_os = "windows", test))]
 use crate::app_event::WindowsSandboxEnableMode;
@@ -372,6 +373,8 @@ mod plugins;
 use self::plugins::PluginInstallAuthFlowState;
 use self::plugins::PluginListFetchState;
 use self::plugins::PluginsCacheState;
+mod prompt_loop;
+use self::prompt_loop::PromptLoopState;
 mod plan_implementation;
 use self::plan_implementation::PLAN_IMPLEMENTATION_TITLE;
 mod model_popups;
@@ -749,6 +752,8 @@ pub(crate) struct ChatWidget {
     realtime_conversation: RealtimeConversationUiState,
     last_rendered_user_message_display: Option<UserMessageDisplay>,
     last_non_retry_error: Option<(String, String)>,
+    prompt_loop_generation: u64,
+    prompt_loop: Option<PromptLoopState>,
 }
 
 #[cfg_attr(not(test), allow(dead_code))]

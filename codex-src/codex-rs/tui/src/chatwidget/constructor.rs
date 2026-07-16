@@ -233,6 +233,8 @@ impl ChatWidget {
             realtime_conversation: RealtimeConversationUiState::default(),
             last_rendered_user_message_display: None,
             last_non_retry_error: None,
+            prompt_loop_generation: 0,
+            prompt_loop: None,
         };
 
         widget.prefetch_rate_limits();
