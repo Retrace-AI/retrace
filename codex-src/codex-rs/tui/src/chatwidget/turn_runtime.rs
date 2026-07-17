@@ -187,7 +187,7 @@ impl ChatWidget {
             self.transcript.saw_plan_item_this_turn = false;
         }
         // Resolve the loop that owned the completed turn before draining queued
-        // commands. A queued `/ralphaloop` must not consume this older response.
+        // commands. A queued `/ralphloop` must not consume this older response.
         let defer_loop_submission = self.has_queued_follow_up_messages()
             || had_pending_steers
             || matches!(

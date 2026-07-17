@@ -2020,8 +2020,7 @@ async fn handle_rampage_spawn(
         return Err(err);
     }
 
-    let task_name_suffix = task_id.rsplit('-').next().unwrap_or(task_id.as_str());
-    let unique_task_name = format!("{}-{task_name_suffix}", args.task_name);
+    let unique_task_name = unique_rampage_task_name(&args.task_name, &task_id);
     let internal_agent_role = if requested_support_agent.is_some() {
         "rampage-advisor"
     } else if task_kind == "verify" {
@@ -2161,6 +2160,11 @@ async fn handle_rampage_spawn(
             Err(err)
         }
     }
+}
+
+fn unique_rampage_task_name(task_name: &str, task_id: &str) -> String {
+    let task_name_suffix = task_id.rsplit('-').next().unwrap_or(task_id);
+    format!("{task_name}_{task_name_suffix}")
 }
 
 async fn handle_rampage_checkpoint(
@@ -4454,6 +4458,19 @@ mod tests {
             verifier_max_failures: Some(json!(3)),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn unique_worker_task_name_is_a_valid_agent_path_segment() {
+        let task_name = unique_rampage_task_name(
+            "system_info_audit",
+            "task-84542358-be60-4824-84dd-672842a982e8",
+        );
+
+        assert_eq!(task_name, "system_info_audit_672842a982e8");
+        codex_protocol::AgentPath::root()
+            .join(&task_name)
+            .expect("Rampage must generate a valid child agent path");
     }
 
     fn push_completed_mission_worker(

@@ -2369,8 +2369,8 @@ impl ChatWidget {
             SlashCommand::Loop => {
                 self.handle_loop_command_args(String::new());
             }
-            SlashCommand::RalphaLoop => {
-                self.handle_ralphaloop_command_args(String::new());
+            SlashCommand::RalphLoop => {
+                self.handle_ralphloop_command_args(String::new());
             }
             SlashCommand::Side | SlashCommand::Btw => {
                 self.request_empty_side_conversation(cmd);
@@ -2739,8 +2739,8 @@ impl ChatWidget {
             SlashCommand::Loop => {
                 self.handle_loop_command_args(args);
             }
-            SlashCommand::RalphaLoop => {
-                self.handle_ralphaloop_command_args(args);
+            SlashCommand::RalphLoop => {
+                self.handle_ralphloop_command_args(args);
             }
             SlashCommand::Keymap => match trimmed.to_ascii_lowercase().as_str() {
                 "" => self.open_keymap_picker(),
@@ -3106,7 +3106,7 @@ impl ChatWidget {
             | SlashCommand::AgentCheck
             | SlashCommand::Thinking
             | SlashCommand::Loop
-            | SlashCommand::RalphaLoop
+            | SlashCommand::RalphLoop
             | SlashCommand::TestApproval => QueueDrain::Continue,
             SlashCommand::Feedback
             | SlashCommand::New

@@ -1,13 +1,12 @@
-//! Session-scoped prompt loops started by `/loop` and `/ralphaloop`.
+//! Session-scoped prompt loops started by `/loop` and `/ralphloop`.
 
 use super::*;
 
-const DEFAULT_LOOP_INTERVAL: Duration = Duration::from_secs(10 * 60);
 const BUSY_LOOP_RETRY: Duration = Duration::from_secs(1);
-const LOOP_USAGE: &str = "Usage: /loop [interval] <prompt> | /loop status | /loop stop";
+const LOOP_USAGE: &str = "Usage: /loop [15s | 15 seconds] <prompt> | /loop status | /loop stop";
 const RALPH_LOOP_USAGE: &str = concat!(
-    "Usage: /ralphaloop <prompt> [--max-iterations N] ",
-    "[--completion-promise TEXT] | /ralphaloop status | /ralphaloop stop"
+    "Usage: /ralphloop <prompt> [for N iterations | --max-iterations N] ",
+    "[--completion-promise TEXT] | /ralphloop status | /ralphloop stop"
 );
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -20,7 +19,7 @@ pub(super) enum PromptLoopPhase {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum PromptLoopKind {
     Timed {
-        interval: Duration,
+        interval: Option<Duration>,
     },
     Ralph {
         max_iterations: Option<u64>,
@@ -43,7 +42,7 @@ pub(super) struct PromptLoopState {
 
 #[derive(Debug, PartialEq, Eq)]
 struct TimedLoopArgs {
-    interval: Duration,
+    interval: Option<Duration>,
     prompt: String,
 }
 
@@ -87,7 +86,11 @@ impl ChatWidget {
             return;
         };
 
-        let next_tick_at = match initial_prompt_loop_deadline(parsed.interval) {
+        let next_tick_at = match parsed
+            .interval
+            .map(initial_prompt_loop_deadline)
+            .transpose()
+        {
             Ok(deadline) => deadline,
             Err(message) => {
                 self.add_error_message(message);
@@ -102,28 +105,46 @@ impl ChatWidget {
             kind: PromptLoopKind::Timed {
                 interval: parsed.interval,
             },
-            phase: PromptLoopPhase::Waiting,
+            phase: if parsed.interval.is_some() {
+                PromptLoopPhase::Waiting
+            } else {
+                PromptLoopPhase::Due
+            },
             iteration: 0,
             timed_tick_pending: false,
-            next_tick_at: Some(next_tick_at),
+            next_tick_at,
             retry_scheduled: false,
         });
-        self.schedule_prompt_loop_wakeup_at(
-            thread_id,
-            generation,
-            next_tick_at,
-            PromptLoopWakeupReason::Interval,
+        if let Some(deadline) = next_tick_at {
+            self.schedule_prompt_loop_wakeup_at(
+                thread_id,
+                generation,
+                deadline,
+                PromptLoopWakeupReason::Interval,
+            );
+        }
+        let message = parsed.interval.map_or_else(
+            || {
+                "Self-paced loop started and will run again after every completed turn until you run `/loop stop`."
+                    .to_string()
+            },
+            |interval| {
+                format!(
+                    "Loop scheduled every {} and will continue until you run `/loop stop`.",
+                    format_interval(interval)
+                )
+            },
         );
         self.add_info_message(
-            format!(
-                "Loop scheduled every {}. The prompt will run between turns; use `/loop stop` to cancel.",
-                format_interval(parsed.interval)
-            ),
-            Some("Running /loop again replaces this schedule.".to_string()),
+            message,
+            Some("Running /loop or /ralphloop again replaces this loop.".to_string()),
         );
+        if parsed.interval.is_none() {
+            self.try_submit_due_prompt_loop();
+        }
     }
 
-    pub(super) fn handle_ralphaloop_command_args(&mut self, args: String) {
+    pub(super) fn handle_ralphloop_command_args(&mut self, args: String) {
         let trimmed = args.trim();
         if is_stop_command(trimmed) {
             self.stop_prompt_loop(/*ralph_only*/ true);
@@ -143,7 +164,7 @@ impl ChatWidget {
         };
         let Some(thread_id) = self.thread_id else {
             self.add_error_message(
-                "The session is still starting; try /ralphaloop again in a moment.".to_string(),
+                "The session is still starting; try /ralphloop again in a moment.".to_string(),
             );
             return;
         };
@@ -175,8 +196,8 @@ impl ChatWidget {
             .map(|value| format!("`<promise>{value}</promise>`"))
             .unwrap_or_else(|| "none".to_string());
         self.add_info_message(
-            format!("Ralph loop started. Max iterations: {limit}; completion promise: {promise}."),
-            Some("Use `/ralphaloop stop` to cancel.".to_string()),
+            format!("RalphLoop started. Max iterations: {limit}; completion promise: {promise}."),
+            Some("Use `/ralphloop stop` to cancel.".to_string()),
         );
 
         self.try_submit_due_prompt_loop();
@@ -207,7 +228,9 @@ impl ChatWidget {
         let mut next_interval_deadline = None;
         let should_try_submit = match (&state.kind, state.phase, reason) {
             (
-                PromptLoopKind::Timed { interval },
+                PromptLoopKind::Timed {
+                    interval: Some(interval),
+                },
                 PromptLoopPhase::Running,
                 PromptLoopWakeupReason::Interval,
             ) => {
@@ -221,7 +244,13 @@ impl ChatWidget {
                 next_interval_deadline = Some(deadline);
                 false
             }
-            (PromptLoopKind::Timed { interval }, _, PromptLoopWakeupReason::Interval) => {
+            (
+                PromptLoopKind::Timed {
+                    interval: Some(interval),
+                },
+                _,
+                PromptLoopWakeupReason::Interval,
+            ) => {
                 state.phase = PromptLoopPhase::Due;
                 let deadline = next_prompt_loop_deadline(
                     state.next_tick_at,
@@ -258,7 +287,15 @@ impl ChatWidget {
         let mut action = LoopTurnAction::None;
 
         match (&state.kind, state.phase) {
-            (PromptLoopKind::Timed { .. }, PromptLoopPhase::Running) => {
+            (PromptLoopKind::Timed { interval: None }, PromptLoopPhase::Running) => {
+                state.phase = PromptLoopPhase::Due;
+                action = if defer_submission {
+                    LoopTurnAction::Retry
+                } else {
+                    LoopTurnAction::Submit
+                };
+            }
+            (PromptLoopKind::Timed { interval: Some(_) }, PromptLoopPhase::Running) => {
                 if state.timed_tick_pending {
                     state.timed_tick_pending = false;
                     state.phase = PromptLoopPhase::Due;
@@ -290,7 +327,7 @@ impl ChatWidget {
                     .is_some_and(|promise| response_has_completion_promise(response, promise))
                 {
                     action = LoopTurnAction::Stop(format!(
-                        "Ralph loop completed after {} iteration{}.",
+                        "RalphLoop completed after {} iteration{}.",
                         state.iteration,
                         if state.iteration == 1 { "" } else { "s" }
                     ));
@@ -298,7 +335,7 @@ impl ChatWidget {
                     && state.iteration >= limit
                 {
                     action = LoopTurnAction::Stop(format!(
-                        "Ralph loop stopped after reaching the {limit}-iteration limit."
+                        "RalphLoop stopped after reaching the {limit}-iteration limit."
                     ));
                 } else {
                     state.phase = PromptLoopPhase::Due;
@@ -336,7 +373,11 @@ impl ChatWidget {
             return;
         };
         let action = match (&state.kind, state.phase) {
-            (PromptLoopKind::Timed { .. }, PromptLoopPhase::Running) => {
+            (PromptLoopKind::Timed { interval: None }, PromptLoopPhase::Running) => {
+                state.phase = PromptLoopPhase::Due;
+                LoopTurnAction::Retry
+            }
+            (PromptLoopKind::Timed { interval: Some(_) }, PromptLoopPhase::Running) => {
                 if state.timed_tick_pending {
                     state.timed_tick_pending = false;
                     state.phase = PromptLoopPhase::Due;
@@ -347,9 +388,11 @@ impl ChatWidget {
                 }
             }
             (PromptLoopKind::Timed { .. }, PromptLoopPhase::Due) => LoopTurnAction::Retry,
-            (PromptLoopKind::Ralph { .. }, PromptLoopPhase::Running) => LoopTurnAction::Stop(
-                "Ralph loop stopped because its active turn did not complete.".to_string(),
-            ),
+            (PromptLoopKind::Ralph { .. }, PromptLoopPhase::Running) => {
+                state.iteration = state.iteration.saturating_sub(1);
+                state.phase = PromptLoopPhase::Due;
+                LoopTurnAction::Retry
+            }
             (PromptLoopKind::Ralph { .. }, PromptLoopPhase::Due) => LoopTurnAction::Retry,
             _ => LoopTurnAction::None,
         };
@@ -498,23 +541,29 @@ impl ChatWidget {
                 Some(if ralph_only {
                     "Use `/loop status` for details.".to_string()
                 } else {
-                    "Use `/ralphaloop status` for details.".to_string()
+                    "Use `/ralphloop status` for details.".to_string()
                 }),
             );
             return;
         }
         let details = match &state.kind {
-            PromptLoopKind::Timed { interval } => format!(
+            PromptLoopKind::Timed {
+                interval: Some(interval),
+            } => format!(
                 "Timed loop: every {}; iteration {}; state {:?}.",
                 format_interval(*interval),
                 state.iteration,
                 state.phase
             ),
+            PromptLoopKind::Timed { interval: None } => format!(
+                "Self-paced loop: iteration {}; state {:?}.",
+                state.iteration, state.phase
+            ),
             PromptLoopKind::Ralph {
                 max_iterations,
                 completion_promise,
             } => format!(
-                "Ralph loop: iteration {}; max {}; completion promise {}; state {:?}.",
+                "RalphLoop: iteration {}; max {}; completion promise {}; state {:?}.",
                 state.iteration,
                 max_iterations
                     .map(|value| value.to_string())
@@ -572,9 +621,13 @@ fn parse_timed_loop_args(value: &str) -> Result<TimedLoopArgs, String> {
     let first = parts.next().unwrap_or_default();
     let rest = parts.next().unwrap_or_default().trim();
     let (interval, prompt) = match parse_interval_token(first) {
-        Some(Ok(interval)) => (interval, rest),
+        Some(Ok(interval)) => (Some(interval), rest),
         Some(Err(message)) => return Err(message),
-        None => (DEFAULT_LOOP_INTERVAL, value),
+        None => match parse_natural_interval_prefix(first, rest) {
+            Some(Ok((interval, prompt))) => (Some(interval), prompt),
+            Some(Err(message)) => return Err(message),
+            None => (None, value),
+        },
     };
     if prompt.is_empty() {
         return Err(LOOP_USAGE.to_string());
@@ -583,6 +636,44 @@ fn parse_timed_loop_args(value: &str) -> Result<TimedLoopArgs, String> {
         interval,
         prompt: prompt.to_string(),
     })
+}
+
+fn parse_natural_interval_prefix<'a>(
+    amount: &str,
+    remainder: &'a str,
+) -> Option<Result<(Duration, &'a str), String>> {
+    if amount.is_empty() || !amount.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    let mut parts = remainder.splitn(2, char::is_whitespace);
+    let unit = parts
+        .next()
+        .unwrap_or_default()
+        .trim_end_matches(|character: char| matches!(character, ',' | ';' | ':'));
+    let prompt = parts.next().unwrap_or_default().trim();
+    let multiplier = match unit.to_ascii_lowercase().as_str() {
+        "s" | "sec" | "secs" | "second" | "seconds" => 1,
+        "m" | "min" | "mins" | "minute" | "minutes" => 60,
+        "h" | "hr" | "hrs" | "hour" | "hours" => 60 * 60,
+        "d" | "day" | "days" => 24 * 60 * 60,
+        _ => return None,
+    };
+    let interval = amount
+        .parse::<u64>()
+        .map_err(|_| "Loop interval is too large.".to_string())
+        .and_then(|amount| {
+            if amount == 0 {
+                return Err(
+                    "Loop interval must be greater than zero (for example `15 seconds`)."
+                        .to_string(),
+                );
+            }
+            amount
+                .checked_mul(multiplier)
+                .map(Duration::from_secs)
+                .ok_or_else(|| "Loop interval is too large.".to_string())
+        });
+    Some(interval.map(|interval| (interval, prompt)))
 }
 
 fn parse_interval_token(value: &str) -> Option<Result<Duration, String>> {
@@ -627,23 +718,29 @@ fn parse_ralph_loop_args(value: &str) -> Result<RalphLoopArgs, String> {
         )
     });
     let Some(option_start) = option_start else {
+        let natural_limit = parse_natural_ralph_iteration_limit(value, &tokens)?;
+        let (prompt, max_iterations) = natural_limit
+            .map(|(prompt, limit)| (prompt, Some(limit)))
+            .unwrap_or((value, None));
         return Ok(RalphLoopArgs {
-            prompt: value.to_string(),
-            max_iterations: None,
+            prompt: prompt.to_string(),
+            max_iterations,
             completion_promise: None,
         });
     };
-    let prompt = value[..tokens[option_start].start].trim_end();
+    let mut prompt = value[..tokens[option_start].start].trim_end();
     if prompt.is_empty() {
         return Err(RALPH_LOOP_USAGE.to_string());
     }
     let mut max_iterations = None;
+    let mut max_iterations_option_seen = false;
     let mut completion_promise = None;
     let mut index = option_start;
     while index < tokens.len() {
         let option = &value[tokens[index].start..tokens[index].end];
         match option {
             "--max-iterations" => {
+                max_iterations_option_seen = true;
                 let token = tokens.get(index + 1).ok_or_else(|| {
                     "--max-iterations requires a non-negative integer.".to_string()
                 })?;
@@ -667,16 +764,65 @@ fn parse_ralph_loop_args(value: &str) -> Result<RalphLoopArgs, String> {
             }
             _ => {
                 return Err(format!(
-                    "Unexpected text `{option}` after /ralphaloop options; put the complete prompt before the options."
+                    "Unexpected text `{option}` after /ralphloop options; put the complete prompt before the options."
                 ));
             }
         }
+    }
+    if let Some((natural_prompt, limit)) =
+        parse_natural_ralph_iteration_limit(value, &tokens[..option_start])?
+    {
+        if max_iterations_option_seen && max_iterations != Some(limit) {
+            return Err(
+                "Conflicting RalphLoop iteration limits; use either `for N iterations` or `--max-iterations N`."
+                    .to_string(),
+            );
+        }
+        prompt = natural_prompt;
+        max_iterations = Some(limit);
     }
     Ok(RalphLoopArgs {
         prompt: prompt.to_string(),
         max_iterations,
         completion_promise,
     })
+}
+
+fn parse_natural_ralph_iteration_limit<'a>(
+    value: &'a str,
+    tokens: &[RawArgumentToken],
+) -> Result<Option<(&'a str, u64)>, String> {
+    if tokens.len() < 3 {
+        return Ok(None);
+    }
+    let suffix_start = tokens.len() - 3;
+    let for_token = tokens[suffix_start];
+    let count_token = tokens[suffix_start + 1];
+    let iterations_token = tokens[suffix_start + 2];
+    let for_word = &value[for_token.start..for_token.end];
+    let count_word = &value[count_token.start..count_token.end];
+    let iterations_word = value[iterations_token.start..iterations_token.end]
+        .trim_end_matches(|character: char| matches!(character, '.' | ',' | ';' | ':' | '!' | '?'));
+    if !for_word.eq_ignore_ascii_case("for")
+        || !matches!(
+            iterations_word.to_ascii_lowercase().as_str(),
+            "iteration" | "iterations"
+        )
+        || !count_word.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return Ok(None);
+    }
+    let limit = count_word
+        .parse::<u64>()
+        .map_err(|_| "RalphLoop iteration limit is too large.".to_string())?;
+    if limit == 0 {
+        return Err("RalphLoop iteration limit must be greater than zero.".to_string());
+    }
+    let prompt = value[..for_token.start].trim_end();
+    if prompt.is_empty() {
+        return Err(RALPH_LOOP_USAGE.to_string());
+    }
+    Ok(Some((prompt, limit)))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -737,7 +883,7 @@ fn raw_argument_tokens(value: &str) -> Result<Vec<RawArgumentToken>, String> {
             }
         }
         if quote.is_some() || escaped {
-            return Err("Unable to parse /ralphaloop arguments; check the quoting.".to_string());
+            return Err("Unable to parse /ralphloop arguments; check the quoting.".to_string());
         }
         if chars.peek().is_none() {
             tokens.push(RawArgumentToken {
@@ -751,10 +897,10 @@ fn raw_argument_tokens(value: &str) -> Result<Vec<RawArgumentToken>, String> {
 
 fn decode_argument_token(raw: &str) -> Result<String, String> {
     let decoded = shlex::split(raw)
-        .ok_or_else(|| "Unable to parse /ralphaloop arguments; check the quoting.".to_string())?;
+        .ok_or_else(|| "Unable to parse /ralphloop arguments; check the quoting.".to_string())?;
     match decoded.as_slice() {
         [value] => Ok(value.clone()),
-        _ => Err("Each /ralphaloop option value must be one argument; quote spaces.".to_string()),
+        _ => Err("Each /ralphloop option value must be one argument; quote spaces.".to_string()),
     }
 }
 
@@ -768,10 +914,19 @@ fn ralph_submission_prompt(args: &RalphLoopArgs) -> String {
             )
         })
         .unwrap_or_else(|| {
-            "Continue making concrete progress on every iteration. This loop ends only at its iteration limit or when the user runs `/ralphaloop stop`.".to_string()
+            "Continue making concrete progress on every iteration.".to_string()
         });
+    let limit = args.max_iterations.map_or_else(
+        || "No iteration limit is configured; the controller will continue until the user runs `/ralphloop stop` or the completion promise is satisfied.".to_string(),
+        |limit| {
+            format!(
+                "The controller will stop after exactly {limit} completed iteration{} unless the completion promise is satisfied first or the user runs `/ralphloop stop`.",
+                if limit == 1 { "" } else { "s" }
+            )
+        },
+    );
     format!(
-        "Ralph loop task:\n{}\n\nIteration contract: inspect the work already present in this same session, continue from it, test or verify the result, and do not repeat a failed approach unchanged. {completion}",
+        "RalphLoop task:\n{}\n\nIteration contract: inspect the work already present in this same session, continue from it, test or verify the result, and do not repeat a failed approach unchanged. {completion} {limit}",
         args.prompt
     )
 }
@@ -801,14 +956,14 @@ mod tests {
         assert_eq!(
             parse_timed_loop_args("5m check the deploy"),
             Ok(TimedLoopArgs {
-                interval: Duration::from_secs(300),
+                interval: Some(Duration::from_secs(300)),
                 prompt: "check the deploy".to_string(),
             })
         );
         assert_eq!(
             parse_timed_loop_args("check the deploy"),
             Ok(TimedLoopArgs {
-                interval: DEFAULT_LOOP_INTERVAL,
+                interval: None,
                 prompt: "check the deploy".to_string(),
             })
         );
@@ -816,15 +971,42 @@ mod tests {
             parse_timed_loop_args("2h inspect status")
                 .expect("valid interval")
                 .interval,
-            Duration::from_secs(7_200)
+            Some(Duration::from_secs(7_200))
+        );
+        assert_eq!(
+            parse_timed_loop_args("15 seconds this is to test loop say hi"),
+            Ok(TimedLoopArgs {
+                interval: Some(Duration::from_secs(15)),
+                prompt: "this is to test loop say hi".to_string(),
+            })
+        );
+        assert_eq!(
+            parse_timed_loop_args("2 hours inspect status")
+                .expect("valid natural interval")
+                .interval,
+            Some(Duration::from_secs(7_200))
+        );
+        assert_eq!(
+            parse_timed_loop_args("15 Seconds inspect status")
+                .expect("case-insensitive natural interval")
+                .interval,
+            Some(Duration::from_secs(15))
+        );
+        assert_eq!(
+            parse_timed_loop_args("15 seconds, inspect status"),
+            Ok(TimedLoopArgs {
+                interval: Some(Duration::from_secs(15)),
+                prompt: "inspect status".to_string(),
+            })
         );
         assert_eq!(
             parse_timed_loop_args("1d inspect status")
                 .expect("valid interval")
                 .interval,
-            Duration::from_secs(86_400)
+            Some(Duration::from_secs(86_400))
         );
         assert!(parse_timed_loop_args("0m never").is_err());
+        assert!(parse_timed_loop_args("0 seconds never").is_err());
         assert!(parse_timed_loop_args("5m").is_err());
         assert!(parse_timed_loop_args("").is_err());
         assert_eq!(
@@ -837,6 +1019,33 @@ mod tests {
 
     #[test]
     fn ralph_loop_parses_options_without_losing_prompt() {
+        assert_eq!(
+            parse_ralph_loop_args("do a df-h command for 5 iterations"),
+            Ok(RalphLoopArgs {
+                prompt: "do a df-h command".to_string(),
+                max_iterations: Some(5),
+                completion_promise: None,
+            })
+        );
+        assert_eq!(
+            parse_ralph_loop_args("check once for 1 iteration"),
+            Ok(RalphLoopArgs {
+                prompt: "check once".to_string(),
+                max_iterations: Some(1),
+                completion_promise: None,
+            })
+        );
+        assert_eq!(
+            parse_ralph_loop_args("do a df-h command for 5 iterations."),
+            Ok(RalphLoopArgs {
+                prompt: "do a df-h command".to_string(),
+                max_iterations: Some(5),
+                completion_promise: None,
+            })
+        );
+        let natural = parse_ralph_loop_args("do a df-h command for 5 iterations")
+            .expect("natural iteration limit");
+        assert!(ralph_submission_prompt(&natural).contains("exactly 5 completed iterations"));
         assert_eq!(
             parse_ralph_loop_args(
                 "Build the API --completion-promise 'ALL DONE' --max-iterations 12"
@@ -869,6 +1078,7 @@ mod tests {
             "Explain --unknown literally"
         );
         assert!(parse_ralph_loop_args("Fix tests --max-iterations nope").is_err());
+        assert!(parse_ralph_loop_args("Fix tests for 5 iterations --max-iterations 12").is_err());
         assert!(parse_ralph_loop_args("--completion-promise").is_err());
         assert!(parse_ralph_loop_args("").is_err());
     }
@@ -914,6 +1124,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn self_paced_command_submits_immediately_without_a_timer() {
+        let (mut chat, _event_rx, mut op_rx) =
+            crate::chatwidget::tests::make_chatwidget_manual(/*model_override*/ None).await;
+        let thread_id = ThreadId::new();
+        chat.thread_id = Some(thread_id);
+
+        chat.handle_loop_command_args("check the deploy".to_string());
+
+        let state = chat.prompt_loop.as_ref().expect("loop is active");
+        assert_eq!(state.kind, PromptLoopKind::Timed { interval: None });
+        assert_eq!(state.phase, PromptLoopPhase::Running);
+        assert_eq!(state.iteration, 1);
+        assert_eq!(state.next_tick_at, None);
+        let AppCommand::UserTurn { items, .. } =
+            crate::chatwidget::tests::next_submit_op(&mut op_rx)
+        else {
+            panic!("expected immediate self-paced turn");
+        };
+        assert!(items.iter().any(
+            |item| matches!(item, UserInput::Text { text, .. } if text == "check the deploy")
+        ));
+    }
+
+    #[tokio::test]
     async fn idle_interval_wakeup_submits_model_prompt_and_coalesces_next_tick() {
         let (mut chat, _event_rx, mut op_rx) =
             crate::chatwidget::tests::make_chatwidget_manual(/*model_override*/ None).await;
@@ -924,7 +1158,7 @@ mod tests {
             thread_id,
             prompt: "!echo this remains a model prompt".to_string(),
             kind: PromptLoopKind::Timed {
-                interval: Duration::from_secs(300),
+                interval: Some(Duration::from_secs(300)),
             },
             phase: PromptLoopPhase::Waiting,
             iteration: 0,
@@ -956,6 +1190,117 @@ mod tests {
         assert_eq!(state.phase, PromptLoopPhase::Due);
         assert!(!state.timed_tick_pending);
         assert_eq!(state.iteration, 1);
+    }
+
+    #[tokio::test]
+    async fn timed_loop_continues_after_second_iteration_until_stopped() {
+        let (mut chat, _event_rx, mut op_rx) =
+            crate::chatwidget::tests::make_chatwidget_manual(/*model_override*/ None).await;
+        let thread_id = ThreadId::new();
+        chat.thread_id = Some(thread_id);
+        chat.prompt_loop = Some(PromptLoopState {
+            generation: 1,
+            thread_id,
+            prompt: "repeat forever".to_string(),
+            kind: PromptLoopKind::Timed {
+                interval: Some(Duration::from_secs(300)),
+            },
+            phase: PromptLoopPhase::Running,
+            iteration: 2,
+            timed_tick_pending: false,
+            next_tick_at: Some(tokio::time::Instant::now() + Duration::from_secs(300)),
+            retry_scheduled: false,
+        });
+
+        chat.on_prompt_loop_turn_complete("second result", /*defer_submission*/ false);
+        assert_eq!(
+            chat.prompt_loop
+                .as_ref()
+                .expect("loop remains active")
+                .phase,
+            PromptLoopPhase::Waiting
+        );
+
+        chat.on_prompt_loop_wakeup(thread_id, 1, PromptLoopWakeupReason::Interval);
+
+        let state = chat.prompt_loop.as_ref().expect("loop remains active");
+        assert_eq!(state.phase, PromptLoopPhase::Running);
+        assert_eq!(state.iteration, 3);
+        let AppCommand::UserTurn { items, .. } =
+            crate::chatwidget::tests::next_submit_op(&mut op_rx)
+        else {
+            panic!("expected third loop iteration");
+        };
+        assert!(
+            items.iter().any(
+                |item| matches!(item, UserInput::Text { text, .. } if text == "repeat forever")
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn self_paced_loop_continues_after_second_iteration_until_stopped() {
+        let (mut chat, _event_rx, mut op_rx) =
+            crate::chatwidget::tests::make_chatwidget_manual(/*model_override*/ None).await;
+        let thread_id = ThreadId::new();
+        chat.thread_id = Some(thread_id);
+        chat.prompt_loop = Some(PromptLoopState {
+            generation: 1,
+            thread_id,
+            prompt: "repeat without a timer".to_string(),
+            kind: PromptLoopKind::Timed { interval: None },
+            phase: PromptLoopPhase::Running,
+            iteration: 2,
+            timed_tick_pending: false,
+            next_tick_at: None,
+            retry_scheduled: false,
+        });
+
+        chat.on_prompt_loop_turn_complete("second result", /*defer_submission*/ false);
+
+        let state = chat.prompt_loop.as_ref().expect("loop remains active");
+        assert_eq!(state.phase, PromptLoopPhase::Running);
+        assert_eq!(state.iteration, 3);
+        let AppCommand::UserTurn { items, .. } =
+            crate::chatwidget::tests::next_submit_op(&mut op_rx)
+        else {
+            panic!("expected third self-paced iteration");
+        };
+        assert!(items.iter().any(
+            |item| matches!(item, UserInput::Text { text, .. } if text == "repeat without a timer")
+        ));
+    }
+
+    #[tokio::test]
+    async fn ralph_loop_stops_at_natural_iteration_limit_without_sixth_submit() {
+        let (mut chat, _event_rx, mut op_rx) =
+            crate::chatwidget::tests::make_chatwidget_manual(/*model_override*/ None).await;
+        let thread_id = ThreadId::new();
+        chat.thread_id = Some(thread_id);
+        chat.prompt_loop = Some(PromptLoopState {
+            generation: 1,
+            thread_id,
+            prompt: "do a df-h command".to_string(),
+            kind: PromptLoopKind::Ralph {
+                max_iterations: Some(5),
+                completion_promise: None,
+            },
+            phase: PromptLoopPhase::Running,
+            iteration: 5,
+            timed_tick_pending: false,
+            next_tick_at: None,
+            retry_scheduled: false,
+        });
+
+        chat.on_prompt_loop_turn_complete("fifth result", /*defer_submission*/ false);
+
+        assert!(chat.prompt_loop.is_none());
+        while let Ok(op) = op_rx.try_recv() {
+            assert!(
+                !matches!(op, AppCommand::UserTurn { .. }),
+                "iteration limit must prevent a sixth submission: {op:?}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -1006,6 +1351,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn failed_running_ralph_loop_retries_without_consuming_completed_iteration() {
+        let (mut chat, _event_rx, mut op_rx) =
+            crate::chatwidget::tests::make_chatwidget_manual(/*model_override*/ None).await;
+        let thread_id = ThreadId::new();
+        chat.thread_id = Some(thread_id);
+        chat.prompt_loop = Some(PromptLoopState {
+            generation: 1,
+            thread_id,
+            prompt: "continue the task".to_string(),
+            kind: PromptLoopKind::Ralph {
+                max_iterations: Some(5),
+                completion_promise: None,
+            },
+            phase: PromptLoopPhase::Running,
+            iteration: 3,
+            timed_tick_pending: false,
+            next_tick_at: None,
+            retry_scheduled: false,
+        });
+
+        chat.on_prompt_loop_turn_failed();
+
+        let state = chat.prompt_loop.as_ref().expect("RalphLoop remains active");
+        assert_eq!(state.phase, PromptLoopPhase::Due);
+        assert_eq!(state.iteration, 2);
+        assert!(state.retry_scheduled);
+        chat.on_prompt_loop_wakeup(thread_id, 1, PromptLoopWakeupReason::Retry);
+        let state = chat.prompt_loop.as_ref().expect("RalphLoop remains active");
+        assert_eq!(state.phase, PromptLoopPhase::Running);
+        assert_eq!(state.iteration, 3);
+        let _ = crate::chatwidget::tests::next_submit_op(&mut op_rx);
+    }
+
+    #[tokio::test]
     async fn failed_due_loop_leaves_queued_user_input_first() {
         let (mut chat, _event_rx, mut op_rx) =
             crate::chatwidget::tests::make_chatwidget_manual(/*model_override*/ None).await;
@@ -1016,7 +1395,7 @@ mod tests {
             thread_id,
             prompt: "scheduled check".to_string(),
             kind: PromptLoopKind::Timed {
-                interval: Duration::from_secs(300),
+                interval: Some(Duration::from_secs(300)),
             },
             phase: PromptLoopPhase::Due,
             iteration: 0,
