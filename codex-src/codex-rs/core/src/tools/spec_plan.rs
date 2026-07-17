@@ -293,6 +293,7 @@ fn hosted_model_tool_specs(context: &CoreToolPlanContext<'_>) -> Vec<ToolSpec> {
     // TODO: Remove hosted image generation once the standalone extension is ready.
     if !rampage_verifier_turn(turn_context)
         && turn_context.collaboration_mode.mode != ModeKind::ReadonlyResearch
+        && !readonly_rampage_worker_turn(turn_context)
         && image_generation_tool_enabled(turn_context)
         && !standalone_image_generation_available(turn_context, context.extension_tool_executors)
     {
@@ -328,15 +329,17 @@ fn rampage_controller_turn(turn_context: &TurnContext) -> bool {
 }
 
 fn rampage_internal_subagent_role(turn_context: &TurnContext) -> Option<&str> {
-    if !matches!(
-        turn_context.collaboration_mode.mode,
-        ModeKind::AbsoluteRampage | ModeKind::ReadonlyResearch
-    ) {
-        return None;
-    }
     match &turn_context.session_source {
         SessionSource::SubAgent(SubAgentSource::ThreadSpawn { agent_role, .. }) => {
-            agent_role.as_deref()
+            match agent_role.as_deref() {
+                Some(
+                    role @ ("rampage-worker"
+                    | "rampage-readonly-worker"
+                    | "rampage-advisor"
+                    | "rampage-verifier"),
+                ) => Some(role),
+                _ => None,
+            }
         }
         _ => None,
     }
@@ -358,17 +361,19 @@ fn rampage_checkpoint_worker_turn(turn_context: &TurnContext) -> bool {
 }
 
 fn readonly_rampage_worker_turn(turn_context: &TurnContext) -> bool {
-    turn_context.collaboration_mode.mode == ModeKind::ReadonlyResearch
-        && matches!(&turn_context.session_source, SessionSource::SubAgent(_))
-        && !rampage_advisor_turn(turn_context)
-        && !rampage_verifier_turn(turn_context)
+    rampage_internal_subagent_role(turn_context) == Some("rampage-readonly-worker")
+        || (turn_context.collaboration_mode.mode == ModeKind::ReadonlyResearch
+            && matches!(&turn_context.session_source, SessionSource::SubAgent(_))
+            && !rampage_advisor_turn(turn_context)
+            && !rampage_verifier_turn(turn_context))
 }
 
 fn collab_tools_enabled(turn_context: &TurnContext) -> bool {
-    if matches!(
-        turn_context.collaboration_mode.mode,
-        ModeKind::AbsoluteRampage | ModeKind::ReadonlyResearch
-    ) && matches!(&turn_context.session_source, SessionSource::SubAgent(_))
+    if rampage_internal_subagent_role(turn_context).is_some()
+        || (matches!(
+            turn_context.collaboration_mode.mode,
+            ModeKind::AbsoluteRampage | ModeKind::ReadonlyResearch
+        ) && matches!(&turn_context.session_source, SessionSource::SubAgent(_)))
     {
         return false;
     }

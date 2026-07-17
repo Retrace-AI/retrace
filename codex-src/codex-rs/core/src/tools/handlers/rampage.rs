@@ -1,3 +1,4 @@
+use crate::agent::AgentControl;
 use crate::compact::collect_user_messages;
 use crate::function_tool::FunctionCallError;
 use crate::tools::context::ToolInvocation;
@@ -16,11 +17,16 @@ use crate::tools::registry::ToolExecutor;
 use crate::turn_timing::now_unix_timestamp_ms;
 use codex_protocol::ThreadId;
 use codex_protocol::config_types::ModeKind;
+use codex_protocol::items::TurnItem;
 use codex_protocol::models::ResponseInputItem;
+use codex_protocol::models::ResponseItem;
 use codex_protocol::openai_models::ReasoningEffort;
 use codex_protocol::protocol::AgentStatus;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::SubAgentSource;
+use codex_protocol::request_user_input::RequestUserInputArgs;
+use codex_protocol::request_user_input::RequestUserInputQuestion;
+use codex_protocol::request_user_input::RequestUserInputResponse;
 use codex_tools::JsonSchema;
 use codex_tools::ResponsesApiTool;
 use codex_tools::ToolName;
@@ -66,12 +72,15 @@ const OUTPUT_EVENT_TEXT_LIMIT: usize = 300;
 const STORED_TASK_RESULT_LIMIT: usize = 12_000;
 const ADVISOR_ACTIVE_TASK_LIMIT: usize = 8;
 const ADVISOR_TERMINAL_TASK_LIMIT: usize = 6;
+const ADVISOR_STUCK_WORKER_THRESHOLD_MS: i64 = 30_000;
 const VERIFIER_EVIDENCE_TASK_LIMIT: usize = 12;
 const REVIEWED_LEGACY_EVIDENCE_ID_LIMIT: usize = 64;
 const CHECKPOINT_TEXT_LIMIT: usize = 2_000;
 const CHECKPOINT_DETAIL_LIMIT: usize = 1_000;
 const ORPHAN_RECONCILE_GRACE_MS: i64 = 60_000;
 const ATTESTATION_WRITE_ATTEMPTS: usize = 3;
+const AGENT_CLOSE_ATTEMPTS: usize = 3;
+const AGENT_CLOSE_ATTEMPT_TIMEOUT_MS: u64 = 5_000;
 
 type RampageStateTransactionMutex = AsyncMutex<()>;
 type RampageStateTransactionRegistry = BTreeMap<PathBuf, Weak<RampageStateTransactionMutex>>;
@@ -117,6 +126,7 @@ pub(crate) struct ActiveRampageMissionStatus {
     pub(crate) blocked_tasks: usize,
     pub(crate) board_items: usize,
     pub(crate) verifier_status: Option<String>,
+    pub(crate) requires_user_resume: bool,
     pub(crate) state_path: String,
 }
 
@@ -226,6 +236,7 @@ async fn mission_status_for_thread(
         blocked_tasks,
         board_items,
         verifier_status: mission.verifier_status.clone(),
+        requires_user_resume: mission.requires_user_resume,
         state_path: path.display().to_string(),
     }))
 }
@@ -506,6 +517,8 @@ struct RampageState {
     schema_version: u32,
     root_thread_id: String,
     active_mission_id: Option<String>,
+    #[serde(default)]
+    consumed_user_directive_ids: BTreeSet<String>,
     missions: Vec<RampageMission>,
     tasks: Vec<RampageTask>,
     board_items: Vec<RampageBoardItem>,
@@ -519,6 +532,7 @@ impl RampageState {
             schema_version: 1,
             root_thread_id,
             active_mission_id: None,
+            consumed_user_directive_ids: BTreeSet::new(),
             missions: Vec::new(),
             tasks: Vec::new(),
             board_items: Vec::new(),
@@ -879,6 +893,19 @@ struct RampageCheckpointArgs {
     next_action: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AuthenticatedRampageDirective {
+    message: String,
+    source_id: String,
+    source_alias_ids: BTreeSet<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RampageUserDirective {
+    Stop(AuthenticatedRampageDirective),
+    Resume(AuthenticatedRampageDirective),
+}
+
 async fn handle_rampage_control(
     invocation: ToolInvocation,
     options: RampageToolOptions,
@@ -889,54 +916,90 @@ async fn handle_rampage_control(
     let _state_transaction = rampage_state_transaction_mutex(&path).lock_owned().await;
     let mut state = load_state(&path, invocation.session.thread_id.to_string()).await?;
     let action = normalize_token(&args.action);
-    let latest_user_message = if matches!(action.as_str(), "stop" | "resume" | "verify_result") {
-        let history = invocation.session.clone_history().await;
-        collect_user_messages(history.raw_items())
-            .into_iter()
-            .next_back()
+    let mut workers_to_close = durable_terminal_worker_thread_ids(&state);
+    if let Err(err) = ensure_blocked_mission_action_allowed(&state, &action) {
+        drop(_state_transaction);
+        close_rampage_workers_with_retry(
+            &invocation.session.services.agent_control,
+            &workers_to_close,
+            &format!("rejected rampage_control {action}"),
+        )
+        .await;
+        return Err(err);
+    }
+    let history = if matches!(action.as_str(), "stop" | "resume" | "verify_result") {
+        Some(invocation.session.clone_history().await)
     } else {
         None
     };
-    match action.as_str() {
-        "start" => {
-            handle_control_start(
-                &mut state,
-                &args,
-                options,
-                invocation.session.thread_id.to_string(),
-            )?;
-        }
-        "status" => {}
-        "update" => {
-            handle_control_update(&mut state, &args)?;
-        }
-        "resume" => {
-            handle_control_resume(&mut state, latest_user_message.as_deref())?;
-        }
+    let latest_user_message = history.as_ref().and_then(|history| {
+        collect_user_messages(history.raw_items())
+            .into_iter()
+            .next_back()
+    });
+    let latest_user_directive = history
+        .as_ref()
+        .and_then(|history| latest_authenticated_rampage_user_directive(history.raw_items()));
+    let action_result = match action.as_str() {
+        "start" => handle_control_start(
+            &mut state,
+            &args,
+            options,
+            invocation.session.thread_id.to_string(),
+        ),
+        "status" => Ok(()),
+        "update" => handle_control_update(&mut state, &args),
+        "resume" => handle_control_resume(&mut state, latest_user_directive.as_ref()),
         "stop" => {
-            handle_control_stop(&mut state, &args, latest_user_message.as_deref())?;
+            let current_mission_workers = durable_mission_worker_thread_ids(&state, false);
+            let result = handle_control_stop(&mut state, &args, latest_user_directive.as_ref());
+            if result.is_ok() {
+                workers_to_close.extend(current_mission_workers);
+            }
+            result
         }
         "complete" => {
-            handle_control_complete(&mut state, &args)?;
+            let current_mission_workers = durable_mission_worker_thread_ids(&state, false);
+            let result = handle_control_complete(&mut state, &args);
+            if result.is_ok() {
+                workers_to_close.extend(current_mission_workers);
+            }
+            result
         }
-        "task_result" => {
-            let worker_result = verified_worker_task_result(&state, &args, &invocation).await?;
-            handle_control_task_result(&mut state, &args, worker_result)?;
-        }
+        "task_result" => match verified_worker_task_result(&state, &args, &invocation).await {
+            Ok(worker_result) => {
+                let result = handle_control_task_result(&mut state, &args, worker_result);
+                if result.is_ok() {
+                    workers_to_close.extend(durable_terminal_worker_thread_ids(&state));
+                }
+                result
+            }
+            Err(err) => Err(err),
+        },
         "verify_result" => {
-            handle_control_verify_result(&mut state, &args, latest_user_message.as_deref())?;
+            handle_control_verify_result(&mut state, &args, latest_user_message.as_deref())
         }
-        _ => {
-            return Err(FunctionCallError::RespondToModel(format!(
-                "unsupported rampage_control action `{}`; use start, status, update, resume, stop, task_result, verify_result, or complete",
-                args.action
-            )));
-        }
-    }
+        _ => Err(FunctionCallError::RespondToModel(format!(
+            "unsupported rampage_control action `{}`; use start, status, update, resume, stop, task_result, verify_result, or complete",
+            args.action
+        ))),
+    };
 
-    if action != "status" {
-        save_state(&path, &state).await?;
-    }
+    let save_result = if action_result.is_ok() && action != "status" {
+        save_state(&path, &state).await
+    } else {
+        Ok(())
+    };
+    drop(_state_transaction);
+    workers_to_close = deduplicate_worker_thread_ids(workers_to_close);
+    close_rampage_workers_with_retry(
+        &invocation.session.services.agent_control,
+        &workers_to_close,
+        &format!("rampage_control {action}"),
+    )
+    .await;
+    action_result?;
+    save_result?;
     Ok(result_from_state(
         true,
         format!("rampage_control {action} recorded"),
@@ -1065,11 +1128,42 @@ fn handle_control_update(
                 .to_string(),
         ));
     }
+    if args.support_agents.is_some()
+        || args.verifier_pass_threshold.is_some()
+        || args.verifier_max_failures.is_some()
+    {
+        return Err(FunctionCallError::RespondToModel(
+            "rampage_control update cannot change startup configuration; support_agents, verifier_pass_threshold, and verifier_max_failures are immutable for the mission"
+                .to_string(),
+        ));
+    }
     if args.verifier_status.is_some() || args.verifier_notes.is_some() {
         return Err(FunctionCallError::RespondToModel(
             "rampage_control update cannot author verifier fields; record the named verifier worker with action=verify_result"
                 .to_string(),
         ));
+    }
+    let requested_status = args.status.as_deref().map(normalize_token);
+    if let Some(status) = requested_status.as_deref() {
+        validate_mission_status(status)?;
+        if matches!(status, "completed" | "stopped") {
+            return Err(FunctionCallError::RespondToModel(
+                "rampage_control update cannot set a terminal mission status; only action=complete may finish a mission after the worker, advisory, and verifier gates pass"
+                    .to_string(),
+            ));
+        }
+        if status == "blocked" {
+            return Err(FunctionCallError::RespondToModel(
+                "rampage_control update cannot author blocked status. Blocked is reserved for verifier escalation, which records the resume authorization boundary; use request_user_input and wait for the user without changing mission status."
+                    .to_string(),
+            ));
+        }
+        if status == "paused" {
+            return Err(FunctionCallError::RespondToModel(
+                "rampage_control update cannot author paused status because it has no authenticated resume boundary. Keep the mission running while request_user_input waits for the user."
+                    .to_string(),
+            ));
+        }
     }
     let mission_id = {
         let mission = required_active_mission_mut(state)?;
@@ -1080,14 +1174,7 @@ fn handle_control_update(
             ));
         }
         let mut criteria_changed = false;
-        if let Some(status) = args.status.as_deref().map(normalize_token) {
-            validate_mission_status(&status)?;
-            if matches!(status.as_str(), "completed" | "stopped") {
-                return Err(FunctionCallError::RespondToModel(
-                    "rampage_control update cannot set a terminal mission status; only action=complete may finish a mission after the worker, advisory, and verifier gates pass"
-                        .to_string(),
-                ));
-            }
+        if let Some(status) = requested_status {
             mission.status = status;
         }
         if let Some(goal) = nonempty(args.goal.as_deref())
@@ -1129,25 +1216,40 @@ fn handle_control_update(
 
 fn handle_control_resume(
     state: &mut RampageState,
-    latest_user_message: Option<&str>,
+    latest_user_directive: Option<&RampageUserDirective>,
 ) -> Result<(), FunctionCallError> {
+    let directive = match latest_user_directive {
+        Some(RampageUserDirective::Resume(directive)) => directive,
+        _ => {
+            return Err(FunctionCallError::RespondToModel(
+                "rampage_control resume refused: wait for a newer real user message or authenticated request_user_input answer that explicitly says resume, continue, retry, proceed, or keep going"
+                    .to_string(),
+            ));
+        }
+    };
+    if state
+        .consumed_user_directive_ids
+        .contains(&directive.source_id)
+    {
+        return Err(FunctionCallError::RespondToModel(
+            "rampage_control resume refused: that authenticated user directive was already consumed; wait for a newer user message or request_user_input answer"
+                .to_string(),
+        ));
+    }
     let mission = required_active_mission_record(state)?;
-    if !mission.requires_user_resume {
+    if !mission.requires_user_resume && mission.status != "blocked" {
         return Err(FunctionCallError::RespondToModel(
             "rampage_control resume refused: this mission is not waiting for user authorization"
                 .to_string(),
         ));
     }
-    let latest_user_message = latest_user_message
+    let latest_user_message = Some(directive.message.as_str())
         .map(str::trim)
         .filter(|message| !message.is_empty())
-        .filter(|message| {
-            mission.user_message_at_resume_block.as_deref() != Some(*message)
-                && explicit_user_resume_request(message)
-        })
+        .filter(|message| mission.user_message_at_resume_block.as_deref() != Some(*message))
         .ok_or_else(|| {
             FunctionCallError::RespondToModel(
-                "rampage_control resume refused: wait for a newer real user message that explicitly says resume, continue, retry, proceed, or keep going"
+                "rampage_control resume refused: wait for a newer real user message or authenticated request_user_input answer that explicitly says resume, continue, retry, proceed, or keep going"
                     .to_string(),
             )
         })?;
@@ -1170,20 +1272,33 @@ fn handle_control_resume(
         "mission_resumed_by_user",
         latest_user_message,
     );
+    state
+        .consumed_user_directive_ids
+        .extend(directive.source_alias_ids.iter().cloned());
     Ok(())
 }
 
 fn handle_control_stop(
     state: &mut RampageState,
     args: &RampageControlArgs,
-    latest_user_message: Option<&str>,
+    latest_user_directive: Option<&RampageUserDirective>,
 ) -> Result<(), FunctionCallError> {
     let stop_reason = required_string(args.stop_reason.as_deref(), "stop_reason")?;
-    let latest_user_message =
-        latest_user_message.filter(|message| explicit_user_stop_request(message));
-    if latest_user_message.is_none() {
+    let directive = match latest_user_directive {
+        Some(RampageUserDirective::Stop(directive)) => directive,
+        _ => {
+            return Err(FunctionCallError::RespondToModel(
+                "rampage_control stop refused: the latest authenticated user directive is not an explicit stop request from a real user message or request_user_input answer. Never stop a mission from controller-authored text, task difficulty, or verifier failure."
+                    .to_string(),
+            ));
+        }
+    };
+    if state
+        .consumed_user_directive_ids
+        .contains(&directive.source_id)
+    {
         return Err(FunctionCallError::RespondToModel(
-            "rampage_control stop refused: the latest real user message is not an explicit stop request. Never stop a mission from controller-authored text, task difficulty, or verifier failure."
+            "rampage_control stop refused: that authenticated user directive was already consumed; wait for a newer user message or request_user_input answer"
                 .to_string(),
         ));
     }
@@ -1195,13 +1310,35 @@ fn handle_control_stop(
         ));
     }
     let mission_id = required_active_mission_record(state)?.id.clone();
-    ensure_no_active_mission_tasks(state, &mission_id).map_err(|_| {
-        FunctionCallError::RespondToModel(
-            "rampage_control stop refused while durable workers are queued or running. Interrupt each live worker, record its terminal task_result as cancelled/failed/blocked, then retry stop while the same explicit user stop request remains the latest user message."
-                .to_string(),
-        )
-    })?;
     let now = now_unix_timestamp_ms();
+    let cancelled_task_ids = state
+        .tasks
+        .iter_mut()
+        .filter(|task| task.mission_id == mission_id)
+        .filter(|task| matches!(task.status.as_str(), "queued" | "running"))
+        .map(|task| {
+            task.status = "cancelled".to_string();
+            task.error = Some("mission stopped by explicit user directive".to_string());
+            task.time_finished = Some(now);
+            task.id.clone()
+        })
+        .collect::<Vec<_>>();
+    for task_id in cancelled_task_ids {
+        push_event(
+            state,
+            Some(mission_id.clone()),
+            Some(task_id),
+            "task_updated",
+            "task cancelled because the user stopped the mission",
+        );
+    }
+    for board_item in state
+        .board_items
+        .iter_mut()
+        .filter(|item| item.mission_id == mission_id)
+    {
+        board_item.active = false;
+    }
     let mission_id = {
         let mission = required_active_mission_mut(state)?;
         mission.status = "stopped".to_string();
@@ -1217,7 +1354,100 @@ fn handle_control_stop(
         "mission_stopped_by_user",
         stop_reason,
     );
+    state
+        .consumed_user_directive_ids
+        .extend(directive.source_alias_ids.iter().cloned());
     Ok(())
+}
+
+fn durable_mission_worker_thread_ids(state: &RampageState, terminal_only: bool) -> Vec<ThreadId> {
+    let Some(mission) = state.active_mission() else {
+        return Vec::new();
+    };
+    state
+        .tasks
+        .iter()
+        .filter(|task| task.mission_id == mission.id)
+        .filter(|task| !terminal_only || !matches!(task.status.as_str(), "queued" | "running"))
+        .filter_map(|task| mission.worker_thread_ids.get(&task.id))
+        .cloned()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .filter_map(|thread_id| ThreadId::from_string(&thread_id).ok())
+        .collect()
+}
+
+fn durable_terminal_worker_thread_ids(state: &RampageState) -> Vec<ThreadId> {
+    state
+        .tasks
+        .iter()
+        .filter(|task| {
+            matches!(
+                task.status.as_str(),
+                "done" | "blocked" | "failed" | "cancelled"
+            )
+        })
+        .filter_map(|task| {
+            state
+                .missions
+                .iter()
+                .find(|mission| mission.id == task.mission_id)
+                .and_then(|mission| mission.worker_thread_ids.get(&task.id))
+        })
+        .cloned()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .filter_map(|thread_id| ThreadId::from_string(&thread_id).ok())
+        .collect()
+}
+
+fn deduplicate_worker_thread_ids(worker_thread_ids: Vec<ThreadId>) -> Vec<ThreadId> {
+    worker_thread_ids
+        .into_iter()
+        .map(|thread_id| thread_id.to_string())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .filter_map(|thread_id| ThreadId::from_string(&thread_id).ok())
+        .collect()
+}
+
+async fn close_rampage_workers_with_retry(
+    agent_control: &AgentControl,
+    worker_thread_ids: &[ThreadId],
+    context: &str,
+) {
+    let close_workers = worker_thread_ids
+        .iter()
+        .copied()
+        .map(|worker_thread_id| async move {
+            let mut last_error = None;
+            for attempt in 0..AGENT_CLOSE_ATTEMPTS {
+                match tokio::time::timeout(
+                    Duration::from_millis(AGENT_CLOSE_ATTEMPT_TIMEOUT_MS),
+                    agent_control.close_agent(worker_thread_id),
+                )
+                .await
+                {
+                    Ok(Ok(_)) => {
+                        last_error = None;
+                        break;
+                    }
+                    Ok(Err(err)) => last_error = Some(err.to_string()),
+                    Err(_) => {
+                        last_error = Some(format!(
+                            "close attempt timed out after {AGENT_CLOSE_ATTEMPT_TIMEOUT_MS}ms"
+                        ));
+                    }
+                }
+                if attempt + 1 < AGENT_CLOSE_ATTEMPTS {
+                    tokio::time::sleep(Duration::from_millis(25_u64 << attempt)).await;
+                }
+            }
+            if let Some(err) = last_error {
+                warn!("failed to close Rampage worker {worker_thread_id} after {context}: {err}");
+            }
+        });
+    futures::future::join_all(close_workers).await;
 }
 
 fn handle_control_complete(
@@ -1774,6 +2004,9 @@ async fn handle_rampage_board(
     let _state_transaction = rampage_state_transaction_mutex(&path).lock_owned().await;
     let mut state = load_state(&path, invocation.session.thread_id.to_string()).await?;
     let action = normalize_token(&args.action);
+    if action == "add" {
+        ensure_blocked_mission_action_allowed(&state, "rampage_board add")?;
+    }
     match action.as_str() {
         "add" => {
             let mission_id = required_active_mission(&state)?.id.clone();
@@ -1860,6 +2093,7 @@ async fn handle_rampage_compact(
     let path = rampage_state_path(&invocation);
     let _state_transaction = rampage_state_transaction_mutex(&path).lock_owned().await;
     let mut state = load_state(&path, invocation.session.thread_id.to_string()).await?;
+    ensure_blocked_mission_action_allowed(&state, "rampage_compact")?;
     let mission_id = required_active_mission(&state)?.id.clone();
     let brief_id = format!("brief-{}", Uuid::new_v4());
     let brief = RampageBrief {
@@ -1899,10 +2133,13 @@ async fn handle_rampage_spawn(
     invocation: ToolInvocation,
     options: RampageToolOptions,
 ) -> Result<RampageResult, FunctionCallError> {
-    let args: RampageSpawnArgs = parse_arguments(&function_arguments(invocation.payload.clone())?)?;
+    let mut args: RampageSpawnArgs =
+        parse_arguments(&function_arguments(invocation.payload.clone())?)?;
+    normalize_spawn_required_fields(&mut args)?;
     let path = rampage_state_path(&invocation);
     let _state_transaction = rampage_state_transaction_mutex(&path).lock_owned().await;
     let mut state = load_state(&path, invocation.session.thread_id.to_string()).await?;
+    ensure_blocked_mission_action_allowed(&state, "rampage_spawn")?;
     let mission = required_active_mission(&state)?.clone();
     let task_id = format!("task-{}", Uuid::new_v4());
     let now = now_unix_timestamp_ms();
@@ -1928,9 +2165,27 @@ async fn handle_rampage_spawn(
         )));
     }
     validate_spawn_contract(&args, &task_kind, requested_support_agent)?;
+    ensure_no_active_verifier_for_non_verifier_spawn(&state, &mission, &task_kind)?;
     if let Some(support_agent) = requested_support_agent {
         ensure_support_agent_spawn_has_worker_evidence(&state, &mission, support_agent)?;
+        ensure_support_agent_not_duplicated_for_current_evidence(&state, &mission, support_agent)?;
     }
+    ensure_substantive_worker_capacity(
+        &state,
+        &mission,
+        &task_kind,
+        requested_support_agent,
+        invocation
+            .turn
+            .config
+            .effective_agent_max_threads(invocation.turn.multi_agent_version),
+    )?;
+    ensure_selected_support_agents_reviewed_before_substantive_spawn(
+        &state,
+        &mission,
+        &task_kind,
+        requested_support_agent,
+    )?;
     ensure_evidence_window_capacity_for_spawn(
         &state,
         &mission,
@@ -2107,7 +2362,14 @@ async fn handle_rampage_spawn(
                         &task_id,
                         format!("failed to subscribe to authenticated worker status: {err}"),
                     );
-                    save_state_with_retry(&path, &state).await?;
+                    let compensation_result = save_state_with_retry(&path, &state).await;
+                    close_rampage_workers_with_retry(
+                        &agent_control,
+                        &[worker_thread_id],
+                        "subscription failure",
+                    )
+                    .await;
+                    compensation_result?;
                     return Err(FunctionCallError::RespondToModel(format!(
                         "spawned worker `{worker_session_id}` was interrupted because Rampage could not establish terminal attestation: {err}"
                     )));
@@ -2138,6 +2400,12 @@ async fn handle_rampage_spawn(
                 if let Err(compensation_err) = save_state_with_retry(&path, &state).await {
                     warn!("failed to persist Rampage spawn compensation: {compensation_err}");
                 }
+                close_rampage_workers_with_retry(
+                    &agent_control,
+                    &[worker_thread_id],
+                    "state-save failure",
+                )
+                .await;
                 return Err(err);
             }
             tokio::spawn(persist_worker_attestation_when_terminal(
@@ -2146,6 +2414,7 @@ async fn handle_rampage_spawn(
                 mission.id.clone(),
                 task_id.clone(),
                 worker_thread_id,
+                agent_control,
             ));
             Ok(result_from_state(
                 true,
@@ -2378,9 +2647,9 @@ fn create_rampage_control_tool(options: RampageToolOptions) -> ToolSpec {
     properties.insert(
         "status".to_string(),
         JsonSchema::string_enum(
-            strings(&["running", "paused", "blocked", "verifying"]),
+            strings(&["running", "verifying"]),
             Some(
-                "Non-terminal mission status for action=update. Only action=complete may finish a mission."
+                "Controller-authored mission status for action=update. Paused and blocked are not accepted because only verifier escalation may establish an authenticated user wait state."
                     .to_string(),
             ),
         ),
@@ -2603,8 +2872,11 @@ fn create_rampage_spawn_tool(options: RampageToolOptions) -> ToolSpec {
     properties.insert(
         "kind".to_string(),
         JsonSchema::string_enum(
-            strings(&["research", "work", "review", "verify", "compact"]),
-            Some("Task kind.".to_string()),
+            strings(&["research", "work", "review", "verify"]),
+            Some(
+                "Task kind. Use the dedicated rampage_compact tool for controller compaction; compact is not a worker kind."
+                    .to_string(),
+            ),
         ),
     );
     properties.insert(
@@ -2774,17 +3046,28 @@ async fn persist_worker_attestation_when_terminal(
     mission_id: String,
     task_id: String,
     worker_thread_id: ThreadId,
+    agent_control: AgentControl,
 ) {
     loop {
         let status = { status_rx.borrow().clone() };
         if let Some(attestation) =
             terminal_attestation_from_status(&mission_id, &task_id, worker_thread_id, &status)
         {
-            if let Err(err) = save_worker_attestation_with_retry(&path, &attestation).await {
-                warn!(
-                    "failed to persist Rampage worker attestation at {}: {err}",
-                    path.display()
-                );
+            match save_worker_attestation_with_retry(&path, &attestation).await {
+                Ok(()) => {
+                    close_rampage_workers_with_retry(
+                        &agent_control,
+                        &[worker_thread_id],
+                        "terminal attestation",
+                    )
+                    .await;
+                }
+                Err(err) => {
+                    warn!(
+                        "failed to persist Rampage worker attestation at {}: {err}",
+                        path.display()
+                    );
+                }
             }
             return;
         }
@@ -2795,11 +3078,21 @@ async fn persist_worker_attestation_when_terminal(
                 worker_thread_id,
                 "worker status channel closed before a terminal status was observed",
             );
-            if let Err(err) = save_worker_attestation_with_retry(&path, &attestation).await {
-                warn!(
-                    "failed to persist lost Rampage worker attestation at {}: {err}",
-                    path.display()
-                );
+            match save_worker_attestation_with_retry(&path, &attestation).await {
+                Ok(()) => {
+                    close_rampage_workers_with_retry(
+                        &agent_control,
+                        &[worker_thread_id],
+                        "lost-worker attestation",
+                    )
+                    .await;
+                }
+                Err(err) => {
+                    warn!(
+                        "failed to persist lost Rampage worker attestation at {}: {err}",
+                        path.display()
+                    );
+                }
             }
             return;
         }
@@ -3124,13 +3417,36 @@ fn required_active_mission(state: &RampageState) -> Result<&RampageMission, Func
                 .to_string(),
         ));
     }
-    if matches!(mission.status.as_str(), "running" | "blocked" | "verifying") {
+    if matches!(mission.status.as_str(), "running" | "verifying") {
         Ok(mission)
+    } else if mission.status == "blocked" {
+        Err(FunctionCallError::RespondToModel(
+            "Rampage mission is blocked and waiting for an explicit user directive; mission work is disabled until rampage_control action=resume or action=stop succeeds."
+                .to_string(),
+        ))
     } else {
         Err(FunctionCallError::RespondToModel(
             "no active Rampage mission exists; call rampage_control action=start first".to_string(),
         ))
     }
+}
+
+fn ensure_blocked_mission_action_allowed(
+    state: &RampageState,
+    action: &str,
+) -> Result<(), FunctionCallError> {
+    let Some(mission) = state.active_incomplete_mission() else {
+        return Ok(());
+    };
+    if mission.status != "blocked" && !mission.requires_user_resume {
+        return Ok(());
+    }
+    if matches!(action, "status" | "resume" | "stop") {
+        return Ok(());
+    }
+    Err(FunctionCallError::RespondToModel(format!(
+        "Rampage mission is blocked and waiting for an explicit user directive; `{action}` is disabled. Only rampage_control action=status, action=resume after authenticated user consent, or action=stop after authenticated user consent is allowed."
+    )))
 }
 
 fn required_active_mission_record(
@@ -3183,6 +3499,263 @@ fn nonempty(value: Option<&str>) -> Option<&str> {
 
 fn normalize_token(value: &str) -> String {
     value.trim().to_ascii_lowercase().replace([' ', '-'], "_")
+}
+
+fn latest_authenticated_rampage_user_directive(
+    items: &[ResponseItem],
+) -> Option<RampageUserDirective> {
+    let mut pending_requests = BTreeMap::<String, RequestUserInputArgs>::new();
+    let mut direct_message_occurrences = BTreeMap::<String, usize>::new();
+    let mut latest_directive = None;
+
+    for item in items {
+        if let Some(TurnItem::UserMessage(user_message)) =
+            crate::event_mapping::parse_turn_item(item)
+        {
+            let message = user_message.message();
+            if !crate::compact::is_summary_message(&message) {
+                pending_requests.clear();
+                let occurrence = direct_message_occurrences
+                    .entry(message.clone())
+                    .and_modify(|occurrence| *occurrence = occurrence.saturating_add(1))
+                    .or_insert(1);
+                latest_directive =
+                    directive_from_direct_user_message_with_occurrence(&message, *occurrence);
+            }
+            continue;
+        }
+
+        match item {
+            ResponseItem::FunctionCall {
+                name,
+                arguments,
+                call_id,
+                ..
+            } if name == "request_user_input" => {
+                if let Ok(args) = serde_json::from_str::<RequestUserInputArgs>(arguments) {
+                    pending_requests.insert(call_id.clone(), args);
+                }
+            }
+            ResponseItem::FunctionCallOutput { call_id, output } => {
+                let Some(args) = pending_requests.remove(call_id) else {
+                    continue;
+                };
+                if output.success == Some(false) {
+                    continue;
+                }
+                let Some(body) = output.body.to_text() else {
+                    continue;
+                };
+                let Ok(response) = serde_json::from_str::<RequestUserInputResponse>(&body) else {
+                    continue;
+                };
+                latest_directive = directive_from_request_user_input(&args, &response, call_id);
+            }
+            _ => {}
+        }
+    }
+
+    latest_directive
+}
+
+#[cfg(test)]
+fn directive_from_direct_user_message(message: &str) -> Option<RampageUserDirective> {
+    directive_from_direct_user_message_with_occurrence(message, 1)
+}
+
+fn directive_from_direct_user_message_with_occurrence(
+    message: &str,
+    occurrence: usize,
+) -> Option<RampageUserDirective> {
+    let occurrence = occurrence.max(1);
+    let source_id = direct_user_message_source_id(message, occurrence);
+    let directive = AuthenticatedRampageDirective {
+        message: message.to_string(),
+        source_id,
+        source_alias_ids: (1..=occurrence)
+            .map(|alias_occurrence| direct_user_message_source_id(message, alias_occurrence))
+            .collect(),
+    };
+    if explicit_user_stop_request(message) {
+        Some(RampageUserDirective::Stop(directive))
+    } else if explicit_user_resume_request(message) {
+        Some(RampageUserDirective::Resume(directive))
+    } else {
+        None
+    }
+}
+
+fn directive_from_request_user_input(
+    args: &RequestUserInputArgs,
+    response: &RequestUserInputResponse,
+    call_id: &str,
+) -> Option<RampageUserDirective> {
+    let mut directive = None;
+    for question in &args.questions {
+        let Some(answer) = response.answers.get(&question.id) else {
+            continue;
+        };
+        for (answer_ordinal, answer) in answer.answers.iter().enumerate() {
+            if !request_user_input_answer_was_offered(question, answer) {
+                continue;
+            }
+            let source_id = stable_directive_source_id(&format!(
+                "request-user-input:{call_id}:{}:{answer_ordinal}:{answer}",
+                question.id,
+            ));
+            let authenticated_directive = AuthenticatedRampageDirective {
+                message: answer.clone(),
+                source_alias_ids: BTreeSet::from([source_id.clone()]),
+                source_id,
+            };
+            let candidate = if explicit_request_user_input_stop_choice(question, answer) {
+                Some(RampageUserDirective::Stop(authenticated_directive))
+            } else if explicit_request_user_input_resume_choice(question, answer) {
+                Some(RampageUserDirective::Resume(authenticated_directive))
+            } else {
+                None
+            };
+            let Some(candidate) = candidate else {
+                continue;
+            };
+            if directive.as_ref().is_some_and(|existing| {
+                !matches!(
+                    (existing, &candidate),
+                    (RampageUserDirective::Stop(_), RampageUserDirective::Stop(_))
+                        | (
+                            RampageUserDirective::Resume(_),
+                            RampageUserDirective::Resume(_)
+                        )
+                )
+            }) {
+                return None;
+            }
+            directive = Some(candidate);
+        }
+    }
+    directive
+}
+
+fn direct_user_message_source_id(message: &str, occurrence: usize) -> String {
+    stable_directive_source_id(&format!(
+        "direct-user-message:{}:{occurrence}:{message}",
+        message.len()
+    ))
+}
+
+fn stable_directive_source_id(source: &str) -> String {
+    use sha1::Digest;
+
+    let digest = sha1::Sha1::digest(source.as_bytes());
+    let hex = digest
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    format!("directive:{hex}")
+}
+
+fn request_user_input_answer_was_offered(
+    _question: &RequestUserInputQuestion,
+    answer: &str,
+) -> bool {
+    // A successful, call-id-bound tool output has already passed through runtime
+    // normalization, which always enables the free-form Other choice. The raw
+    // function call in history is captured before that normalization.
+    !answer.trim().is_empty()
+}
+
+fn explicit_request_user_input_stop_choice(
+    question: &RequestUserInputQuestion,
+    answer: &str,
+) -> bool {
+    let answer_words = normalized_directive_words(answer);
+    if answer_words.iter().any(|word| {
+        matches!(
+            word.as_str(),
+            "not"
+                | "dont"
+                | "never"
+                | "keep"
+                | "continue"
+                | "worker"
+                | "workers"
+                | "agent"
+                | "agents"
+                | "concurrent"
+        )
+    }) {
+        return false;
+    }
+    let Some(verb) = answer_words.first() else {
+        return false;
+    };
+    matches!(verb.as_str(), "stop" | "cancel" | "abort" | "end")
+        && request_user_input_targets_mission(question, &answer_words)
+}
+
+fn explicit_request_user_input_resume_choice(
+    question: &RequestUserInputQuestion,
+    answer: &str,
+) -> bool {
+    let answer_words = normalized_directive_words(answer);
+    if answer_words.iter().any(|word| {
+        matches!(
+            word.as_str(),
+            "not"
+                | "dont"
+                | "never"
+                | "stop"
+                | "cancel"
+                | "worker"
+                | "workers"
+                | "agent"
+                | "agents"
+                | "concurrent"
+        )
+    }) {
+        return false;
+    }
+    let resume = explicit_user_resume_request(answer)
+        || answer_words
+            .windows(2)
+            .any(|pair| pair[0] == "keep" && pair[1] == "running");
+    resume && request_user_input_targets_mission(question, &answer_words)
+}
+
+fn request_user_input_targets_mission(
+    question: &RequestUserInputQuestion,
+    answer_words: &[String],
+) -> bool {
+    directive_words_target_mission(answer_words)
+        || directive_words_target_mission(&normalized_directive_words(&question.question))
+        || question.options.as_ref().is_some_and(|options| {
+            options.iter().any(|option| {
+                let words = normalized_directive_words(&option.label);
+                !words.iter().any(|word| {
+                    matches!(
+                        word.as_str(),
+                        "worker" | "workers" | "agent" | "agents" | "concurrent"
+                    )
+                }) && directive_words_target_mission(&words)
+            })
+        })
+}
+
+fn directive_words_target_mission(words: &[String]) -> bool {
+    words.iter().any(|word| {
+        matches!(
+            word.as_str(),
+            "mission" | "rampage" | "task" | "work" | "audit"
+        )
+    })
+}
+
+fn normalized_directive_words(message: &str) -> Vec<String> {
+    message
+        .split(|character: char| !character.is_ascii_alphanumeric())
+        .filter(|word| !word.is_empty())
+        .map(str::to_ascii_lowercase)
+        .collect()
 }
 
 fn explicit_user_stop_request(message: &str) -> bool {
@@ -3245,14 +3818,20 @@ fn explicit_user_resume_request(message: &str) -> bool {
     {
         return false;
     }
-    words.iter().any(|word| {
+    let first_directive_word = words
+        .iter()
+        .position(|word| !matches!(*word, "yes" | "please" | "now"))
+        .unwrap_or(words.len());
+    let words = &words[first_directive_word..];
+    words.first().is_some_and(|word| {
         matches!(
             *word,
             "resume" | "continue" | "retry" | "proceed" | "restart"
         )
-    }) || words
-        .windows(2)
-        .any(|pair| matches!(pair, ["keep", "going"] | ["try", "again"] | ["go", "ahead"]))
+    }) || matches!(
+        words,
+        ["keep", "going", ..] | ["try", "again", ..] | ["go", "ahead", ..]
+    )
 }
 
 fn validate_mission_status(status: &str) -> Result<(), FunctionCallError> {
@@ -3327,8 +3906,8 @@ fn latest_fresh_support_agent_task<'a>(
     mission: &RampageMission,
     support_agent: &str,
 ) -> Option<&'a RampageTask> {
-    let latest_worker_result_time = latest_substantive_worker_evidence_time(state, mission).ok()?;
-    let latest_worker_revision = latest_substantive_worker_evidence_revision(state, mission);
+    let (latest_worker_result_time, latest_worker_revision) =
+        support_agent_review_basis(state, mission).ok()?;
     state
         .tasks
         .iter()
@@ -3713,6 +4292,58 @@ fn latest_substantive_worker_evidence_revision(
         .max()
 }
 
+fn support_agent_review_basis(
+    state: &RampageState,
+    mission: &RampageMission,
+) -> Result<(i64, Option<u64>), FunctionCallError> {
+    let authenticated_evidence = latest_substantive_worker_evidence_time(state, mission)
+        .ok()
+        .map(|time| {
+            (
+                time,
+                latest_substantive_worker_evidence_revision(state, mission),
+            )
+        });
+    let now = now_unix_timestamp_ms();
+    let stuck_snapshot = state
+        .tasks
+        .iter()
+        .filter(|task| task.mission_id == mission.id)
+        .filter(|task| is_substantive_mission_worker(task) && task.status == "running")
+        .filter(|task| {
+            task.worker_session_id
+                .as_deref()
+                .is_some_and(|worker_session_id| !worker_session_id.trim().is_empty())
+        })
+        .filter_map(|task| {
+            let started = task.time_started.unwrap_or(task.time_created);
+            (now.saturating_sub(started) >= ADVISOR_STUCK_WORKER_THRESHOLD_MS).then(|| {
+                (
+                    started.saturating_add(ADVISOR_STUCK_WORKER_THRESHOLD_MS),
+                    Some(
+                        mission
+                            .task_input_revisions
+                            .get(&task.id)
+                            .copied()
+                            .unwrap_or_default(),
+                    ),
+                )
+            })
+        })
+        .max_by_key(|(time, revision)| (revision.unwrap_or_default(), *time));
+
+    authenticated_evidence
+        .into_iter()
+        .chain(stuck_snapshot)
+        .max_by_key(|(time, revision)| (revision.unwrap_or_default(), *time))
+        .ok_or_else(|| {
+            FunctionCallError::RespondToModel(format!(
+                "Rampage advisory review requires an authenticated worker checkpoint/result or a spawned worker that has remained running for at least {} seconds.",
+                ADVISOR_STUCK_WORKER_THRESHOLD_MS / 1_000
+            ))
+        })
+}
+
 fn completed_spawned_task_result(task: &RampageTask) -> bool {
     task.status == "done"
         && task.time_finished.is_some()
@@ -3821,6 +4452,113 @@ fn validate_selected_support_agents_completed(
     Ok(())
 }
 
+fn ensure_selected_support_agents_reviewed_before_substantive_spawn(
+    state: &RampageState,
+    mission: &RampageMission,
+    task_kind: &str,
+    requested_support_agent: Option<&str>,
+) -> Result<(), FunctionCallError> {
+    if requested_support_agent.is_some()
+        || !matches!(task_kind, "research" | "work" | "review")
+        || support_agent_review_basis(state, mission).is_err()
+    {
+        return Ok(());
+    }
+
+    for support_agent in required_support_agents(&mission.support_agents) {
+        if let Err(message) = support_agent_has_contributed(state, mission, support_agent) {
+            return Err(FunctionCallError::RespondToModel(format!(
+                "rampage_spawn refused: selected support agents must review the latest substantive worker evidence before more mission work is spawned. {message}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn ensure_no_active_verifier_for_non_verifier_spawn(
+    state: &RampageState,
+    mission: &RampageMission,
+    task_kind: &str,
+) -> Result<(), FunctionCallError> {
+    if task_kind == "verify" {
+        return Ok(());
+    }
+    let active_verifier = state.tasks.iter().find(|task| {
+        task.mission_id == mission.id
+            && task.kind == "verify"
+            && matches!(task.status.as_str(), "queued" | "running")
+    });
+    let Some(active_verifier) = active_verifier else {
+        return Ok(());
+    };
+    Err(FunctionCallError::RespondToModel(format!(
+        "rampage_spawn refused while verifier task {} ({}) is active. Wait for and record that verifier result before changing its evidence window.",
+        active_verifier.id, active_verifier.title
+    )))
+}
+
+fn ensure_support_agent_not_duplicated_for_current_evidence(
+    state: &RampageState,
+    mission: &RampageMission,
+    support_agent: &str,
+) -> Result<(), FunctionCallError> {
+    let display_name = support_agent_display_name(support_agent);
+    if let Some(active) = state.tasks.iter().find(|task| {
+        task.mission_id == mission.id
+            && task_support_agent_kind(task).is_some_and(|kind| kind == support_agent)
+            && matches!(task.status.as_str(), "queued" | "running")
+    }) {
+        return Err(FunctionCallError::RespondToModel(format!(
+            "rampage_spawn refused: {display_name} already has active task {}. Wait for and record that result instead of filling another worker slot with duplicate advice.",
+            active.id
+        )));
+    }
+    if let Some(completed) = latest_fresh_support_agent_task(state, mission, support_agent) {
+        return Err(FunctionCallError::RespondToModel(format!(
+            "rampage_spawn refused: {display_name} task {} already reviewed the latest substantive evidence. Spawn it again only after a newer authenticated worker checkpoint or terminal result exists.",
+            completed.id
+        )));
+    }
+    Ok(())
+}
+
+fn ensure_substantive_worker_capacity(
+    state: &RampageState,
+    mission: &RampageMission,
+    task_kind: &str,
+    requested_support_agent: Option<&str>,
+    max_child_threads: Option<usize>,
+) -> Result<(), FunctionCallError> {
+    if requested_support_agent.is_some() || !matches!(task_kind, "research" | "work" | "review") {
+        return Ok(());
+    }
+    let Some(max_child_threads) = max_child_threads else {
+        return Ok(());
+    };
+    let reserved_support_slots = required_support_agents(&mission.support_agents).len();
+    let substantive_limit = if max_child_threads == 0 {
+        0
+    } else {
+        max_child_threads
+            .saturating_sub(reserved_support_slots)
+            .max(1)
+    };
+    let active_substantive_workers = state
+        .tasks
+        .iter()
+        .filter(|task| task.mission_id == mission.id)
+        .filter(|task| is_substantive_mission_worker(task))
+        .filter(|task| matches!(task.status.as_str(), "queued" | "running"))
+        .count();
+    if active_substantive_workers < substantive_limit {
+        return Ok(());
+    }
+
+    Err(FunctionCallError::RespondToModel(format!(
+        "rampage_spawn reserved {reserved_support_slots} of {max_child_threads} child slots for the selected support agents; {active_substantive_workers}/{substantive_limit} substantive worker slots are already active. Wait for and record current worker evidence, then spawn the selected advisors to review it before adding more substantive work."
+    )))
+}
+
 fn required_support_agents(support_agents: &str) -> Vec<&'static str> {
     match normalize_token(support_agents).as_str() {
         "both" => vec![SUPPORT_AGENT_NEW_IDEAS, SUPPORT_AGENT_EFFICIENCY],
@@ -3835,10 +4573,10 @@ fn support_agent_has_contributed(
     mission: &RampageMission,
     support_agent: &str,
 ) -> Result<(), String> {
-    let latest_worker_result_time = latest_substantive_worker_evidence_time(state, mission)
-        .map_err(|_| {
+    let (latest_worker_result_time, latest_worker_revision) =
+        support_agent_review_basis(state, mission).map_err(|_| {
             format!(
-                "{} cannot contribute before a non-support worker has returned an authenticated checkpoint or terminal result. Spawn a focused mission worker first.",
+                "{} cannot contribute before a non-support worker has returned an authenticated checkpoint/result or remained running long enough for a stuck-worker snapshot. Spawn a focused mission worker first.",
                 support_agent_display_name(support_agent)
             )
         })?;
@@ -3855,7 +4593,6 @@ fn support_agent_has_contributed(
         ));
     }
 
-    let latest_worker_revision = latest_substantive_worker_evidence_revision(state, mission);
     let tasks = all_tasks
         .iter()
         .copied()
@@ -3957,17 +4694,25 @@ fn validate_spawn_contract(
     Ok(())
 }
 
+fn normalize_spawn_required_fields(args: &mut RampageSpawnArgs) -> Result<(), FunctionCallError> {
+    args.task_name = required_string(Some(&args.task_name), "task_name")?;
+    args.title = required_string(Some(&args.title), "title")?;
+    args.instructions = required_string(Some(&args.instructions), "instructions")?;
+    Ok(())
+}
+
 fn ensure_support_agent_spawn_has_worker_evidence(
     state: &RampageState,
     mission: &RampageMission,
     support_agent: &str,
 ) -> Result<(), FunctionCallError> {
-    latest_substantive_worker_evidence_time(state, mission)
+    support_agent_review_basis(state, mission)
         .map(|_| ())
         .map_err(|_| {
             FunctionCallError::RespondToModel(format!(
-                "{} cannot spawn before a substantive non-support worker has returned an authenticated checkpoint or terminal result. Spawn a focused mission worker first, then retry the advisory task with that worker evidence.",
-                support_agent_display_name(support_agent)
+                "{} cannot spawn before a substantive non-support worker has returned an authenticated checkpoint/result or has remained running for at least {} seconds. Spawn a focused mission worker first, then retry with its evidence or stuck-worker snapshot.",
+                support_agent_display_name(support_agent),
+                ADVISOR_STUCK_WORKER_THRESHOLD_MS / 1_000,
             ))
         })
 }
@@ -4044,7 +4789,13 @@ fn support_agent_has_spawned(
 }
 
 fn validate_task_kind(kind: &str) -> Result<(), FunctionCallError> {
-    if matches!(kind, "research" | "work" | "review" | "verify" | "compact") {
+    if kind == "compact" {
+        return Err(FunctionCallError::RespondToModel(
+            "rampage_spawn kind=compact is invalid; use the dedicated rampage_compact controller tool instead"
+                .to_string(),
+        ));
+    }
+    if matches!(kind, "research" | "work" | "review" | "verify") {
         Ok(())
     } else {
         Err(FunctionCallError::RespondToModel(format!(
@@ -4255,13 +5006,14 @@ fn worker_brief(
                         })
                         .unwrap_or_else(|| "<none>".to_string());
                     format!(
-                        "- task_id={} role={} title={} kind={} status={} elapsed_ms={}\n  checkpoint={}\n  result={}\n  error={}",
+                        "- task_id={} role={} title={} kind={} status={} elapsed_ms={}\n  instructions={}\n  checkpoint={}\n  result={}\n  error={}",
                         task.id,
                         task.role,
                         task.title,
                         task.kind,
                         task.status,
                         elapsed_ms,
+                        text_for_worker_brief(&task.instructions, OUTPUT_TASK_TEXT_LIMIT),
                         checkpoint,
                         result,
                         error
@@ -4812,7 +5564,92 @@ mod tests {
     }
 
     #[test]
-    fn explicit_stop_is_terminal_and_allows_a_new_mission() {
+    fn update_rejects_immutable_startup_configuration() {
+        let mut state = RampageState::new("thread-1".to_string());
+        handle_control_start(
+            &mut state,
+            &valid_start_args("both"),
+            RampageToolOptions::new(ModeKind::AbsoluteRampage),
+            "thread-1".to_string(),
+        )
+        .expect("mission should start");
+        let original = state.active_mission().expect("mission").clone();
+        let update_args = RampageControlArgs {
+            action: "update".to_string(),
+            support_agents: Some("none".to_string()),
+            verifier_pass_threshold: Some(50.0),
+            verifier_max_failures: Some(json!("infinite")),
+            ..Default::default()
+        };
+
+        let err = handle_control_update(&mut state, &update_args)
+            .expect_err("startup configuration must remain immutable");
+        assert!(err.to_string().contains("startup configuration"));
+        let mission = state.active_mission().expect("mission");
+        assert_eq!(mission.support_agents, original.support_agents);
+        assert_eq!(
+            mission.verifier_pass_threshold,
+            original.verifier_pass_threshold
+        );
+        assert_eq!(
+            mission.verifier_max_failures,
+            original.verifier_max_failures
+        );
+    }
+
+    #[test]
+    fn update_rejects_controller_authored_wait_states() {
+        for (status, expected) in [
+            ("blocked", "reserved for verifier escalation"),
+            ("paused", "no authenticated resume boundary"),
+        ] {
+            let mut state = RampageState::new("thread-1".to_string());
+            handle_control_start(
+                &mut state,
+                &valid_start_args("none"),
+                RampageToolOptions::new(ModeKind::AbsoluteRampage),
+                "thread-1".to_string(),
+            )
+            .expect("mission should start");
+
+            let err = handle_control_update(
+                &mut state,
+                &RampageControlArgs {
+                    action: "update".to_string(),
+                    status: Some(status.to_string()),
+                    ..Default::default()
+                },
+            )
+            .expect_err("controller-authored wait states must be rejected");
+            assert!(err.to_string().contains(expected));
+            assert_eq!(state.active_mission().expect("mission").status, "running");
+        }
+    }
+
+    #[test]
+    fn compacted_stop_replay_is_blocked_and_newer_identical_occurrence_is_distinct() {
+        let stop_message = "please stop this mission";
+        let user_message = |message: String| ResponseItem::Message {
+            id: None,
+            role: "user".to_string(),
+            content: vec![codex_protocol::models::ContentItem::InputText { text: message }],
+            phase: None,
+        };
+        let mut original_history = vec![
+            user_message(stop_message.to_string()),
+            user_message("context ".repeat(25_000)),
+            user_message(stop_message.to_string()),
+        ];
+        let stop_directive = latest_authenticated_rampage_user_directive(&original_history)
+            .expect("latest direct stop message should authenticate");
+        let stop_source_id = match &stop_directive {
+            RampageUserDirective::Stop(directive) => {
+                assert_eq!(directive.source_alias_ids.len(), 2);
+                directive.source_id.clone()
+            }
+            RampageUserDirective::Resume(_) => panic!("expected stop directive"),
+        };
+
         let mut state = RampageState::new("thread-1".to_string());
         handle_control_start(
             &mut state,
@@ -4822,16 +5659,13 @@ mod tests {
         )
         .expect("mission should start");
         let stopped_mission_id = state.active_mission().expect("mission").id.clone();
-        handle_control_stop(
-            &mut state,
-            &RampageControlArgs {
-                action: "stop".to_string(),
-                stop_reason: Some("The user explicitly said to stop.".to_string()),
-                ..Default::default()
-            },
-            Some("please stop this mission"),
-        )
-        .expect("explicit user stop should terminate the mission");
+        let stop_args = RampageControlArgs {
+            action: "stop".to_string(),
+            stop_reason: Some("The user explicitly said to stop.".to_string()),
+            ..Default::default()
+        };
+        handle_control_stop(&mut state, &stop_args, Some(&stop_directive))
+            .expect("explicit user stop should terminate the mission");
         assert_eq!(state.active_mission().expect("mission").status, "stopped");
 
         let reopen_err = handle_control_update(
@@ -4849,6 +5683,28 @@ mod tests {
                 .contains("terminal missions are immutable")
         );
 
+        let compacted_history = crate::compact::build_compacted_history(
+            Vec::new(),
+            &crate::compact::collect_user_messages(&original_history),
+            &format!("{}\nmission summary", crate::compact::SUMMARY_PREFIX),
+        );
+        assert_eq!(
+            crate::compact::collect_user_messages(&compacted_history)
+                .iter()
+                .filter(|message| message.as_str() == stop_message)
+                .count(),
+            1,
+            "real compaction should drop the older identical stop prefix"
+        );
+        let compacted_stop_directive =
+            latest_authenticated_rampage_user_directive(&compacted_history)
+                .expect("the rebuilt history should retain the latest direct stop message");
+        let compacted_source_id = match &compacted_stop_directive {
+            RampageUserDirective::Stop(directive) => directive.source_id.as_str(),
+            RampageUserDirective::Resume(_) => panic!("expected stop directive"),
+        };
+        assert_ne!(compacted_source_id, stop_source_id);
+
         handle_control_start(
             &mut state,
             &valid_start_args("none"),
@@ -4860,10 +5716,31 @@ mod tests {
             state.active_mission().expect("new mission").id,
             stopped_mission_id
         );
+        let replay = handle_control_stop(&mut state, &stop_args, Some(&compacted_stop_directive))
+            .expect_err("a consumed directive cannot stop a newer mission");
+        assert!(replay.to_string().contains("already consumed"));
+
+        original_history.push(user_message(stop_message.to_string()));
+        let newer_stop = latest_authenticated_rampage_user_directive(&original_history)
+            .expect("a newer identical stop occurrence should authenticate");
+        let newer_source_id = match &newer_stop {
+            RampageUserDirective::Stop(directive) => directive.source_id.as_str(),
+            RampageUserDirective::Resume(_) => panic!("expected stop directive"),
+        };
+        assert_ne!(
+            newer_source_id, stop_source_id,
+            "a newer identical message occurrence must receive a distinct primary identity"
+        );
+        handle_control_stop(&mut state, &stop_args, Some(&newer_stop))
+            .expect("a newer authenticated directive may stop the new mission");
+        assert_eq!(
+            state.active_mission().expect("new mission").status,
+            "stopped"
+        );
     }
 
     #[test]
-    fn stop_requires_real_user_request_and_no_live_workers() {
+    fn stop_requires_real_user_request_and_cancels_live_workers() {
         let mut state = RampageState::new("thread-1".to_string());
         handle_control_start(
             &mut state,
@@ -4877,9 +5754,17 @@ mod tests {
             stop_reason: Some("controller wants to stop".to_string()),
             ..Default::default()
         };
-        let forged = handle_control_stop(&mut state, &stop_args, Some("continue the mission"))
-            .expect_err("controller text cannot authenticate a stop");
-        assert!(forged.to_string().contains("latest real user message"));
+        let forged = handle_control_stop(
+            &mut state,
+            &stop_args,
+            directive_from_direct_user_message("continue the mission").as_ref(),
+        )
+        .expect_err("a resume directive cannot authenticate a stop");
+        assert!(
+            forged
+                .to_string()
+                .contains("latest authenticated user directive")
+        );
 
         let mission_id = state.active_mission().expect("mission").id.clone();
         push_completed_mission_worker(&mut state, &mission_id, "task-live", 2);
@@ -4890,12 +5775,356 @@ mod tests {
             .expect("worker");
         live.status = "running".to_string();
         live.time_finished = None;
-        let live_err =
-            handle_control_stop(&mut state, &stop_args, Some("please stop this mission now"))
-                .expect_err("live workers must be reconciled first");
-        assert!(live_err.to_string().contains("queued or running"));
+        let worker_thread_id = ThreadId::new();
+        state
+            .active_mission_mut()
+            .expect("mission")
+            .worker_thread_ids
+            .insert("task-live".to_string(), worker_thread_id.to_string());
+        assert_eq!(
+            durable_mission_worker_thread_ids(&state, false),
+            vec![worker_thread_id]
+        );
+        handle_control_stop(
+            &mut state,
+            &stop_args,
+            directive_from_direct_user_message("please stop this mission now").as_ref(),
+        )
+        .expect("authenticated mission stop should cancel durable live work");
+        let live = state
+            .tasks
+            .iter()
+            .find(|task| task.id == "task-live")
+            .expect("worker");
+        assert_eq!(live.status, "cancelled");
+        assert!(live.time_finished.is_some());
+        assert_eq!(
+            durable_mission_worker_thread_ids(&state, true),
+            vec![worker_thread_id]
+        );
+        assert_eq!(state.active_mission().expect("mission").status, "stopped");
         assert!(explicit_user_stop_request("please stop this mission now"));
         assert!(!explicit_user_stop_request("do not stop this mission"));
+    }
+
+    #[test]
+    fn terminal_cleanup_ids_survive_mission_rollover_and_state_reload() {
+        let mut state = RampageState::new("thread-1".to_string());
+        handle_control_start(
+            &mut state,
+            &valid_start_args("none"),
+            RampageToolOptions::new(ModeKind::AbsoluteRampage),
+            "thread-1".to_string(),
+        )
+        .expect("first mission should start");
+        let old_mission_id = state.active_mission().expect("old mission").id.clone();
+        push_completed_mission_worker(&mut state, &old_mission_id, "task-old", 2);
+        let old_worker_thread_id = ThreadId::new();
+        state
+            .active_mission_mut()
+            .expect("old mission")
+            .worker_thread_ids
+            .insert("task-old".to_string(), old_worker_thread_id.to_string());
+        handle_control_stop(
+            &mut state,
+            &RampageControlArgs {
+                action: "stop".to_string(),
+                stop_reason: Some("User stopped the old mission.".to_string()),
+                ..Default::default()
+            },
+            directive_from_direct_user_message("stop this mission").as_ref(),
+        )
+        .expect("old mission should stop");
+
+        handle_control_start(
+            &mut state,
+            &valid_start_args("none"),
+            RampageToolOptions::new(ModeKind::AbsoluteRampage),
+            "thread-1".to_string(),
+        )
+        .expect("new mission should start");
+        let new_mission_id = state.active_mission().expect("new mission").id.clone();
+        push_completed_mission_worker(&mut state, &new_mission_id, "task-new", 4);
+        let new_task = state.tasks.last_mut().expect("new worker");
+        new_task.status = "running".to_string();
+        new_task.result = None;
+        new_task.time_finished = None;
+        let new_worker_thread_id = ThreadId::new();
+        state
+            .active_mission_mut()
+            .expect("new mission")
+            .worker_thread_ids
+            .insert("task-new".to_string(), new_worker_thread_id.to_string());
+
+        let persisted = serde_json::to_string(&state).expect("serialize durable state");
+        let restored: RampageState =
+            serde_json::from_str(&persisted).expect("reload durable state");
+        assert_eq!(
+            durable_terminal_worker_thread_ids(&restored),
+            vec![old_worker_thread_id],
+            "terminal UUIDs from prior missions remain retryable after restart"
+        );
+        let mut stop_cleanup_ids = durable_terminal_worker_thread_ids(&restored);
+        stop_cleanup_ids.extend(durable_mission_worker_thread_ids(&restored, false));
+        assert_eq!(
+            deduplicate_worker_thread_ids(stop_cleanup_ids),
+            deduplicate_worker_thread_ids(vec![old_worker_thread_id, new_worker_thread_id]),
+            "stop/complete cleanup combines old terminal UUIDs with every current mission UUID"
+        );
+
+        let mut legacy_value = serde_json::to_value(&restored).expect("serialize legacy fixture");
+        legacy_value
+            .as_object_mut()
+            .expect("state object")
+            .remove("consumed_user_directive_ids");
+        let legacy_restored: RampageState =
+            serde_json::from_value(legacy_value).expect("legacy state remains compatible");
+        assert!(legacy_restored.consumed_user_directive_ids.is_empty());
+    }
+
+    fn request_user_input_history(
+        call_id: &str,
+        question: &str,
+        options: &[&str],
+        answer: &str,
+        is_other: bool,
+    ) -> Vec<ResponseItem> {
+        vec![
+            ResponseItem::FunctionCall {
+                id: None,
+                name: "request_user_input".to_string(),
+                namespace: None,
+                arguments: json!({
+                    "questions": [{
+                        "header": "Mission choice",
+                        "id": "mission_action",
+                        "question": question,
+                        "isOther": is_other,
+                        "options": options
+                            .iter()
+                            .map(|label| json!({"label": label, "description": "Choose action"}))
+                            .collect::<Vec<_>>()
+                    }]
+                })
+                .to_string(),
+                call_id: call_id.to_string(),
+            },
+            ResponseItem::FunctionCallOutput {
+                call_id: call_id.to_string(),
+                output: codex_protocol::models::FunctionCallOutputPayload {
+                    body: codex_protocol::models::FunctionCallOutputBody::Text(
+                        json!({
+                            "answers": {
+                                "mission_action": {"answers": [answer]}
+                            }
+                        })
+                        .to_string(),
+                    ),
+                    success: Some(true),
+                },
+            },
+        ]
+    }
+
+    #[test]
+    fn authenticated_request_user_input_directives_stop_or_resume_the_mission() {
+        assert!(matches!(
+            directive_from_direct_user_message("please continue this mission"),
+            Some(RampageUserDirective::Resume(_))
+        ));
+        assert!(
+            directive_from_direct_user_message("why did you continue the mission?").is_none(),
+            "a question about prior continuation is not resume authorization"
+        );
+        let stop_history = request_user_input_history(
+            "stop-call",
+            "How should I proceed?",
+            &["STOP - Complete audit", "KEEP RUNNING"],
+            "STOP - Complete audit",
+            false,
+        );
+        let stop_directive = latest_authenticated_rampage_user_directive(&stop_history)
+            .expect("paired stop choice should authenticate");
+        assert!(matches!(&stop_directive, RampageUserDirective::Stop(_)));
+
+        let bare_task_stop = request_user_input_history(
+            "bare-task-stop",
+            "Stop current task/work?",
+            &["STOP", "KEEP RUNNING"],
+            "STOP",
+            false,
+        );
+        assert!(matches!(
+            latest_authenticated_rampage_user_directive(&bare_task_stop),
+            Some(RampageUserDirective::Stop(_))
+        ));
+        let other_stop = request_user_input_history(
+            "other-stop",
+            "How should I proceed?",
+            &["STOP - Complete audit", "KEEP RUNNING"],
+            "STOP",
+            true,
+        );
+        assert!(matches!(
+            latest_authenticated_rampage_user_directive(&other_stop),
+            Some(RampageUserDirective::Stop(_))
+        ));
+        let normalized_option_stop = request_user_input_history(
+            "normalized-option-stop",
+            "How should I proceed?",
+            &["STOP - Complete audit", "KEEP RUNNING"],
+            "STOP",
+            false,
+        );
+        assert!(matches!(
+            latest_authenticated_rampage_user_directive(&normalized_option_stop),
+            Some(RampageUserDirective::Stop(_))
+        ));
+        let normalized_other_stop = request_user_input_history(
+            "normalized-other-stop",
+            "Stop current task/work?",
+            &["KEEP RUNNING"],
+            "STOP",
+            false,
+        );
+        assert!(matches!(
+            latest_authenticated_rampage_user_directive(&normalized_other_stop),
+            Some(RampageUserDirective::Stop(_))
+        ));
+
+        let mut state = RampageState::new("thread-1".to_string());
+        handle_control_start(
+            &mut state,
+            &valid_start_args("none"),
+            RampageToolOptions::new(ModeKind::AbsoluteRampage),
+            "thread-1".to_string(),
+        )
+        .expect("mission should start");
+        handle_control_stop(
+            &mut state,
+            &RampageControlArgs {
+                action: "stop".to_string(),
+                stop_reason: Some("User selected STOP in request_user_input.".to_string()),
+                ..Default::default()
+            },
+            Some(&stop_directive),
+        )
+        .expect("authenticated stop choice should stop the mission");
+        assert_eq!(state.active_mission().expect("mission").status, "stopped");
+
+        let resume_history = request_user_input_history(
+            "resume-call",
+            "The Rampage mission is blocked. Continue the mission?",
+            &["KEEP RUNNING", "STOP rampage mission"],
+            "KEEP RUNNING",
+            false,
+        );
+        let resume_directive = latest_authenticated_rampage_user_directive(&resume_history)
+            .expect("paired resume choice should authenticate");
+        assert!(matches!(&resume_directive, RampageUserDirective::Resume(_)));
+
+        let mut state = RampageState::new("thread-2".to_string());
+        handle_control_start(
+            &mut state,
+            &valid_start_args("none"),
+            RampageToolOptions::new(ModeKind::AbsoluteRampage),
+            "thread-2".to_string(),
+        )
+        .expect("mission should start");
+        state.active_mission_mut().expect("mission").status = "blocked".to_string();
+        handle_control_resume(&mut state, Some(&resume_directive))
+            .expect("authenticated resume choice should resume a blocked mission");
+        assert_eq!(state.active_mission().expect("mission").status, "running");
+    }
+
+    #[test]
+    fn request_user_input_worker_stop_does_not_authorize_mission_stop() {
+        let worker_stop_history = request_user_input_history(
+            "worker-stop-call",
+            "The mission is blocked by occupied worker slots. How should I proceed?",
+            &[
+                "STOP concurrent workers",
+                "STOP this mission",
+                "KEEP RUNNING",
+            ],
+            "STOP concurrent workers",
+            false,
+        );
+        assert!(latest_authenticated_rampage_user_directive(&worker_stop_history).is_none());
+
+        let mut stale_stop_history = request_user_input_history(
+            "mission-stop-call",
+            "Please stop the mission.",
+            &["STOP this mission", "KEEP RUNNING"],
+            "STOP this mission",
+            false,
+        );
+        stale_stop_history.push(ResponseItem::Message {
+            id: None,
+            role: "user".to_string(),
+            content: vec![codex_protocol::models::ContentItem::InputText {
+                text: "Do not stop. Show me the status.".to_string(),
+            }],
+            phase: None,
+        });
+        assert!(latest_authenticated_rampage_user_directive(&stale_stop_history).is_none());
+
+        let mut superseded_request = request_user_input_history(
+            "superseded-stop-call",
+            "Stop current task/work?",
+            &["STOP", "KEEP RUNNING"],
+            "STOP",
+            false,
+        );
+        let stop_output = superseded_request.pop().expect("stop output");
+        superseded_request.push(ResponseItem::Message {
+            id: None,
+            role: "user".to_string(),
+            content: vec![codex_protocol::models::ContentItem::InputText {
+                text: "Show me the status first.".to_string(),
+            }],
+            phase: None,
+        });
+        superseded_request.push(stop_output);
+        assert!(
+            latest_authenticated_rampage_user_directive(&superseded_request).is_none(),
+            "a later direct user message must invalidate an unanswered older prompt"
+        );
+    }
+
+    #[test]
+    fn blocked_mission_allows_only_status_resume_or_stop() {
+        let mut state = RampageState::new("thread-1".to_string());
+        handle_control_start(
+            &mut state,
+            &valid_start_args("none"),
+            RampageToolOptions::new(ModeKind::AbsoluteRampage),
+            "thread-1".to_string(),
+        )
+        .expect("mission should start");
+        state.active_mission_mut().expect("mission").status = "blocked".to_string();
+        assert!(required_active_mission(&state).is_err());
+
+        for action in ["status", "resume", "stop"] {
+            ensure_blocked_mission_action_allowed(&state, action)
+                .expect("wait-state control action should remain available");
+        }
+        for action in [
+            "update",
+            "complete",
+            "task_result",
+            "verify_result",
+            "rampage_spawn",
+            "rampage_board add",
+            "rampage_compact",
+        ] {
+            let err = ensure_blocked_mission_action_allowed(&state, action)
+                .expect_err("blocked missions must reject retrying work");
+            assert!(
+                err.to_string()
+                    .contains("waiting for an explicit user directive")
+            );
+        }
     }
 
     #[test]
@@ -4937,6 +6166,63 @@ mod tests {
     }
 
     #[test]
+    fn spawn_rejects_blank_required_fields_and_trims_valid_values() {
+        let valid_args = || RampageSpawnArgs {
+            task_name: " worker ".to_string(),
+            title: " Work item ".to_string(),
+            instructions: " Do focused work. ".to_string(),
+            kind: Some("work".to_string()),
+            role: None,
+            parent_task_id: None,
+            dependencies: None,
+            model: None,
+            reasoning_effort: None,
+            service_tier: None,
+            fork_turns: None,
+        };
+
+        let mut normalized = valid_args();
+        normalize_spawn_required_fields(&mut normalized).expect("valid fields");
+        assert_eq!(normalized.task_name, "worker");
+        assert_eq!(normalized.title, "Work item");
+        assert_eq!(normalized.instructions, "Do focused work.");
+
+        let mut blank_task_name = valid_args();
+        blank_task_name.task_name = "   ".to_string();
+        assert!(
+            normalize_spawn_required_fields(&mut blank_task_name)
+                .expect_err("blank task_name")
+                .to_string()
+                .contains("task_name")
+        );
+
+        let mut blank_title = valid_args();
+        blank_title.title = "\t".to_string();
+        assert!(
+            normalize_spawn_required_fields(&mut blank_title)
+                .expect_err("blank title")
+                .to_string()
+                .contains("title")
+        );
+
+        let mut blank_instructions = valid_args();
+        blank_instructions.instructions = "\n".to_string();
+        assert!(
+            normalize_spawn_required_fields(&mut blank_instructions)
+                .expect_err("blank instructions")
+                .to_string()
+                .contains("instructions")
+        );
+    }
+
+    #[test]
+    fn spawn_rejects_compact_worker_kind() {
+        let err = validate_task_kind("compact")
+            .expect_err("compaction is a controller tool, not a spawned worker kind");
+        assert!(err.to_string().contains("rampage_compact"));
+    }
+
+    #[test]
     fn support_agent_spawn_requires_substantive_worker_evidence() {
         let mut state = RampageState::new("thread-1".to_string());
         handle_control_start(
@@ -4955,10 +6241,7 @@ mod tests {
             SUPPORT_AGENT_NEW_IDEAS,
         )
         .expect_err("advisor must wait for substantive worker evidence");
-        assert!(
-            err.to_string()
-                .contains("authenticated checkpoint or terminal result")
-        );
+        assert!(err.to_string().contains("authenticated checkpoint/result"));
 
         push_completed_mission_worker(&mut state, &mission_id, "task-worker", 10);
         let worker = state.tasks.last_mut().expect("worker");
@@ -4996,6 +6279,290 @@ mod tests {
         let mission = state.active_mission().expect("mission").clone();
         ensure_support_agent_spawn_has_worker_evidence(&state, &mission, SUPPORT_AGENT_NEW_IDEAS)
             .expect("authenticated terminal result should unlock advisor spawn");
+    }
+
+    #[test]
+    fn stuck_worker_snapshot_unlocks_one_fresh_advisory_round() {
+        let mut state = RampageState::new("thread-1".to_string());
+        handle_control_start(
+            &mut state,
+            &valid_start_args("new_ideas_only"),
+            RampageToolOptions::new(ModeKind::AbsoluteRampage),
+            "thread-1".to_string(),
+        )
+        .expect("mission should start");
+        let mission_id = state.active_mission().expect("mission").id.clone();
+        let now = now_unix_timestamp_ms();
+        push_completed_mission_worker(&mut state, &mission_id, "task-stuck", now);
+        let worker = state.tasks.last_mut().expect("worker");
+        worker.status = "running".to_string();
+        worker.result = None;
+        worker.time_finished = None;
+        worker.time_started = Some(now);
+        state
+            .active_mission_mut()
+            .expect("mission")
+            .task_input_revisions
+            .insert("task-stuck".to_string(), 0);
+        let mission = state.active_mission().expect("mission").clone();
+        assert!(
+            ensure_support_agent_spawn_has_worker_evidence(
+                &state,
+                &mission,
+                SUPPORT_AGENT_NEW_IDEAS,
+            )
+            .is_err(),
+            "a newly started worker is not yet a stuck-worker review target"
+        );
+
+        state.tasks.last_mut().expect("worker").time_started =
+            Some(now.saturating_sub(ADVISOR_STUCK_WORKER_THRESHOLD_MS + 1));
+        let mission = state.active_mission().expect("mission").clone();
+        ensure_support_agent_spawn_has_worker_evidence(&state, &mission, SUPPORT_AGENT_NEW_IDEAS)
+            .expect("a bounded stuck-worker snapshot should unlock advisory review");
+        let brief = worker_brief(
+            &state,
+            &mission,
+            "task-stuck-advice",
+            &RampageSpawnArgs {
+                task_name: "new_ideas_agent".to_string(),
+                title: "Review stuck worker".to_string(),
+                instructions: "Return alternate approaches for the named worker.".to_string(),
+                kind: Some("review".to_string()),
+                role: Some("New Ideas Agent".to_string()),
+                parent_task_id: None,
+                dependencies: None,
+                model: None,
+                reasoning_effort: None,
+                service_tier: None,
+                fork_turns: None,
+            },
+            "New Ideas Agent",
+            RampageToolOptions::new(ModeKind::AbsoluteRampage),
+        );
+        assert!(brief.contains("task_id=task-stuck"));
+        assert!(brief.contains("title=Implement mission task"));
+        assert!(brief.contains("status=running"));
+        assert!(brief.contains("instructions=Do the focused work and report evidence."));
+        push_revisioned_support_agent(
+            &mut state,
+            &mission_id,
+            SUPPORT_AGENT_NEW_IDEAS,
+            "task-stuck-advice",
+        );
+        let mission = state.active_mission().expect("mission").clone();
+        support_agent_has_contributed(&state, &mission, SUPPORT_AGENT_NEW_IDEAS)
+            .expect("stuck-snapshot advice counts as a fresh contribution");
+        let err = ensure_support_agent_not_duplicated_for_current_evidence(
+            &state,
+            &mission,
+            SUPPORT_AGENT_NEW_IDEAS,
+        )
+        .expect_err("the same stuck snapshot must not spawn duplicate advice");
+        assert!(err.to_string().contains("already reviewed"));
+    }
+
+    #[test]
+    fn new_substantive_work_waits_for_selected_advisors_to_review_latest_evidence() {
+        let mut state = RampageState::new("thread-1".to_string());
+        handle_control_start(
+            &mut state,
+            &valid_start_args("both"),
+            RampageToolOptions::new(ModeKind::AbsoluteRampage),
+            "thread-1".to_string(),
+        )
+        .expect("mission should start");
+        let mission_id = state.active_mission().expect("mission").id.clone();
+        let mission = state.active_mission().expect("mission").clone();
+        ensure_selected_support_agents_reviewed_before_substantive_spawn(
+            &state, &mission, "work", None,
+        )
+        .expect("initial worker fan-out is allowed before evidence exists");
+
+        push_revisioned_mission_worker(&mut state, &mission_id, "task-worker-1");
+        let mission = state.active_mission().expect("mission").clone();
+        let err = ensure_selected_support_agents_reviewed_before_substantive_spawn(
+            &state, &mission, "work", None,
+        )
+        .expect_err("selected advisors must review returned worker evidence");
+        assert!(err.to_string().contains("New Ideas Agent"));
+
+        push_revisioned_support_agent(
+            &mut state,
+            &mission_id,
+            SUPPORT_AGENT_NEW_IDEAS,
+            "task-ideas-1",
+        );
+        push_revisioned_support_agent(
+            &mut state,
+            &mission_id,
+            SUPPORT_AGENT_EFFICIENCY,
+            "task-efficiency-1",
+        );
+        let mission = state.active_mission().expect("mission").clone();
+        ensure_selected_support_agents_reviewed_before_substantive_spawn(
+            &state, &mission, "work", None,
+        )
+        .expect("fresh advice unlocks subsequent mission work");
+
+        push_revisioned_mission_worker(&mut state, &mission_id, "task-worker-2");
+        let mission = state.active_mission().expect("mission").clone();
+        let err = ensure_selected_support_agents_reviewed_before_substantive_spawn(
+            &state, &mission, "review", None,
+        )
+        .expect_err("new worker evidence makes previous advice stale");
+        assert!(err.to_string().contains("stale"));
+    }
+
+    #[test]
+    fn substantive_worker_capacity_reserves_slots_for_selected_advisors() {
+        let mut state = RampageState::new("thread-1".to_string());
+        handle_control_start(
+            &mut state,
+            &valid_start_args("both"),
+            RampageToolOptions::new(ModeKind::AbsoluteRampage),
+            "thread-1".to_string(),
+        )
+        .expect("mission should start");
+        let mission_id = state.active_mission().expect("mission").id.clone();
+        let mission = state.active_mission().expect("mission").clone();
+        ensure_substantive_worker_capacity(&state, &mission, "work", None, Some(3))
+            .expect("one V2 worker can start while two advisor slots remain reserved");
+
+        push_revisioned_mission_worker(&mut state, &mission_id, "task-worker-1");
+        let worker = state
+            .tasks
+            .iter_mut()
+            .find(|task| task.id == "task-worker-1")
+            .expect("worker");
+        worker.status = "running".to_string();
+        worker.time_finished = None;
+        let mission = state.active_mission().expect("mission").clone();
+        let err = ensure_substantive_worker_capacity(&state, &mission, "work", None, Some(3))
+            .expect_err("V2 capacity must retain two slots for selected advisors");
+        assert!(err.to_string().contains("reserved 2 of 3 child slots"));
+        ensure_substantive_worker_capacity(
+            &state,
+            &mission,
+            "review",
+            Some(SUPPORT_AGENT_NEW_IDEAS),
+            Some(3),
+        )
+        .expect("the capacity reservation must not block its intended advisor");
+
+        assert_eq!(
+            6usize.saturating_sub(required_support_agents("both").len()),
+            4,
+            "V1 leaves four substantive slots while reserving both advisors"
+        );
+        assert_eq!(
+            3usize.saturating_sub(required_support_agents("none").len()),
+            3,
+            "missions without advisors may use all V2 child slots"
+        );
+    }
+
+    #[test]
+    fn support_agent_spawn_rejects_active_and_fresh_duplicates() {
+        let mut state = RampageState::new("thread-1".to_string());
+        handle_control_start(
+            &mut state,
+            &valid_start_args("both"),
+            RampageToolOptions::new(ModeKind::AbsoluteRampage),
+            "thread-1".to_string(),
+        )
+        .expect("mission should start");
+        let mission_id = state.active_mission().expect("mission").id.clone();
+        push_revisioned_mission_worker(&mut state, &mission_id, "task-worker-1");
+        let mission = state.active_mission().expect("mission").clone();
+        ensure_support_agent_not_duplicated_for_current_evidence(
+            &state,
+            &mission,
+            SUPPORT_AGENT_NEW_IDEAS,
+        )
+        .expect("the first advisor task is allowed");
+
+        push_revisioned_support_agent(
+            &mut state,
+            &mission_id,
+            SUPPORT_AGENT_NEW_IDEAS,
+            "task-ideas-1",
+        );
+        let mission = state.active_mission().expect("mission").clone();
+        let err = ensure_support_agent_not_duplicated_for_current_evidence(
+            &state,
+            &mission,
+            SUPPORT_AGENT_NEW_IDEAS,
+        )
+        .expect_err("fresh completed advice must not be duplicated");
+        assert!(err.to_string().contains("already reviewed"));
+
+        let advisor = state
+            .tasks
+            .iter_mut()
+            .find(|task| task.id == "task-ideas-1")
+            .expect("advisor");
+        advisor.status = "running".to_string();
+        advisor.time_finished = None;
+        let mission = state.active_mission().expect("mission").clone();
+        let err = ensure_support_agent_not_duplicated_for_current_evidence(
+            &state,
+            &mission,
+            SUPPORT_AGENT_NEW_IDEAS,
+        )
+        .expect_err("an active advisor must occupy only one slot");
+        assert!(err.to_string().contains("already has active task"));
+
+        let advisor = state
+            .tasks
+            .iter_mut()
+            .find(|task| task.id == "task-ideas-1")
+            .expect("advisor");
+        advisor.status = "done".to_string();
+        advisor.time_finished = Some(now_unix_timestamp_ms());
+        push_revisioned_mission_worker(&mut state, &mission_id, "task-worker-2");
+        let mission = state.active_mission().expect("mission").clone();
+        ensure_support_agent_not_duplicated_for_current_evidence(
+            &state,
+            &mission,
+            SUPPORT_AGENT_NEW_IDEAS,
+        )
+        .expect("new worker evidence makes the prior advice stale and permits one fresh advisor");
+    }
+
+    #[test]
+    fn non_verifier_spawn_is_rejected_while_verification_is_active() {
+        let mut state = RampageState::new("thread-1".to_string());
+        handle_control_start(
+            &mut state,
+            &valid_start_args("none"),
+            RampageToolOptions::new(ModeKind::AbsoluteRampage),
+            "thread-1".to_string(),
+        )
+        .expect("mission should start");
+        let mission_id = state.active_mission().expect("mission").id.clone();
+        push_revisioned_mission_worker(&mut state, &mission_id, "task-worker-1");
+        push_verify_task_for_current_revision(
+            &mut state,
+            &mission_id,
+            "task-verify-1",
+            100.0,
+            "All criteria pass.",
+        );
+        let verifier = state
+            .tasks
+            .iter_mut()
+            .find(|task| task.id == "task-verify-1")
+            .expect("verifier");
+        verifier.status = "running".to_string();
+        verifier.time_finished = None;
+        let mission = state.active_mission().expect("mission").clone();
+
+        let err = ensure_no_active_verifier_for_non_verifier_spawn(&state, &mission, "work")
+            .expect_err("substantive work cannot mutate an active verifier window");
+        assert!(err.to_string().contains("verifier task task-verify-1"));
+        ensure_no_active_verifier_for_non_verifier_spawn(&state, &mission, "verify")
+            .expect("the dedicated verifier gates diagnose duplicate verifier spawns");
     }
 
     #[test]
@@ -5054,7 +6621,7 @@ mod tests {
                 stop_reason: Some("The user stopped the first mission.".to_string()),
                 ..Default::default()
             },
-            Some("stop the current rampage mission"),
+            directive_from_direct_user_message("stop the current rampage mission").as_ref(),
         )
         .expect("first mission should stop");
         handle_control_start(
@@ -5254,7 +6821,7 @@ mod tests {
     }
 
     #[test]
-    fn selected_support_agent_result_allows_verified_completion() {
+    fn selected_support_agent_result_allows_verified_completion_and_retains_cleanup_ids() {
         let mut state = RampageState::new("thread-1".to_string());
         let start_args = valid_start_args("new_ideas_only");
         handle_control_start(
@@ -5296,6 +6863,15 @@ mod tests {
         handle_control_verify_result(&mut state, &verify_args, None)
             .expect("verify result recorded");
 
+        let worker_thread_id = ThreadId::new();
+        state
+            .active_mission_mut()
+            .expect("mission")
+            .worker_thread_ids
+            .insert("task-work".to_string(), worker_thread_id.to_string());
+        let workers_to_close = durable_mission_worker_thread_ids(&state, false);
+        assert_eq!(workers_to_close, vec![worker_thread_id]);
+
         let complete_args = RampageControlArgs {
             action: "complete".to_string(),
             ..Default::default()
@@ -5306,6 +6882,10 @@ mod tests {
         let mission = state.active_mission().expect("mission");
         assert_eq!(mission.status, "completed");
         assert_eq!(mission.verifier_status.as_deref(), Some("passed"));
+        assert_eq!(
+            durable_mission_worker_thread_ids(&state, false),
+            vec![worker_thread_id]
+        );
     }
 
     #[test]
@@ -6065,12 +7645,25 @@ mod tests {
         );
         assert!(required_active_mission(&state).is_err());
         assert!(
-            handle_control_resume(&mut state, Some("continue original work")).is_err(),
+            handle_control_resume(
+                &mut state,
+                directive_from_direct_user_message("continue original work").as_ref(),
+            )
+            .is_err(),
             "the user message that existed at escalation is not fresh authorization"
         );
-        assert!(handle_control_resume(&mut state, Some("what is the status?")).is_err());
-        handle_control_resume(&mut state, Some("please continue now"))
-            .expect("new explicit user resume should unlock the mission");
+        assert!(
+            handle_control_resume(
+                &mut state,
+                directive_from_direct_user_message("what is the status?").as_ref(),
+            )
+            .is_err()
+        );
+        handle_control_resume(
+            &mut state,
+            directive_from_direct_user_message("please continue now").as_ref(),
+        )
+        .expect("new explicit user resume should unlock the mission");
         let mission = state.active_mission().expect("mission");
         assert!(!mission.requires_user_resume);
         assert_eq!(mission.status, "running");

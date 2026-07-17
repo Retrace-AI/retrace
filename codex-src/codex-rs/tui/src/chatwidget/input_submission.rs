@@ -78,6 +78,8 @@ impl ChatWidget {
             user_message,
             history_record,
             ShellEscapePolicy::Allow,
+            /*final_output_json_schema*/ None,
+            /*collaboration_mode_override*/ None,
         )
         .0
     }
@@ -87,10 +89,27 @@ impl ChatWidget {
         user_message: UserMessage,
         shell_escape_policy: ShellEscapePolicy,
     ) -> Option<AppCommand> {
+        self.submit_user_message_with_shell_escape_policy_and_turn_overrides(
+            user_message,
+            shell_escape_policy,
+            /*final_output_json_schema*/ None,
+            /*collaboration_mode_override*/ None,
+        )
+    }
+
+    pub(super) fn submit_user_message_with_shell_escape_policy_and_turn_overrides(
+        &mut self,
+        user_message: UserMessage,
+        shell_escape_policy: ShellEscapePolicy,
+        final_output_json_schema: Option<serde_json::Value>,
+        collaboration_mode_override: Option<CollaborationMode>,
+    ) -> Option<AppCommand> {
         self.submit_user_message_with_history_and_shell_escape_policy(
             user_message,
             UserMessageHistoryRecord::UserMessageText,
             shell_escape_policy,
+            final_output_json_schema,
+            collaboration_mode_override,
         )
         .1
     }
@@ -100,6 +119,8 @@ impl ChatWidget {
         user_message: UserMessage,
         history_record: UserMessageHistoryRecord,
         shell_escape_policy: ShellEscapePolicy,
+        final_output_json_schema: Option<serde_json::Value>,
+        collaboration_mode_override: Option<CollaborationMode>,
     ) -> (bool, Option<AppCommand>) {
         if !self.is_session_configured() {
             tracing::warn!("cannot submit user message before session is configured; queueing");
@@ -292,7 +313,10 @@ impl ChatWidget {
             }
         }
 
-        let effective_mode = self.effective_collaboration_mode();
+        let effective_mode = collaboration_mode_override
+            .as_ref()
+            .cloned()
+            .unwrap_or_else(|| self.effective_collaboration_mode());
         if effective_mode.model().trim().is_empty() {
             self.add_error_message(
                 "Thread model is unavailable. Wait for the thread to finish syncing or choose a model before sending input.".to_string(),
@@ -312,7 +336,9 @@ impl ChatWidget {
 
         self.maybe_apply_ide_context(&mut items);
 
-        let collaboration_mode = if self.collaboration_modes_enabled() {
+        let collaboration_mode = if collaboration_mode_override.is_some() {
+            Some(effective_mode.clone())
+        } else if self.collaboration_modes_enabled() {
             self.active_collaboration_mask
                 .as_ref()
                 .map(|_| effective_mode.clone())
@@ -346,7 +372,7 @@ impl ChatWidget {
             effective_mode.reasoning_effort(),
             /*summary*/ None,
             service_tier,
-            /*final_output_json_schema*/ None,
+            final_output_json_schema,
             collaboration_mode,
             personality,
         );

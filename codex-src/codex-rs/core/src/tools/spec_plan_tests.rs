@@ -1265,8 +1265,8 @@ async fn rampage_modes_expose_durable_tools_only_on_root_controller() {
     worker.assert_registered_lacks(&["spawn_agent", "spawn_agents_on_csv"]);
 
     let bound_worker = probe(|turn| {
-        set_feature(turn, Feature::MultiAgentV2, /*enabled*/ true);
-        turn.collaboration_mode.mode = ModeKind::AbsoluteRampage;
+        set_feature(turn, Feature::Collab, /*enabled*/ true);
+        turn.collaboration_mode.mode = ModeKind::Default;
         turn.session_source = SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
             parent_thread_id: ThreadId::new(),
             depth: 1,
@@ -1282,6 +1282,18 @@ async fn rampage_modes_expose_durable_tools_only_on_root_controller() {
         "rampage_board",
         "rampage_compact",
         "rampage_spawn",
+        "spawn_agent",
+        "send_input",
+        "resume_agent",
+        "wait",
+        "close_agent",
+    ]);
+    bound_worker.assert_registered_lacks(&[
+        "spawn_agent",
+        "send_input",
+        "resume_agent",
+        "wait",
+        "close_agent",
     ]);
 
     let code_mode_worker = probe(|turn| {
@@ -1393,13 +1405,9 @@ async fn rampage_advisors_and_verifiers_have_evidence_only_capabilities() {
         |turn| {
             set_features(
                 turn,
-                &[
-                    Feature::CodeMode,
-                    Feature::CodeModeOnly,
-                    Feature::MultiAgentV2,
-                ],
+                &[Feature::CodeMode, Feature::CodeModeOnly, Feature::Collab],
             );
-            turn.collaboration_mode.mode = ModeKind::AbsoluteRampage;
+            turn.collaboration_mode.mode = ModeKind::Default;
             turn.session_source = SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
                 parent_thread_id: ThreadId::new(),
                 depth: 1,
@@ -1429,8 +1437,8 @@ async fn rampage_advisors_and_verifiers_have_evidence_only_capabilities() {
 
     let verifier = probe_with(
         |turn| {
-            set_feature(turn, Feature::MultiAgentV2, /*enabled*/ true);
-            turn.collaboration_mode.mode = ModeKind::AbsoluteRampage;
+            set_feature(turn, Feature::Collab, /*enabled*/ true);
+            turn.collaboration_mode.mode = ModeKind::Default;
             turn.session_source = SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
                 parent_thread_id: ThreadId::new(),
                 depth: 1,
@@ -1451,6 +1459,10 @@ async fn rampage_advisors_and_verifiers_have_evidence_only_capabilities() {
         "apply_patch",
         "request_permissions",
         "spawn_agent",
+        "send_input",
+        "resume_agent",
+        "wait",
+        "close_agent",
         "send_message",
         "followup_task",
         "mcp__private",
@@ -1459,11 +1471,18 @@ async fn rampage_advisors_and_verifiers_have_evidence_only_capabilities() {
         "image_generation",
         "rampage_checkpoint",
     ]);
+    verifier.assert_registered_lacks(&[
+        "spawn_agent",
+        "send_input",
+        "resume_agent",
+        "wait",
+        "close_agent",
+    ]);
 
     let readonly_worker = probe_with(
         |turn| {
-            set_feature(turn, Feature::MultiAgentV2, /*enabled*/ true);
-            turn.collaboration_mode.mode = ModeKind::ReadonlyResearch;
+            set_feature(turn, Feature::Collab, /*enabled*/ true);
+            turn.collaboration_mode.mode = ModeKind::Default;
             turn.session_source = SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
                 parent_thread_id: ThreadId::new(),
                 depth: 1,
@@ -1484,11 +1503,22 @@ async fn rampage_advisors_and_verifiers_have_evidence_only_capabilities() {
         "apply_patch",
         "request_permissions",
         "spawn_agent",
+        "send_input",
+        "resume_agent",
+        "wait",
+        "close_agent",
         "send_message",
         "mcp__private",
         "extension_echo",
         "dynamic",
         "image_generation",
+    ]);
+    readonly_worker.assert_registered_lacks(&[
+        "spawn_agent",
+        "send_input",
+        "resume_agent",
+        "wait",
+        "close_agent",
     ]);
     readonly_worker.assert_visible_contains(&["rampage_checkpoint"]);
 }

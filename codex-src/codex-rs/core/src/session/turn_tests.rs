@@ -238,8 +238,9 @@ async fn absolute_rampage_blocks_completion_with_active_durable_mission() {
     let thread_id = session.thread_id.to_string();
     let rampage_dir = turn_context.config.codex_home.as_path().join("rampage");
     std::fs::create_dir_all(&rampage_dir).expect("create rampage dir");
+    let state_path = rampage_dir.join(format!("{thread_id}.json"));
     std::fs::write(
-        rampage_dir.join(format!("{thread_id}.json")),
+        &state_path,
         serde_json::to_string_pretty(&serde_json::json!({
             "schema_version": 1,
             "root_thread_id": thread_id,
@@ -301,6 +302,108 @@ async fn absolute_rampage_blocks_completion_with_active_durable_mission() {
     assert!(prompt_text.contains("cannot complete while the durable mission is still active"));
     assert!(prompt_text.contains("rampage_control"));
     assert!(prompt_text.contains("action=complete"));
+    assert!(prompt_text.contains("blocked state is reserved for verifier escalation"));
+    assert!(!prompt_text.contains("update the mission status to blocked"));
+
+    let mut state: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&state_path).expect("read state"))
+            .expect("parse state");
+    state["missions"][0]["status"] = serde_json::json!("blocked");
+    std::fs::write(
+        &state_path,
+        serde_json::to_string_pretty(&state).expect("serialize blocked state"),
+    )
+    .expect("write blocked state");
+    assert!(
+        build_rampage_active_mission_continuation_message(
+            &session,
+            &turn_context,
+            Some("Waiting for the user."),
+            0,
+        )
+        .await
+        .is_none(),
+        "blocked missions must not force another controller sampling pass"
+    );
+    assert!(rampage_mission_waiting_for_user(&session, &turn_context).await);
+
+    state["missions"][0]["status"] = serde_json::json!("running");
+    state["missions"][0]["requires_user_resume"] = serde_json::json!(true);
+    std::fs::write(
+        &state_path,
+        serde_json::to_string_pretty(&state).expect("serialize resume-gated state"),
+    )
+    .expect("write resume-gated state");
+    assert!(
+        build_rampage_active_mission_continuation_message(
+            &session,
+            &turn_context,
+            Some("Waiting for user authorization."),
+            0,
+        )
+        .await
+        .is_none(),
+        "resume-gated missions must not force another controller sampling pass"
+    );
+}
+
+#[test]
+fn rampage_wait_state_allows_consent_round_trip_then_stops_tool_loops() {
+    let mut follow_ups = 0;
+    for expected in 1..=3 {
+        assert!(!consume_rampage_wait_state_follow_up_budget(
+            true,
+            true,
+            &mut follow_ups,
+        ));
+        assert_eq!(follow_ups, expected);
+    }
+    // verify_result -> status -> request_user_input still leaves one pass for
+    // the authenticated resume/stop action, which exits the wait state.
+    assert!(!consume_rampage_wait_state_follow_up_budget(
+        false,
+        true,
+        &mut follow_ups,
+    ));
+    assert_eq!(follow_ups, 0, "leaving the wait state resets the budget");
+    for expected in 1..=RAMPAGE_WAIT_STATE_MAX_FOLLOW_UPS {
+        assert!(!consume_rampage_wait_state_follow_up_budget(
+            true,
+            true,
+            &mut follow_ups,
+        ));
+        assert_eq!(follow_ups, expected);
+    }
+    assert!(consume_rampage_wait_state_follow_up_budget(
+        true,
+        true,
+        &mut follow_ups,
+    ));
+
+    follow_ups = 0;
+    assert!(!consume_rampage_wait_state_follow_up_budget(
+        true,
+        false,
+        &mut follow_ups,
+    ));
+    assert_eq!(follow_ups, 0, "pending input alone does not consume budget");
+}
+
+#[test]
+fn rampage_wait_state_defers_mid_turn_compaction_for_bounded_handshake() {
+    assert!(!should_defer_rampage_wait_state_compaction(true, true, 0));
+    for follow_ups in 1..=RAMPAGE_WAIT_STATE_MAX_FOLLOW_UPS {
+        assert!(should_defer_rampage_wait_state_compaction(
+            true, true, follow_ups,
+        ));
+    }
+    assert!(!should_defer_rampage_wait_state_compaction(
+        true,
+        true,
+        RAMPAGE_WAIT_STATE_MAX_FOLLOW_UPS + 1,
+    ));
+    assert!(!should_defer_rampage_wait_state_compaction(false, true, 1,));
+    assert!(!should_defer_rampage_wait_state_compaction(true, false, 1,));
 }
 
 #[tokio::test]
@@ -743,6 +846,22 @@ fn rampage_startup_guard_rejects_malformed_missing_and_non_distinct_answers() {
             r#"{"action":"start","support_agents":"both","verifier_pass_threshold":80,"verifier_max_failures":3}"#,
         ),
     ));
+}
+
+#[test]
+fn rampage_startup_guard_accepts_descriptive_percent_labels() {
+    assert_eq!(
+        parse_verifier_pass_threshold("100% (Full Audit)"),
+        Some(100.0)
+    );
+    assert_eq!(
+        parse_verifier_pass_threshold("Pass threshold 90% (Recommended)"),
+        Some(90.0)
+    );
+    assert_eq!(parse_verifier_pass_threshold("80%"), Some(80.0));
+    assert_eq!(parse_verifier_pass_threshold("80"), Some(80.0));
+    assert_eq!(parse_verifier_pass_threshold("pass 90"), None);
+    assert_eq!(parse_verifier_pass_threshold("not a percent"), None);
 }
 
 #[test]

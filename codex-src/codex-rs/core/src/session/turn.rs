@@ -197,6 +197,7 @@ pub(crate) async fn run_turn(
     let mut stop_hook_active = false;
     let mut mid_task_status_forced_continuations = 0usize;
     let mut rampage_active_mission_forced_continuations = 0usize;
+    let mut rampage_wait_state_follow_ups = 0usize;
     // The startup gate (ask the mandatory questions, then start the mission) must only
     // fire for a brand-new mission. If a mission is already active for this thread, a
     // mid-mission user message must not re-trigger the questions or block tools; the
@@ -293,6 +294,21 @@ pub(crate) async fn run_turn(
                 can_drain_pending_input = true;
                 let has_pending_input = sess.input_queue.has_pending_input(&sess.active_turn).await;
                 let needs_follow_up = model_needs_follow_up || has_pending_input;
+                let rampage_waiting_for_user = rampage_controller_turn
+                    && rampage_mission_waiting_for_user(&sess, turn_context.as_ref()).await;
+                if consume_rampage_wait_state_follow_up_budget(
+                    rampage_waiting_for_user,
+                    model_needs_follow_up,
+                    &mut rampage_wait_state_follow_ups,
+                ) {
+                    break;
+                }
+                let defer_auto_compact_for_rampage_handshake =
+                    should_defer_rampage_wait_state_compaction(
+                        rampage_waiting_for_user,
+                        model_needs_follow_up,
+                        rampage_wait_state_follow_ups,
+                    );
                 let token_status =
                     auto_compact_token_status(sess.as_ref(), turn_context.as_ref()).await;
                 let token_limit_reached = token_status.token_limit_reached;
@@ -315,11 +331,15 @@ pub(crate) async fn run_turn(
                     model_needs_follow_up,
                     has_pending_input,
                     needs_follow_up,
+                    defer_auto_compact_for_rampage_handshake,
                     "post sampling token usage"
                 );
 
                 // as long as compaction works well in getting us way below the token limit, we shouldn't worry about being in an infinite loop.
-                if token_limit_reached && needs_follow_up {
+                if token_limit_reached
+                    && needs_follow_up
+                    && !defer_auto_compact_for_rampage_handshake
+                {
                     if let Err(err) = run_auto_compact(
                         &sess,
                         &turn_context,
@@ -355,6 +375,9 @@ pub(crate) async fn run_turn(
                         )
                         .await;
                         continue;
+                    }
+                    if rampage_waiting_for_user {
+                        break;
                     }
                     if let Some(hook_prompt_message) = build_active_exec_continuation_message(
                         &sess,
@@ -871,7 +894,11 @@ fn parse_support_agents_answer(answer: &str) -> Option<String> {
 
 fn parse_verifier_pass_threshold(answer: &str) -> Option<f64> {
     let answer = strip_recommended_suffix(answer);
-    let value = answer.strip_suffix('%').unwrap_or(answer).trim();
+    let value = if let Some((value, _label)) = answer.split_once('%') {
+        value.split_whitespace().last()?
+    } else {
+        answer.trim()
+    };
     let value = value.parse::<f64>().ok()?;
     (value.is_finite() && (0.0..=100.0).contains(&value)).then_some(value)
 }
@@ -1296,6 +1323,9 @@ async fn build_rampage_active_mission_continuation_message(
             )]);
         }
     };
+    if status.status == "blocked" || status.requires_user_resume {
+        return None;
+    }
 
     let previous = last_agent_message
         .map(str::trim)
@@ -1310,7 +1340,7 @@ async fn build_rampage_active_mission_continuation_message(
     let verifier = status.verifier_status.as_deref().unwrap_or("not recorded");
     let mode_name = turn_context.collaboration_mode.mode.display_name();
     let prompt = format!(
-        "{mode_name} mode cannot complete while the durable mission is still active.\n\nMission: {title} ({id})\nStatus: {status_value}; phase: {phase}; verifier: {verifier}\nWorkers: active {active_tasks}, done {done_tasks}, blocked {blocked_tasks}, total {total_tasks}; active Questboard items: {board_items}\nState file: {state_path}{previous}\n\nContinue the Mission Control loop now: call `rampage_control` action=status or update, `wait_agent` for running workers, record worker outputs with `rampage_control` action=task_result, write Questboard evidence with `rampage_board`, create `rampage_compact` before context gets large, run/record verifier status, and only finish after `rampage_control` action=complete succeeds. If external input is truly needed, use `request_user_input` and update the mission status to blocked.{repeated_guidance}",
+        "{mode_name} mode cannot complete while the durable mission is still active.\n\nMission: {title} ({id})\nStatus: {status_value}; phase: {phase}; verifier: {verifier}\nWorkers: active {active_tasks}, done {done_tasks}, blocked {blocked_tasks}, total {total_tasks}; active Questboard items: {board_items}\nState file: {state_path}{previous}\n\nContinue the Mission Control loop now: call `rampage_control` action=status or update, `wait_agent` for running workers, record worker outputs with `rampage_control` action=task_result, write Questboard evidence with `rampage_board`, create `rampage_compact` before context gets large, run/record verifier status, and only finish after `rampage_control` action=complete succeeds. If external input is truly needed, use `request_user_input` and wait for the user without changing mission status; blocked state is reserved for verifier escalation.{repeated_guidance}",
         title = status.title,
         id = status.id,
         status_value = status.status,
@@ -1326,6 +1356,48 @@ async fn build_rampage_active_mission_continuation_message(
         prompt,
         "rampage-active-mission-continue",
     )])
+}
+
+async fn rampage_mission_waiting_for_user(sess: &Session, turn_context: &TurnContext) -> bool {
+    incomplete_mission_status_for_thread(
+        turn_context.config.codex_home.as_path(),
+        &sess.thread_id.to_string(),
+    )
+    .await
+    .ok()
+    .flatten()
+    .is_some_and(|status| status.status == "blocked" || status.requires_user_resume)
+}
+
+const RAMPAGE_WAIT_STATE_MAX_FOLLOW_UPS: usize = 4;
+
+fn should_defer_rampage_wait_state_compaction(
+    waiting_for_user: bool,
+    model_needs_follow_up: bool,
+    follow_ups: usize,
+) -> bool {
+    waiting_for_user
+        && model_needs_follow_up
+        && (1..=RAMPAGE_WAIT_STATE_MAX_FOLLOW_UPS).contains(&follow_ups)
+}
+
+fn consume_rampage_wait_state_follow_up_budget(
+    waiting_for_user: bool,
+    model_needs_follow_up: bool,
+    follow_ups: &mut usize,
+) -> bool {
+    if !waiting_for_user {
+        *follow_ups = 0;
+        return false;
+    }
+    if !model_needs_follow_up {
+        return false;
+    }
+    if *follow_ups >= RAMPAGE_WAIT_STATE_MAX_FOLLOW_UPS {
+        return true;
+    }
+    *follow_ups += 1;
+    false
 }
 
 fn build_mid_task_status_continuation_message(
