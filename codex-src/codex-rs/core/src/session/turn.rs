@@ -850,6 +850,28 @@ fn request_user_input_questions(arguments: &str) -> Vec<RampageStartupQuestion> 
 fn rampage_startup_question_category(
     question: &RequestUserInputQuestion,
 ) -> Option<RampageStartupQuestionCategory> {
+    let id = normalize_rampage_token(&question.id);
+    match id.as_str() {
+        "support_agents" | "support_agent" | "advisory_agents" => {
+            return Some(RampageStartupQuestionCategory::SupportAgents);
+        }
+        "verifier_pass_threshold"
+        | "pass_percentage"
+        | "pass_pct"
+        | "pass_percent"
+        | "verification_pass_threshold" => {
+            return Some(RampageStartupQuestionCategory::VerifierPassThreshold);
+        }
+        "verifier_max_failures"
+        | "max_attempts"
+        | "max_failures"
+        | "max_tries"
+        | "verification_max_failures" => {
+            return Some(RampageStartupQuestionCategory::VerifierMaxFailures);
+        }
+        _ => {}
+    }
+
     let text = format!("{} {}", question.header, question.question).to_ascii_lowercase();
     let support = text.contains("support") && text.contains("agent");
     let verifier = text.contains("verif");
@@ -882,6 +904,15 @@ fn strip_recommended_suffix(answer: &str) -> &str {
 
 fn parse_support_agents_answer(answer: &str) -> Option<String> {
     match normalize_rampage_token(strip_recommended_suffix(answer)).as_str() {
+        "advisory"
+        | "advisor"
+        | "advisory_agent"
+        | "advisory_only"
+        | "one_advisory_agent"
+        | "single_advisory_agent"
+        | "combined_advisory_agent"
+        | "single_combined_advisor"
+        | "one_combined_advisor" => Some("advisory".to_string()),
         "both" | "both_support_agents" => Some("both".to_string()),
         "new_ideas_only" | "new_ideas_agent_only" => Some("new_ideas_only".to_string()),
         "efficiency_only" | "efficiency_monitoring_only" | "efficiency_monitoring_agent_only" => {
@@ -912,9 +943,12 @@ fn parse_verifier_max_failures_value(value: &str) -> Option<RampageVerifierMaxFa
     if matches!(normalized.as_str(), "infinite" | "unlimited" | "none") {
         return Some(RampageVerifierMaxFailures::Infinite);
     }
+    if let Ok(value) = normalized.parse::<u64>() {
+        return Some(RampageVerifierMaxFailures::Bounded(value));
+    }
     normalized
-        .parse::<u64>()
-        .ok()
+        .split('_')
+        .find_map(|token| token.parse::<u64>().ok())
         .map(RampageVerifierMaxFailures::Bounded)
 }
 
@@ -922,6 +956,7 @@ fn rampage_startup_configuration(arguments: &str) -> Option<RampageStartupConfig
     let value = serde_json::from_str::<serde_json::Value>(arguments).ok()?;
     let support_agents = value.get("support_agents")?.as_str()?;
     let support_agents = match normalize_rampage_token(support_agents).as_str() {
+        "advisory" | "advisory_agent" | "advisor" => "advisory",
         "both" => "both",
         "new_ideas_only" => "new_ideas_only",
         "efficiency_only" => "efficiency_only",

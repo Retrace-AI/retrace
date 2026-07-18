@@ -83,6 +83,7 @@ struct NormalizedRalphLoop {
     prompt: String,
     #[serde(
         alias = "iterations",
+        alias = "iteration_count",
         alias = "max_iters",
         alias = "iteration_limit",
         alias = "count"
@@ -807,6 +808,7 @@ fn required_field_aliases(field: &str) -> &'static [&'static str] {
         "max_iterations" => &[
             "max_iterations",
             "iterations",
+            "iteration_count",
             "max_iters",
             "iteration_limit",
             "count",
@@ -971,7 +973,7 @@ fn apply_prompt_loop_normalization(
                 raw_completion_promise,
                 normalized.completion_promise,
             )?;
-            if completion_promise.is_some() && detect_ralph_completion_promise(prompt)?.is_some() {
+            if completion_promise.is_some() && detect_ralph_completion_promise(prompt)?.intent {
                 return Err(
                     "The normalized RalphLoop prompt still contains the extracted completion-promise control, so RalphLoop was not started."
                         .to_string(),
@@ -1326,9 +1328,21 @@ fn parse_count_phrase(value: &[String]) -> Option<u64> {
     }
 }
 
-fn detect_ralph_completion_promise(value: &str) -> Result<Option<String>, String> {
+#[derive(Debug, Default, PartialEq, Eq)]
+struct CompletionPromiseDetection {
+    /// The user explicitly asked for a completion promise using either the
+    /// exact `--completion-promise` flag or natural language such as
+    /// `completion promise is disk space`.
+    intent: bool,
+    /// Exact value when it can be verified locally. Natural-language forms are
+    /// intentionally value-less because the local parser cannot reliably split
+    /// task text from the promise phrase without the setup model.
+    exact_value: Option<String>,
+}
+
+fn detect_ralph_completion_promise(value: &str) -> Result<CompletionPromiseDetection, String> {
     let tokens = raw_argument_tokens(value)?;
-    let mut detected = None;
+    let mut detected = CompletionPromiseDetection::default();
     let mut index = 0;
     while index < tokens.len() {
         let raw = &value[tokens[index].start..tokens[index].end];
@@ -1347,37 +1361,74 @@ fn detect_ralph_completion_promise(value: &str) -> Result<Option<String>, String
             return Err("--completion-promise must not be empty.".to_string());
         }
         if detected
+            .exact_value
             .as_ref()
-            .is_some_and(|existing: &String| existing != &promise)
+            .is_some_and(|existing| existing != &promise)
         {
             return Err(
                 "Conflicting --completion-promise values, so RalphLoop was not started."
                     .to_string(),
             );
         }
-        detected = Some(promise);
+        detected.intent = true;
+        detected.exact_value = Some(promise);
         index += consumed;
+    }
+
+    if detected.intent {
+        return Ok(detected);
+    }
+
+    if has_natural_ralph_completion_promise_intent(value) {
+        detected.intent = true;
     }
     Ok(detected)
 }
 
+fn has_natural_ralph_completion_promise_intent(value: &str) -> bool {
+    let lower = value.to_ascii_lowercase();
+    let natural_markers = [
+        "completion promise is",
+        "completion promise:",
+        "completion promise=",
+        "completeion promise is",
+        "completeion promise:",
+        "completeion promise=",
+        "is completion promise",
+        "is the completion promise",
+        "is completeion promise",
+        "is the completeion promise",
+    ];
+    natural_markers.iter().any(|marker| lower.contains(marker))
+}
+
 fn reconcile_ralph_completion_promise(
-    raw: Option<String>,
+    raw: CompletionPromiseDetection,
     normalized: Option<String>,
 ) -> Result<Option<String>, String> {
-    match (raw, normalized) {
-        (Some(expected), Some(actual)) if expected == actual => Ok(Some(expected)),
-        (Some(expected), Some(actual)) => Err(format!(
+    match (raw.intent, raw.exact_value, normalized) {
+        (true, Some(expected), Some(actual)) if expected == actual => Ok(Some(expected)),
+        (true, Some(expected), Some(actual)) => Err(format!(
             "The RalphLoop command requested completion promise `{expected}`, but the setup model returned `{actual}`. RalphLoop was not started."
         )),
-        (Some(expected), None) => Err(format!(
+        (true, Some(expected), None) => Err(format!(
             "The setup model did not preserve the requested completion promise `{expected}`, so RalphLoop was not started."
         )),
-        (None, Some(_)) => Err(
+        (true, None, Some(actual)) if !actual.trim().is_empty() => Ok(Some(actual)),
+        (true, None, Some(_)) => Err(
+            "The setup model returned an empty completion promise, so RalphLoop was not started."
+                .to_string(),
+        ),
+        (true, None, None) => Err(
+            "The setup model did not resolve the requested completion promise, so RalphLoop was not started."
+                .to_string(),
+        ),
+        (false, None, Some(_)) => Err(
             "The setup model invented a completion promise that was not requested, so RalphLoop was not started."
                 .to_string(),
         ),
-        (None, None) => Ok(None),
+        (false, None, None) => Ok(None),
+        (false, Some(_), _) => unreachable!("exact completion promise implies intent"),
     }
 }
 
@@ -2172,17 +2223,32 @@ mod tests {
         assert_eq!(
             detect_ralph_completion_promise("check deploy --completion-promise 'ALL DONE'")
                 .expect("valid completion promise"),
-            Some("ALL DONE".to_string())
+            CompletionPromiseDetection {
+                intent: true,
+                exact_value: Some("ALL DONE".to_string()),
+            }
         );
         assert_eq!(
-            detect_ralph_completion_promise("check deploy --completion-promise=\"ALL DONE\"")
+            detect_ralph_completion_promise(r#"check deploy --completion-promise="ALL DONE""#)
                 .expect("valid inline completion promise"),
-            Some("ALL DONE".to_string())
+            CompletionPromiseDetection {
+                intent: true,
+                exact_value: Some("ALL DONE".to_string()),
+            }
         );
-        assert!(reconcile_ralph_completion_promise(None, Some("DONE".to_string())).is_err());
         assert!(
             reconcile_ralph_completion_promise(
-                Some("ALL DONE".to_string()),
+                CompletionPromiseDetection::default(),
+                Some("DONE".to_string())
+            )
+            .is_err()
+        );
+        assert!(
+            reconcile_ralph_completion_promise(
+                CompletionPromiseDetection {
+                    intent: true,
+                    exact_value: Some("ALL DONE".to_string()),
+                },
                 Some("DONE".to_string())
             )
             .is_err()
@@ -2404,6 +2470,58 @@ mod tests {
             /*defer_submission*/ false,
         );
         assert!(promise_chat.prompt_loop.is_none());
+    }
+
+    #[tokio::test]
+    async fn ralph_normalization_accepts_iteration_count_alias_and_natural_promise() {
+        let (mut chat, _event_rx, mut op_rx) =
+            crate::chatwidget::tests::make_chatwidget_manual(/*model_override*/ None).await;
+        chat.thread_id = Some(ThreadId::new());
+        chat.handle_ralphloop_command_args(
+            "df -h 5 times getting disk space is completion promise".to_string(),
+        );
+        let _normalizer = crate::chatwidget::tests::next_submit_op(&mut op_rx);
+        chat.input_queue.user_turn_pending_start = false;
+        chat.on_prompt_loop_turn_complete(
+            r#"{"task_prompt":"df -h","iteration_count":5,"completion_promise":"getting disk space"}"#,
+            /*defer_submission*/ false,
+        );
+        let first = crate::chatwidget::tests::next_submit_op(&mut op_rx);
+        let AppCommand::UserTurn { items, .. } = first else {
+            panic!("expected first RalphLoop iteration");
+        };
+        assert!(items.iter().any(|item| {
+            matches!(item, UserInput::Text { text, .. } if text.contains("df -h"))
+        }));
+        assert!(items.iter().any(|item| {
+            matches!(item, UserInput::Text { text, .. } if text.contains("<promise>getting disk space</promise>"))
+        }));
+    }
+
+    #[tokio::test]
+    async fn ralph_normalization_accepts_typoed_completion_promise_marker() {
+        let (mut chat, _event_rx, mut op_rx) =
+            crate::chatwidget::tests::make_chatwidget_manual(/*model_override*/ None).await;
+        chat.thread_id = Some(ThreadId::new());
+        chat.handle_ralphloop_command_args(
+            "5 times do df -h completeion promise is disk space".to_string(),
+        );
+        let _normalizer = crate::chatwidget::tests::next_submit_op(&mut op_rx);
+        chat.input_queue.user_turn_pending_start = false;
+        chat.on_prompt_loop_turn_complete(
+            r#"{"task_prompt":"do df -h","iteration_count":5,"completion_promise":"disk space"}"#,
+            /*defer_submission*/ false,
+        );
+        let first = crate::chatwidget::tests::next_submit_op(&mut op_rx);
+        let AppCommand::UserTurn { items, .. } = first else {
+            panic!("expected first RalphLoop iteration");
+        };
+        assert!(items.iter().any(|item| {
+            matches!(item, UserInput::Text { text, .. } if text.contains("do df -h"))
+        }));
+        assert!(items.iter().any(|item| {
+            matches!(item, UserInput::Text { text, .. } if text.contains("<promise>disk space</promise>"))
+        }));
     }
 
     #[tokio::test]

@@ -110,6 +110,46 @@ fn startup_answers(support_agents: &str, pass_threshold: &str, max_failures: &st
     .to_string()
 }
 
+fn advisory_startup_question_arguments_with_live_ids() -> String {
+    serde_json::json!({
+        "questions": [
+            {
+                "id": "support_agents",
+                "header": "Support Agents",
+                "question": "Enable optional support agents for this ABSOLUTE RAMPAGE MODE mission?",
+                "options": [{
+                    "label": "One advisory agent (Recommended)",
+                    "description": "Enable a single combined Advisory Agent."
+                }]
+            },
+            {
+                "id": "pass_percentage",
+                "header": "Pass %",
+                "question": "What percentage of the success criteria counts as a verification pass?",
+                "options": [{"label": "80% (Recommended)", "description": "Default threshold."}]
+            },
+            {
+                "id": "max_attempts",
+                "header": "Max Attempts",
+                "question": "After how many failed verification rounds should Mission Control stop and flag you?",
+                "options": [{"label": "1 (Recommended)", "description": "Stop after one failure."}]
+            }
+        ]
+    })
+    .to_string()
+}
+
+fn advisory_startup_answers_with_live_ids() -> String {
+    serde_json::json!({
+        "answers": {
+            "support_agents": {"answers": ["One advisory agent (Recommended)"]},
+            "pass_percentage": {"answers": ["80% (Recommended)"]},
+            "max_attempts": {"answers": ["1 (Recommended)"]}
+        }
+    })
+    .to_string()
+}
+
 fn observe_startup_questions(
     guard: &mut RampageStartupGuard,
     arguments: &str,
@@ -729,6 +769,71 @@ fn rampage_startup_guard_accepts_matching_answers_only_after_successful_start_ou
     assert!(!guard.should_block_tool_call(&tool_identity("exec_command"), None));
     assert!(guard.should_block_tool_call(&tool_identity("spawn_agent"), None));
     assert!(!guard.should_block_tool_call(&tool_identity("rampage_spawn"), None));
+}
+
+#[test]
+fn rampage_startup_guard_accepts_live_advisory_startup_shape() {
+    let input = vec![user_text_turn_input(
+        "can you do a security audit on this machine and give me a report",
+    )];
+    let mut guard = RampageStartupGuard::new(
+        ModeKind::AbsoluteRampage,
+        &input,
+        /*mission_already_active*/ false,
+        /*preexisting_mission_id*/ None,
+        /*controller_turn*/ true,
+    );
+
+    observe_startup_questions(
+        &mut guard,
+        &advisory_startup_question_arguments_with_live_ids(),
+        &advisory_startup_answers_with_live_ids(),
+        Some(true),
+    );
+
+    let start_arguments = r#"{"action":"start","support_agents":"advisory","verifier_pass_threshold":80,"verifier_max_failures":1}"#;
+    assert!(
+        !guard.should_block_tool_call(&tool_identity("rampage_control"), Some(start_arguments),),
+        "advisory startup answers should match support_agents=advisory start args"
+    );
+    let start_identity = tool_identity("rampage_control");
+    guard.observe_tool_call(&start_identity, Some(start_arguments));
+    guard.observe_tool_output(&ResponseItem::FunctionCallOutput {
+        call_id: start_identity.call_id,
+        output: FunctionCallOutputPayload {
+            body: FunctionCallOutputBody::Text(
+                r#"{"ok":true,"message":"mission started"}"#.to_string(),
+            ),
+            success: Some(true),
+        },
+    });
+    assert!(!guard.should_block_tool_call(&tool_identity("exec_command"), None));
+}
+
+#[test]
+fn readonly_research_startup_guard_accepts_live_advisory_startup_shape() {
+    let input = vec![user_text_turn_input(
+        "research how the current implementation works",
+    )];
+    let mut guard = RampageStartupGuard::new(
+        ModeKind::ReadonlyResearch,
+        &input,
+        /*mission_already_active*/ false,
+        /*preexisting_mission_id*/ None,
+        /*controller_turn*/ true,
+    );
+
+    observe_startup_questions(
+        &mut guard,
+        &advisory_startup_question_arguments_with_live_ids(),
+        &advisory_startup_answers_with_live_ids(),
+        Some(true),
+    );
+
+    let start_arguments = r#"{"action":"start","support_agents":"advisory","verifier_pass_threshold":80,"verifier_max_failures":1}"#;
+    assert!(
+        !guard.should_block_tool_call(&tool_identity("rampage_control"), Some(start_arguments),)
+    );
 }
 
 #[test]
