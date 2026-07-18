@@ -184,8 +184,7 @@ async fn prepare_startup_tooltip_override_prompts_to_add_models_when_none_config
         .expect("config");
 
     // With no models available the tip must steer to /model, even on first run.
-    let tooltip =
-        prepare_startup_tooltip_override(&mut config, &[], /*is_first_run*/ true).await;
+    let tooltip = prepare_startup_tooltip_override(&mut config, &[], /*is_first_run*/ true).await;
 
     let tooltip = tooltip.expect("no-models tooltip should be present");
     assert!(

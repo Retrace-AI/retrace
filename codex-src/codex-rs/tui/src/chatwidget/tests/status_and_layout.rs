@@ -298,6 +298,49 @@ async fn flush_answer_stream_keeps_default_reflow_for_plain_text_tail() {
 }
 
 #[tokio::test]
+async fn inline_think_block_does_not_leak_and_records_reasoning() {
+    // Local OpenAI-compatible models sometimes emit `<think>...</think>` inside
+    // normal assistant text, split across streaming chunks. The visible answer
+    // must stay clean, and the hidden reasoning must be recorded so
+    // `/thinking show` can surface it.
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    chat.handle_thinking_command_args("show".to_string());
+    while rx.try_recv().is_ok() {}
+
+    for chunk in ["Hello ", "<thi", "nk>secret plan", "</thi", "nk> World"] {
+        chat.on_agent_message_delta(chunk.to_string());
+    }
+    chat.flush_answer_stream_with_separator();
+
+    let mut consolidated_source: Option<String> = None;
+    let mut history = Vec::new();
+    while let Ok(event) = rx.try_recv() {
+        match event {
+            AppEvent::ConsolidateAgentMessage { source, .. } => consolidated_source = Some(source),
+            AppEvent::InsertHistoryCell(cell) => {
+                history.push(lines_to_single_string(&cell.transcript_lines(/*width*/ 80)));
+            }
+            _ => {}
+        }
+    }
+
+    let visible = consolidated_source.unwrap_or_default();
+    assert!(
+        !visible.contains("secret plan") && !visible.to_ascii_lowercase().contains("<think>"),
+        "visible answer leaked reasoning: {visible:?}"
+    );
+    assert!(
+        visible.contains("Hello") && visible.contains("World"),
+        "visible answer lost normal text: {visible:?}"
+    );
+    let combined_history = history.join("\n");
+    assert!(
+        combined_history.contains("secret plan"),
+        "expected hidden reasoning to be recorded for /thinking show: {combined_history:?}"
+    );
+}
+
+#[tokio::test]
 async fn flush_answer_stream_requests_scrollback_reflow_for_live_table_tail() {
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
     let cwd = chat.config.cwd.to_path_buf();

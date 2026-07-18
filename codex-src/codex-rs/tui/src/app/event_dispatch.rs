@@ -461,6 +461,10 @@ impl App {
                 self.chat_widget.start_model_reprobe(model_id);
                 tui.frame_requester().schedule_frame();
             }
+            AppEvent::OpenModelAddPicker => {
+                self.chat_widget.open_model_add_picker();
+                tui.frame_requester().schedule_frame();
+            }
             AppEvent::CodexOsModelAddListLoaded { result } => {
                 self.chat_widget.on_codexos_model_add_list_loaded(result);
                 tui.frame_requester().schedule_frame();
@@ -471,7 +475,16 @@ impl App {
                 tui.frame_requester().schedule_frame();
             }
             AppEvent::OpenModelContextPopup { model, effort } => {
-                self.chat_widget.open_model_context_popup(model, effort);
+                self.chat_widget.begin_model_sizing(model, effort);
+                tui.frame_requester().schedule_frame();
+            }
+            AppEvent::ModelSavedLimitsLoaded {
+                model,
+                effort,
+                limits,
+            } => {
+                self.chat_widget
+                    .on_model_saved_limits_loaded(model, effort, limits);
                 tui.frame_requester().schedule_frame();
             }
             AppEvent::ModelContextSelected {

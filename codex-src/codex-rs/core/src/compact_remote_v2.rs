@@ -332,6 +332,9 @@ async fn run_remote_compaction_request_v2(
         .min(MAX_REMOTE_COMPACTION_V2_STREAM_RETRIES);
     let mut retries = 0;
     loop {
+        let _llm_call_permit = sess
+            .acquire_llm_call_slot_with_wait_notice(turn_context)
+            .await;
         let result = match client_session
             .stream(
                 prompt,
@@ -348,6 +351,7 @@ async fn run_remote_compaction_request_v2(
             Ok(stream) => collect_compaction_output(stream).await,
             Err(err) => Err(err),
         };
+        drop(_llm_call_permit);
 
         match result {
             Ok(compaction_output) => return Ok(compaction_output),

@@ -44,12 +44,15 @@ use tracing::warn;
 
 pub(crate) use self::execution::AgentExecutionGuard;
 use self::execution::AgentExecutionLimiter;
+use self::llm_call_limiter::LlmCallLimiter;
+pub(crate) use self::llm_call_limiter::LlmCallPermit;
 use self::residency::V2Residency;
 
 const ROOT_LAST_TASK_MESSAGE: &str = "Main thread";
 
 mod execution;
 mod legacy;
+mod llm_call_limiter;
 mod residency;
 mod spawn;
 
@@ -99,6 +102,11 @@ pub(crate) struct AgentControl {
     state: Arc<AgentRegistry>,
     v2_residency: Arc<V2Residency>,
     agent_execution_limiter: Arc<AgentExecutionLimiter>,
+    /// Shared fair limiter capping how many LLM sampling streams can run at once
+    /// across the root agent and every sub-agent spawned beneath it. Cloned (as
+    /// an `Arc`) into every sub-agent via `AgentControl::clone`, so the whole
+    /// mission tree contends for the same two slots.
+    llm_call_limiter: Arc<LlmCallLimiter>,
 }
 
 impl AgentControl {

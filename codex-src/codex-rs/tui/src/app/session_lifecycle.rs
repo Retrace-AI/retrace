@@ -656,6 +656,18 @@ impl App {
 
     pub(super) fn fresh_session_config(&self) -> Config {
         let mut config = self.config.clone();
+        // `/new` must not silently reset the model/variant the user is currently
+        // running. `refresh_in_memory_config_from_disk_best_effort` (called just
+        // before this) can pull stale model + reasoning-effort values back from
+        // disk, which made `/new` drop the live variant selection. Mirror the
+        // side-fork carryover so a fresh session keeps the currently selected
+        // model, reasoning effort, and service tier; the user can still change
+        // them afterwards with `/model`.
+        let current_model = self.chat_widget.current_model();
+        if !current_model.trim().is_empty() {
+            config.model = Some(current_model.to_string());
+        }
+        config.model_reasoning_effort = self.chat_widget.current_reasoning_effort();
         config.service_tier = self.chat_widget.configured_service_tier();
         config
     }

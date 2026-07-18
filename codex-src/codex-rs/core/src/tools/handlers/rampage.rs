@@ -58,6 +58,16 @@ const RAMPAGE_SPAWN_TOOL: &str = "rampage_spawn";
 const RAMPAGE_CHECKPOINT_TOOL: &str = "rampage_checkpoint";
 const SUPPORT_AGENT_NEW_IDEAS: &str = "new_ideas";
 const SUPPORT_AGENT_EFFICIENCY: &str = "efficiency";
+/// Single combined advisory agent that replaces the separate New Ideas +
+/// Efficiency monitors: it does both jobs (unstuck ideas AND efficiency/pruning
+/// review) in one worker slot, and — unlike the two legacy monitors — is asked
+/// to inspect the workers' actual output/checkpoints, not just board summaries.
+const SUPPORT_AGENT_ADVISORY: &str = "advisory";
+/// Rampage workers must run in small, observable waves. This is intentionally
+/// stricter than the generic multi-agent thread limit: the mission controller
+/// may queue more work on the Questboard, but it must not keep more than this
+/// many substantive workers active at once.
+const MAX_ACTIVE_RAMPAGE_SUBSTANTIVE_WORKERS: usize = 3;
 const RESULT_TASK_LIMIT: usize = 8;
 const RESULT_BOARD_LIMIT: usize = 8;
 const RESULT_BRIEF_LIMIT: usize = 1;
@@ -1028,7 +1038,7 @@ fn handle_control_start(
         .filter(|value| !value.is_empty())
         .ok_or_else(|| {
             FunctionCallError::RespondToModel(
-                "rampage_control start requires support_agents from the startup question; call request_user_input first with Both support agents, New Ideas only, Efficiency only, or No support agents".to_string(),
+                "rampage_control start requires support_agents from the startup question; call request_user_input first with One advisory agent, Both support agents, New Ideas only, Efficiency only, or No support agents".to_string(),
             )
         })
         .map(normalize_token)?;
@@ -2657,7 +2667,13 @@ fn create_rampage_control_tool(options: RampageToolOptions) -> ToolSpec {
     properties.insert(
         "support_agents".to_string(),
         JsonSchema::string_enum(
-            strings(&["both", "new_ideas_only", "efficiency_only", "none"]),
+            strings(&[
+                "advisory",
+                "both",
+                "new_ideas_only",
+                "efficiency_only",
+                "none",
+            ]),
             Some("Startup support-agent choice gathered from request_user_input.".to_string()),
         ),
     );
@@ -4415,12 +4431,12 @@ fn ensure_no_active_mission_tasks(
 fn validate_support_agents(value: &str) -> Result<(), FunctionCallError> {
     if matches!(
         value,
-        "both" | "new_ideas_only" | "efficiency_only" | "none"
+        "both" | "new_ideas_only" | "efficiency_only" | "advisory" | "none"
     ) {
         Ok(())
     } else {
         Err(FunctionCallError::RespondToModel(format!(
-            "invalid support_agents `{value}`; use both, new_ideas_only, efficiency_only, or none"
+            "invalid support_agents `{value}`; use advisory, both, new_ideas_only, efficiency_only, or none"
         )))
     }
 }
@@ -4536,13 +4552,15 @@ fn ensure_substantive_worker_capacity(
         return Ok(());
     };
     let reserved_support_slots = required_support_agents(&mission.support_agents).len();
-    let substantive_limit = if max_child_threads == 0 {
+    let configured_substantive_limit = if max_child_threads == 0 {
         0
     } else {
         max_child_threads
             .saturating_sub(reserved_support_slots)
             .max(1)
     };
+    let substantive_limit =
+        configured_substantive_limit.min(MAX_ACTIVE_RAMPAGE_SUBSTANTIVE_WORKERS);
     let active_substantive_workers = state
         .tasks
         .iter()
@@ -4555,7 +4573,7 @@ fn ensure_substantive_worker_capacity(
     }
 
     Err(FunctionCallError::RespondToModel(format!(
-        "rampage_spawn reserved {reserved_support_slots} of {max_child_threads} child slots for the selected support agents; {active_substantive_workers}/{substantive_limit} substantive worker slots are already active. Wait for and record current worker evidence, then spawn the selected advisors to review it before adding more substantive work."
+        "rampage_spawn reserved {reserved_support_slots} of {max_child_threads} child slots for the selected support agents and caps substantive Rampage workers at {MAX_ACTIVE_RAMPAGE_SUBSTANTIVE_WORKERS} active workers per wave; {active_substantive_workers}/{substantive_limit} substantive worker slots are already active. Wait for and record current worker evidence, then spawn the selected advisors to review it before adding more substantive work."
     )))
 }
 
@@ -4564,6 +4582,7 @@ fn required_support_agents(support_agents: &str) -> Vec<&'static str> {
         "both" => vec![SUPPORT_AGENT_NEW_IDEAS, SUPPORT_AGENT_EFFICIENCY],
         "new_ideas_only" => vec![SUPPORT_AGENT_NEW_IDEAS],
         "efficiency_only" => vec![SUPPORT_AGENT_EFFICIENCY],
+        "advisory" => vec![SUPPORT_AGENT_ADVISORY],
         _ => Vec::new(),
     }
 }
@@ -4723,6 +4742,7 @@ fn role_support_agent_kind(role: &str) -> Option<&'static str> {
         "efficiency" | "efficiency_agent" | "efficiency_monitoring_agent" => {
             Some(SUPPORT_AGENT_EFFICIENCY)
         }
+        "advisory" | "advisory_agent" | "advisor" => Some(SUPPORT_AGENT_ADVISORY),
         _ => None,
     }
 }
@@ -4736,6 +4756,7 @@ fn support_agent_display_name(support_agent: &str) -> &'static str {
     match support_agent {
         SUPPORT_AGENT_NEW_IDEAS => "New Ideas Agent",
         SUPPORT_AGENT_EFFICIENCY => "Efficiency Monitoring Agent",
+        SUPPORT_AGENT_ADVISORY => "Advisory Agent",
         _ => "Support agent",
     }
 }
@@ -4757,6 +4778,14 @@ fn missing_support_agent(support_agent: &str) -> MissingSupportAgent {
             kind: "review",
             title: "Efficiency Monitoring Agent - worker review",
             instructions: "Monitoring-only advisor: review the current named non-support worker status/results for duplicate work, vague tasks, idle or unnecessary workers, pruning/merging/retasking opportunities, compaction timing, verification timing, and progress against success criteria. Never review Mission Control or advisory output, and never do mission work yourself. If no non-support worker exists, advise Mission Control to spawn one and do nothing else.",
+        },
+        SUPPORT_AGENT_ADVISORY => MissingSupportAgent {
+            display_name: "Advisory Agent",
+            task_name: "advisory_agent",
+            role: "Advisory Agent",
+            kind: "review",
+            title: "Advisory Agent - worker review",
+            instructions: "Monitoring-only combined advisor (replaces the separate New Ideas and Efficiency agents). Inspect the current named non-support workers' ACTUAL output, checkpoints, and transcripts - not just their board summaries. Cover both jobs in one pass: (1) unstick lingering or stuck workers with alternate strategies, shortcuts, existing tools/docs/repos/APIs/local artifacts, better worker prompts, and access workarounds; (2) flag execution inefficiency: duplicate work, vague tasks, idle or unnecessary workers, pruning/merging/retasking opportunities, compaction timing, and verification timing against the success criteria. Never review Mission Control or your own prior advisory output, and never do mission work yourself. If no non-support worker exists, advise Mission Control to spawn one and do nothing else.",
         },
         _ => MissingSupportAgent {
             display_name: "Support agent",
@@ -5126,6 +5155,15 @@ fn worker_brief(
             "\n\nRole contract (Efficiency Monitoring Agent - monitoring only):\n\
              - Review only the named non-support workers in the current worker snapshot. Do not review Mission Control, your own output, or any other advisory output.\n\
              - Your only output is steering about those workers' execution efficiency: duplicate work, vague tasks, idle or unnecessary workers, pruning/merging/retasking opportunities, compaction timing, verification timing, and progress against success criteria.\n\
+             - Never do mission work yourself: no implementing, no fixing, no writing deliverables, no running the mission's commands.\n\
+             - If no non-support worker exists, return only a recommendation that Mission Control spawn one.\n\
+             - If you notice you have drifted into doing mission work or meta-review, stop immediately and return to observing and steering.\n\
+             - Re-read this contract before every response; it overrides any drift in the conversation."
+        }
+        Some(SUPPORT_AGENT_ADVISORY) => {
+            "\n\nRole contract (Advisory Agent - monitoring only, replaces New Ideas + Efficiency):\n\
+             - Review only the named non-support workers in the current worker snapshot, and inspect their ACTUAL output, checkpoints, and transcripts - not just their board summaries. Do not review Mission Control, your own output, or any other advisory output.\n\
+             - Cover both advisory jobs in one pass. Unstick steering: alternate strategies, blockers spotted early, shortcuts, existing tools/docs/repos/APIs/local artifacts, better worker prompts, and access workarounds. Efficiency steering: duplicate work, vague tasks, idle or unnecessary workers, pruning/merging/retasking opportunities, compaction timing, verification timing, and progress against success criteria.\n\
              - Never do mission work yourself: no implementing, no fixing, no writing deliverables, no running the mission's commands.\n\
              - If no non-support worker exists, return only a recommendation that Mission Control spawn one.\n\
              - If you notice you have drifted into doing mission work or meta-review, stop immediately and return to observing and steering.\n\
@@ -6451,15 +6489,63 @@ mod tests {
         .expect("the capacity reservation must not block its intended advisor");
 
         assert_eq!(
-            6usize.saturating_sub(required_support_agents("both").len()),
-            4,
-            "V1 leaves four substantive slots while reserving both advisors"
+            6usize
+                .saturating_sub(required_support_agents("both").len())
+                .min(MAX_ACTIVE_RAMPAGE_SUBSTANTIVE_WORKERS),
+            3,
+            "Rampage caps substantive workers at three even when V1 leaves more child slots"
         );
         assert_eq!(
             3usize.saturating_sub(required_support_agents("none").len()),
             3,
             "missions without advisors may use all V2 child slots"
         );
+    }
+
+    #[test]
+    fn substantive_worker_capacity_caps_large_waves_at_three_workers() {
+        let mut state = RampageState::new("thread-1".to_string());
+        handle_control_start(
+            &mut state,
+            &valid_start_args("none"),
+            RampageToolOptions::new(ModeKind::AbsoluteRampage),
+            "thread-1".to_string(),
+        )
+        .expect("mission should start");
+        let mission_id = state.active_mission().expect("mission").id.clone();
+        for index in 1..=MAX_ACTIVE_RAMPAGE_SUBSTANTIVE_WORKERS {
+            push_revisioned_mission_worker(
+                &mut state,
+                &mission_id,
+                &format!("task-worker-{index}"),
+            );
+            let worker = state
+                .tasks
+                .iter_mut()
+                .find(|task| task.id == format!("task-worker-{index}"))
+                .expect("worker");
+            worker.status = "running".to_string();
+            worker.time_finished = None;
+        }
+
+        let mission = state.active_mission().expect("mission").clone();
+        let err = ensure_substantive_worker_capacity(&state, &mission, "work", None, Some(12))
+            .expect_err("fourth active substantive worker must wait for the next wave");
+        assert!(
+            err.to_string()
+                .contains("caps substantive Rampage workers at 3 active workers")
+        );
+
+        let worker = state
+            .tasks
+            .iter_mut()
+            .find(|task| task.id == "task-worker-3")
+            .expect("worker");
+        worker.status = "done".to_string();
+        worker.time_finished = Some(300);
+        let mission = state.active_mission().expect("mission").clone();
+        ensure_substantive_worker_capacity(&state, &mission, "work", None, Some(12))
+            .expect("a new worker can start after a wave slot frees");
     }
 
     #[test]

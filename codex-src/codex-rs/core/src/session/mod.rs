@@ -902,6 +902,35 @@ async fn thread_title_from_thread_store(
 }
 
 impl Session {
+    /// Acquire one of the shared, mission-wide LLM-call slots for an upcoming
+    /// model stream, surfacing a visible one-time "waiting for a model slot"
+    /// notice when the agent has to queue behind its peers.
+    ///
+    /// The fast path (a slot is immediately free) takes it silently. Only when
+    /// all shared slots are in use does the agent enter a visible wait: a
+    /// one-time warning is emitted for this thread (so a busy mission does not
+    /// flood history on every contended turn) and then the call blocks FIFO
+    /// until a slot frees.
+    pub(crate) async fn acquire_llm_call_slot_with_wait_notice(
+        &self,
+        turn_context: &TurnContext,
+    ) -> crate::agent::control::LlmCallPermit {
+        let agent_control = &self.services.agent_control;
+        if let Some(permit) = agent_control.try_acquire_llm_call_slot() {
+            return permit;
+        }
+        if agent_control.should_announce_llm_wait(self.thread_id) {
+            self.send_event(
+                turn_context,
+                EventMsg::Warning(WarningEvent {
+                    message: "Waiting for a shared model slot (max 2 model calls run at once across the main agent and its sub-agents).".to_string(),
+                }),
+            )
+            .await;
+        }
+        agent_control.acquire_llm_call_slot().await
+    }
+
     pub(crate) async fn app_server_client_metadata(&self) -> AppServerClientMetadata {
         let state = self.state.lock().await;
         AppServerClientMetadata {

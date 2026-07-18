@@ -115,7 +115,7 @@ impl ChatWidget {
                     for delta in summary {
                         self.on_agent_reasoning_delta(delta);
                     }
-                    if self.config.show_raw_agent_reasoning {
+                    if self.raw_reasoning_visible() {
                         for delta in content {
                             self.on_agent_reasoning_delta(delta);
                         }

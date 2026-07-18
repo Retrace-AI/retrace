@@ -41,6 +41,7 @@ impl GitActionDirective {
 pub(crate) struct ParsedAssistantMarkdown {
     pub(crate) visible_markdown: String,
     pub(crate) git_actions: Vec<GitActionDirective>,
+    pub(crate) hidden_reasoning: Vec<String>,
 }
 
 impl ParsedAssistantMarkdown {
@@ -56,6 +57,7 @@ pub(crate) fn parse_assistant_markdown(markdown: &str, cwd: &Path) -> ParsedAssi
     let mut git_actions = Vec::new();
     let mut seen = HashSet::new();
     let mut visible_lines = Vec::new();
+    let (markdown, hidden_reasoning) = strip_thinking_blocks(markdown);
 
     for line in markdown.lines() {
         if let Some(rewritten) = rewrite_code_comment_line(line, cwd) {
@@ -81,7 +83,39 @@ pub(crate) fn parse_assistant_markdown(markdown: &str, cwd: &Path) -> ParsedAssi
     ParsedAssistantMarkdown {
         visible_markdown: visible_lines.join("\n"),
         git_actions,
+        hidden_reasoning,
     }
+}
+
+fn strip_thinking_blocks(markdown: &str) -> (String, Vec<String>) {
+    const OPEN: &str = "<think>";
+    const CLOSE: &str = "</think>";
+
+    let mut visible = String::with_capacity(markdown.len());
+    let mut hidden = Vec::new();
+    let mut rest = markdown;
+
+    while let Some(open) = rest.find(OPEN) {
+        visible.push_str(&rest[..open]);
+        let after_open = &rest[open + OPEN.len()..];
+        if let Some(close) = after_open.find(CLOSE) {
+            let thought = after_open[..close].trim();
+            if !thought.is_empty() {
+                hidden.push(thought.to_string());
+            }
+            rest = &after_open[close + CLOSE.len()..];
+        } else {
+            let thought = after_open.trim();
+            if !thought.is_empty() {
+                hidden.push(thought.to_string());
+            }
+            rest = "";
+            break;
+        }
+    }
+
+    visible.push_str(rest);
+    (visible, hidden)
 }
 
 fn rewrite_code_comment_line(line: &str, cwd: &Path) -> Option<String> {
@@ -302,6 +336,17 @@ mod tests {
 
         assert_eq!(parsed.visible_markdown, "Done");
         assert!(parsed.git_actions.is_empty());
+    }
+
+    #[test]
+    fn strips_local_model_thinking_blocks_from_visible_markdown() {
+        let parsed = parse_assistant_markdown(
+            "Before\n<think>\nprivate chain\n</think>\nAfter",
+            Path::new("/repo"),
+        );
+
+        assert_eq!(parsed.visible_markdown, "Before\n\nAfter");
+        assert_eq!(parsed.hidden_reasoning, vec!["private chain".to_string()]);
     }
 
     #[test]

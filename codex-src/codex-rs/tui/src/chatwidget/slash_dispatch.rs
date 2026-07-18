@@ -9,10 +9,10 @@ use super::goal_validation::GoalObjectiveValidationSource;
 use super::*;
 use crate::app_event::CodexOsProviderConfigureResult;
 use crate::app_event::CodexOsProviderModelRow;
-use crate::app_event::DeleteConversationRow;
-use crate::app_event::DeleteConversationTarget;
 use crate::app_event::CodexOsProviderRemoveSnapshot;
 use crate::app_event::CodexOsProviderRow;
+use crate::app_event::DeleteConversationRow;
+use crate::app_event::DeleteConversationTarget;
 use crate::app_event::ThreadGoalSetMode;
 use crate::bottom_pane::MultiSelectItem;
 use crate::bottom_pane::MultiSelectPicker;
@@ -267,7 +267,9 @@ fn codexos_status_display(status: ExitStatus) -> String {
         .unwrap_or_else(|| "terminated by signal".to_string())
 }
 
-pub(crate) async fn run_codexos_local_command_checked(command: CodexOsLocalCommand) -> Result<String, String> {
+pub(crate) async fn run_codexos_local_command_checked(
+    command: CodexOsLocalCommand,
+) -> Result<String, String> {
     let CodexOsLocalCommand {
         label,
         program,
@@ -370,7 +372,10 @@ async fn run_codexos_local_command_streaming(
                 text.push_str(stderr_text.trim_end());
                 text.push('\n');
             }
-            text.push_str(&format!("[exit status: {}]\n", codexos_status_display(status)));
+            text.push_str(&format!(
+                "[exit status: {}]\n",
+                codexos_status_display(status)
+            ));
             Err(text)
         }
         Err(err) => Err(format!("failed to run {}: {err}\n", program.display())),
@@ -483,6 +488,34 @@ async fn list_codexos_all_models() -> Result<Vec<CodexOsProviderModelRow>, Strin
         .into_iter()
         .map(codexos_model_row_from_json)
         .collect())
+}
+
+/// Prior per-model context/output limits, as previously saved via
+/// `models set <model> --context <n> --output <n>`. Used so the `/model`
+/// sizing popups can pre-select the value the user chose last time, letting
+/// them just press Enter to keep it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct SavedModelLimits {
+    pub(crate) context_window: Option<i64>,
+    pub(crate) output_tokens: Option<i64>,
+}
+
+/// Look up the saved context/output limits for a single model id. Returns
+/// `SavedModelLimits::default()` (all `None`) when the model has no saved
+/// limits yet or the registry cannot be read — the popups then fall back to
+/// their normal, un-defaulted presentation.
+pub(crate) async fn fetch_saved_model_limits(model: String) -> SavedModelLimits {
+    let Ok(rows) = list_codexos_all_models().await else {
+        return SavedModelLimits::default();
+    };
+    let Some(row) = rows.into_iter().find(|row| row.id == model) else {
+        return SavedModelLimits::default();
+    };
+    let output_tokens = parse_token_count(&row.output);
+    SavedModelLimits {
+        context_window: row.context,
+        output_tokens,
+    }
 }
 
 /// Re-fetches the model list from every connected provider (so newly-added
@@ -726,11 +759,7 @@ async fn reprobe_codexos_model(
     let mut output = format!("/model reprobe {model_id}\n\n");
     output.push_str(
         &run_codexos_local_command_streaming(
-            codexos_admin_command(vec![
-                "models".to_string(),
-                "probe".to_string(),
-                model_id,
-            ]),
+            codexos_admin_command(vec!["models".to_string(), "probe".to_string(), model_id]),
             tx.clone(),
         )
         .await?,
@@ -1346,7 +1375,10 @@ impl ChatWidget {
             ),
             Some("This runs selected-model capability probes. It can take a while.".to_string()),
         );
-        self.begin_probe_status(format!("Probing {} model(s) from {provider_id}", model_ids.len()));
+        self.begin_probe_status(format!(
+            "Probing {} model(s) from {provider_id}",
+            model_ids.len()
+        ));
         let tx = self.app_event_tx.clone();
         tokio::spawn(async move {
             let result =
@@ -1704,7 +1736,10 @@ impl ChatWidget {
             return;
         }
         let mut parts = trimmed.split_whitespace();
-        let subcommand = parts.next().map(str::to_ascii_lowercase).unwrap_or_default();
+        let subcommand = parts
+            .next()
+            .map(str::to_ascii_lowercase)
+            .unwrap_or_default();
         if !matches!(subcommand.as_str(), "reprobe" | "probe" | "add") {
             self.add_error_message("Usage: /model [probe [model] | add]".to_string());
             return;
@@ -1724,8 +1759,7 @@ impl ChatWidget {
             // Bare `/model probe` opens the picker of everything probe-able.
             ("probe", None) => self.open_model_probe_picker(),
             (_, model_arg) => {
-                let model_id =
-                    model_arg.unwrap_or_else(|| self.current_model().to_string());
+                let model_id = model_arg.unwrap_or_else(|| self.current_model().to_string());
                 self.start_model_reprobe(model_id);
             }
         }
@@ -1738,9 +1772,7 @@ impl ChatWidget {
         let items = vec![
             crate::bottom_pane::SelectionItem {
                 name: "Conversations".to_string(),
-                description: Some(
-                    "Delete a saved conversation, or all of them.".to_string(),
-                ),
+                description: Some("Delete a saved conversation, or all of them.".to_string()),
                 actions: vec![Box::new(|tx| {
                     tx.send(AppEvent::DeleteTargetConversations);
                 })],
@@ -1896,7 +1928,7 @@ impl ChatWidget {
     /// Loads all models for the `/model add` multi-select: re-fetches each
     /// provider's current catalog first (so newly-available upstream models
     /// show up), then lists everything with enabled models preselected.
-    fn open_model_add_picker(&mut self) {
+    pub(crate) fn open_model_add_picker(&mut self) {
         self.add_info_message(
             "Refreshing models from your providers…".to_string(),
             /*hint*/ None,
@@ -2067,12 +2099,11 @@ impl ChatWidget {
                     row.thinking_method.unwrap_or_else(|| "none".to_string()),
                 ));
                 let model_id = row.id.clone();
-                let actions: Vec<crate::bottom_pane::SelectionAction> =
-                    vec![Box::new(move |tx| {
-                        tx.send(AppEvent::CodexOsReprobeModel {
-                            model_id: model_id.clone(),
-                        });
-                    })];
+                let actions: Vec<crate::bottom_pane::SelectionAction> = vec![Box::new(move |tx| {
+                    tx.send(AppEvent::CodexOsReprobeModel {
+                        model_id: model_id.clone(),
+                    });
+                })];
                 crate::bottom_pane::SelectionItem {
                     name: row.id.clone(),
                     description,
@@ -2173,7 +2204,10 @@ impl ChatWidget {
                 self.persist_thinking_display("hide");
                 self.add_info_message(
                     "Thinking blocks are hidden.".to_string(),
-                    Some("They are still recorded; press Ctrl-T to view the full transcript.".to_string()),
+                    Some(
+                        "They are still recorded; press Ctrl-T to view the full transcript."
+                            .to_string(),
+                    ),
                 );
             }
             "auto" | "default" => {

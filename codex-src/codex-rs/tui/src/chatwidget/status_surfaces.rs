@@ -789,12 +789,16 @@ impl ChatWidget {
         let effective = self.effective_reasoning_effort();
         // The model's default reasoning variant, per the catalog.
         let model = self.current_model().to_string();
-        let default = self.model_catalog.try_list_models().ok().and_then(|models| {
-            models
-                .into_iter()
-                .find(|preset| preset.model == model)
-                .map(|preset| preset.default_reasoning_effort)
-        });
+        let default = self
+            .model_catalog
+            .try_list_models()
+            .ok()
+            .and_then(|models| {
+                models
+                    .into_iter()
+                    .find(|preset| preset.model == model)
+                    .map(|preset| preset.default_reasoning_effort)
+            });
         // The variant actually in effect: an explicit override, else the default.
         let in_use = effective.clone().or_else(|| default.clone());
         // Whether that variant IS the model default (so we tag it "default").

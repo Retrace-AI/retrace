@@ -378,7 +378,15 @@ fn managed_filesystem_sandbox_is_restricted(permission_profile: &PermissionProfi
 ///
 /// Smooth-mode streaming drains one line per tick, so this interval controls
 /// perceived typing speed for non-backlogged output.
-const COMMIT_ANIMATION_TICK: Duration = tui::TARGET_FRAME_INTERVAL;
+///
+/// This is deliberately decoupled from `tui::TARGET_FRAME_INTERVAL` (~8.33ms /
+/// 120fps). At the frame rate, smooth streaming renders ~120 lines/second,
+/// which is effectively instant and too fast to read as it arrives. A slower
+/// cadence produces a visible, naked-eye "typing" effect for normal output.
+/// Genuine backlog is still handled by the adaptive chunking policy, which
+/// switches to catch-up mode and bulk-drains, so long or very fast responses
+/// converge instead of lagging unboundedly behind the model.
+const COMMIT_ANIMATION_TICK: Duration = Duration::from_millis(30);
 
 #[derive(Debug, Clone)]
 pub struct AppExitInfo {

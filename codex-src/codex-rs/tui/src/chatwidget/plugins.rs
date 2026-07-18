@@ -1496,7 +1496,9 @@ impl ChatWidget {
             label: "Retrace Curated".to_string(),
             header: plugins_header(
                 "Retrace Curated marketplace.".to_string(),
-                format!("Installed {curated_installed} of {curated_total} Retrace Curated plugins."),
+                format!(
+                    "Installed {curated_installed} of {curated_total} Retrace Curated plugins."
+                ),
             ),
             items: self.plugin_selection_items(
                 curated_entries,

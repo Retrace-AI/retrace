@@ -27,9 +27,7 @@ fn fallback_model_metadata_warning_slug(message: &str) -> Option<&str> {
 /// affects what the user sees.
 pub(super) fn augment_warning(message: String) -> String {
     if fallback_model_metadata_warning_slug(&message).is_some() {
-        format!(
-            "{message} Quit and relaunch this session to load the model's metadata."
-        )
+        format!("{message} Quit and relaunch this session to load the model's metadata.")
     } else {
         message
     }

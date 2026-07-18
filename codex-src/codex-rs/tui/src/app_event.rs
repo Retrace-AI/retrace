@@ -429,6 +429,9 @@ pub(crate) enum AppEvent {
         result: Result<Vec<CodexOsProviderModelRow>, String>,
     },
 
+    /// Open the same refreshed multi-select surface used by `/model add`.
+    OpenModelAddPicker,
+
     /// Result of loading the model list for the `/model add` multi-select.
     CodexOsModelAddListLoaded {
         result: Result<Vec<CodexOsProviderModelRow>, String>,
@@ -447,6 +450,14 @@ pub(crate) enum AppEvent {
     OpenModelContextPopup {
         model: String,
         effort: Option<ReasoningEffort>,
+    },
+
+    /// Prior saved context/output limits for `model` finished loading; the
+    /// `/model` context popup can now open pre-selecting the saved values.
+    ModelSavedLimitsLoaded {
+        model: String,
+        effort: Option<ReasoningEffort>,
+        limits: crate::chatwidget::SavedModelLimits,
     },
 
     /// The context window chosen for `model`. `None` means "Custom", which

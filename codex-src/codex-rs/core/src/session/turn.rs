@@ -2915,6 +2915,17 @@ async fn try_run_sampling_request(
         turn_context.model_info.slug.as_str(),
         turn_context.provider.info().name.as_str(),
     );
+    // Shared fair rotation across the whole mission tree: the root agent and all
+    // of its sub-agents combined may only have `MAX_CONCURRENT_LLM_CALLS` model
+    // streams in flight at once. Acquire a slot here, immediately before the
+    // model stream, and hold it only for the duration of that stream (the permit
+    // is dropped together with `sampling_timing_guard`, before `drain_in_flight`
+    // runs tools such as `wait_agent`). Scoping it this tightly is what prevents
+    // a parent from holding a slot while blocking on a child that itself needs a
+    // slot — a self-inflicted deadlock.
+    let _llm_call_permit = sess
+        .acquire_llm_call_slot_with_wait_notice(&turn_context)
+        .await;
     let sampling_timing_guard = turn_context.turn_timing_state.begin_sampling();
     let mut stream = client_session
         .stream(
@@ -3370,6 +3381,10 @@ async fn try_run_sampling_request(
         }
     };
     drop(sampling_timing_guard);
+    // Release the shared LLM-call slot the instant the model stream is done, and
+    // crucially before `drain_in_flight` awaits tool calls (which may include
+    // `wait_agent` blocking on sub-agents that need their own slot).
+    drop(_llm_call_permit);
 
     flush_assistant_text_segments_all(
         &sess,

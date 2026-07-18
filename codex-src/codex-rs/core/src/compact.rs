@@ -582,6 +582,9 @@ async fn drain_to_completed(
     turn_metadata_header: Option<&str>,
     prompt: &Prompt,
 ) -> CodexResult<()> {
+    let _llm_call_permit = sess
+        .acquire_llm_call_slot_with_wait_notice(turn_context)
+        .await;
     let mut stream = client_session
         .stream(
             prompt,

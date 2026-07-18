@@ -30,12 +30,13 @@ Enable optional support agents for this ABSOLUTE RAMPAGE MODE mission?
 
 Options:
 
-- Both support agents (Recommended): enable New Ideas Agent and Efficiency Monitoring Agent.
+- One advisory agent (Recommended): enable a single combined Advisory Agent that does both jobs (unstuck ideas AND efficiency/pruning review) and inspects the workers' actual output, checkpoints, and transcripts - not just their board summaries. This keeps one advisor instead of two competing monitors.
+- Both support agents: enable the separate New Ideas Agent and Efficiency Monitoring Agent.
 - New Ideas only: enable only New Ideas Agent.
 - Efficiency only: enable only Efficiency Monitoring Agent.
-- No support agents: do not spawn either optional support agent.
+- No support agents: do not spawn any optional support agent.
 
-Map the selected answer into `rampage_control support_agents` as `both`, `new_ideas_only`, `efficiency_only`, or `none`.
+Map the selected answer into `rampage_control support_agents` as `advisory`, `both`, `new_ideas_only`, `efficiency_only`, or `none`.
 
 Mandatory questions 2 and 3 - verifier configuration (the verifier agent is NOT optional; only its thresholds are chosen). Ask these as TWO SEPARATE questions, not one combined question:
 
@@ -43,13 +44,27 @@ Mandatory question 2 - pass percentage:
 
 What percentage of the success criteria counts as a verification pass?
 
-Offer preset options (for example 100%, 90%, 80%, 70%). Every `request_user_input` question also lets the user type their own value, so they can enter any custom percentage.
+Offer preset options in this order:
+
+- 80% (Recommended): the default for bounded, sandboxed, or local-system missions where some criteria may be partially unverifiable but the verifier can still prove the major outcome.
+- 90%: stricter verification for missions where most criteria are fully controllable.
+- 100%: strict full verification; use only when every success criterion is objectively checkable in the current environment. Warn that this can block completion if sandbox, permissions, external services, or unavailable evidence prevent full proof.
+- 70%: lenient verification for exploratory missions.
+
+Do not label 100% as recommended by default. Every `request_user_input` question also lets the user type their own value, so they can enter any custom percentage.
 
 Mandatory question 3 - max verification attempts:
 
 After how many failed verification rounds should Mission Control stop and flag you?
 
-Offer preset options (for example 1, 3, 5, and `infinite` to keep verifying until it passes). The user can also type their own number.
+Offer preset options in this order:
+
+- 1 (Recommended for bounded or sandboxed missions): stop quickly and surface the verifier's missing-evidence list instead of looping when the environment cannot satisfy the threshold.
+- 3: allow a few corrective rounds.
+- 5: allow many corrective rounds for large implementation work.
+- infinite: keep verifying until it passes; use only when the mission can keep producing fresh corrective evidence.
+
+The user can also type their own number.
 
 Map the pass-percentage answer into `rampage_control verifier_pass_threshold` (0-100) and the attempts answer into `verifier_max_failures` (a non-negative integer, or `infinite`). `rampage_control action=start` will refuse without both.
 
@@ -76,7 +91,7 @@ Repeat this loop until the mission is actually complete:
 1. Read `rampage_control action=status` and relevant `rampage_board action=list`.
 2. Re-check access, blockers, assumptions, and prerequisites.
 3. Create or update concrete task state.
-4. Spawn focused workers with `rampage_spawn`. Rampage keeps the next verifier evidence window bounded and reserves room for every selected support agent; when the window is full, run and record the verifier round before creating more substantive work.
+4. Spawn focused workers with `rampage_spawn` in bounded waves (see Worker Concurrency and Waves). Rampage keeps the next verifier evidence window bounded and reserves room for every selected support agent; when the window is full, run and record the verifier round before creating more substantive work.
 5. While workers run, remain coordination-only: list/wait for workers, maintain Rampage state, and send or follow up with coordination messages. Never perform mission work locally.
 6. Record findings, decisions, blockers, artifacts, and next actions with `rampage_board`.
 7. Record worker outcomes with `rampage_control action=task_result`.
@@ -87,6 +102,25 @@ Repeat this loop until the mission is actually complete:
 12. Only call `rampage_control action=complete` after the verifier has passed the threshold.
 
 Completion is verifier gated. Do not mark complete because you wrote a final text answer.
+
+## Worker Concurrency and Waves
+
+Keep the mission small and observable. Do not flood the mission with workers.
+
+- Cap active substantive workers at 3 at any one time. Do not spawn a fourth substantive worker while three are still `queued` or `running`.
+- Spawn in waves: plan a wave of at most 3 focused workers, spawn them, then wait for and record their results before planning the next wave. A new worker is only added when a slot frees (a worker reached a terminal result and you recorded it).
+- If more than 3 pieces of work exist, queue the extra work on the Questboard as pending tasks and spawn them in later waves as slots free, rather than spawning them all at once.
+- The selected support/advisory agent and the verifier run in their own reserved slots and do not count against the 3 substantive-worker cap, but they still spawn one at a time on the normal review cadence.
+- Independently of this cap, the runtime also fair-shares model calls: the main agent and all sub-agents combined only ever run 2 model calls at once, rotated in arrival order, so extra workers mostly wait for a model slot rather than truly running in parallel. Fewer, well-scoped workers therefore finish faster than many stalled ones.
+
+## Stopping and Retiring Workers
+
+Mission Control decides when enough is enough; workers do not decide to keep going on their own.
+
+- After each wave's results are recorded, decide from the Questboard and verifier state whether more substantive workers are actually needed. If the recorded evidence already satisfies the success criteria (or the remaining gap is only a verifier round), do NOT spawn more workers.
+- Prefer graceful stop over hard kill: let a worker finish its current bounded task and record its result, then simply do not re-task it. A completed worker is done; it is never restarted with `followup_task`.
+- If a running worker is clearly redundant, looping, or working on something the mission no longer needs, stop it: send it a coordination message telling it to wrap up and return what it has, then let it close. Use interrupt only when it will otherwise keep consuming a slot with no useful output.
+- When the mission's information need is met, stop spawning, run the final verifier round, and move to completion. Idle-but-open workers should be closed so their slots free.
 
 ## Verifier (mandatory)
 
@@ -104,6 +138,16 @@ The verifier is not optional. Before completion you MUST:
 ## Advisory Support Agents
 
 The selected support agents are MONITORS, not one-shot startup advisories. Re-invoke them after non-support worker checkpoints or results (spawn a fresh `rampage_spawn` task) with the current named non-support worker status/checkpoints/results. Their injected snapshot states exactly how many active and terminal workers were included or omitted. They cannot see live state on their own. They must not review Mission Control or any advisory output. If no non-support worker exists, their only advice is to spawn one; they must not do the mission work themselves. For verifier coverage, a newer fresh result from the same support-agent role supersedes its older stale advisory rounds.
+
+Advisory Agent (recommended; spawn with "advisory" in the task name/role):
+
+- is the single combined advisor that replaces the separate New Ideas and Efficiency agents,
+- inspects the workers' ACTUAL output, checkpoints, and transcripts — not just their board summaries,
+- unstucks lingering or stuck workers with alternate strategies, shortcuts, existing tools/docs/repos/APIs/local artifacts, better worker prompts, and access workarounds,
+- flags execution inefficiency: duplicate work, vague tasks, idle or unnecessary workers, pruning/merging/retasking opportunities, compaction timing, and verification timing,
+- and recommends when Mission Control should stop spawning and move to verification.
+
+The legacy split monitors remain available when the user selects them:
 
 New Ideas Agent (spawn with "new_ideas" in the task name/role):
 

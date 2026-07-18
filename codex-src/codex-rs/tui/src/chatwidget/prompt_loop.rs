@@ -65,17 +65,30 @@ struct RalphLoopArgs {
 }
 
 #[derive(Debug, serde::Deserialize)]
-#[serde(deny_unknown_fields)]
 struct NormalizedTimedLoop {
+    #[serde(alias = "task", alias = "task_prompt", alias = "loop_prompt")]
     prompt: String,
+    #[serde(
+        alias = "cadence",
+        alias = "cadence_seconds",
+        alias = "interval",
+        alias = "seconds"
+    )]
     interval_seconds: Option<u64>,
 }
 
 #[derive(Debug, serde::Deserialize)]
-#[serde(deny_unknown_fields)]
 struct NormalizedRalphLoop {
+    #[serde(alias = "task", alias = "task_prompt", alias = "loop_prompt")]
     prompt: String,
+    #[serde(
+        alias = "iterations",
+        alias = "max_iters",
+        alias = "iteration_limit",
+        alias = "count"
+    )]
     max_iterations: Option<u64>,
+    #[serde(alias = "completion", alias = "promise", alias = "completion_text")]
     completion_promise: Option<String>,
 }
 
@@ -776,6 +789,51 @@ fn prompt_loop_normalization_schema(target: PromptLoopTarget) -> serde_json::Val
     }
 }
 
+/// Accepted aliases for each canonical normalized-loop field. The local setup
+/// models do not always emit the canonical key names (they have returned
+/// `cadence_seconds`, `cadence`, `task`, and `task_prompt`), so a required
+/// field is considered present when the object carries the canonical key or any
+/// of its documented aliases.
+fn required_field_aliases(field: &str) -> &'static [&'static str] {
+    match field {
+        "prompt" => &["prompt", "task", "task_prompt", "loop_prompt"],
+        "interval_seconds" => &[
+            "interval_seconds",
+            "cadence",
+            "cadence_seconds",
+            "interval",
+            "seconds",
+        ],
+        "max_iterations" => &[
+            "max_iterations",
+            "iterations",
+            "max_iters",
+            "iteration_limit",
+            "count",
+        ],
+        "completion_promise" => &[
+            "completion_promise",
+            "completion",
+            "promise",
+            "completion_text",
+        ],
+        // Unknown fields are matched by their exact name only.
+        _ => &[],
+    }
+}
+
+fn required_field_present(
+    object: &serde_json::Map<String, serde_json::Value>,
+    field: &str,
+) -> bool {
+    if object.contains_key(field) {
+        return true;
+    }
+    required_field_aliases(field)
+        .iter()
+        .any(|key| object.contains_key(*key))
+}
+
 fn parse_normalized_loop_response<T>(response: &str, required_fields: &[&str]) -> Result<T, String>
 where
     T: serde::de::DeserializeOwned,
@@ -804,7 +862,7 @@ where
         };
         if !required_fields
             .iter()
-            .all(|field| object.contains_key(*field))
+            .all(|field| required_field_present(object, field))
         {
             continue;
         }
@@ -2048,6 +2106,35 @@ mod tests {
 
     #[test]
     fn normalization_rejects_mismatched_and_invented_numeric_controls() {
+        // Regression: the local setup models observed in production emit key
+        // aliases (`cadence_seconds`/`task_prompt`, `cadence`/`task`) instead of
+        // the canonical schema keys. Those responses must still parse so the loop
+        // actually starts instead of silently reporting "the loop was not started".
+        let timed_alias = parse_normalized_loop_response::<NormalizedTimedLoop>(
+            r#"{"cadence_seconds":15,"task_prompt":"df -h"}"#,
+            &["prompt", "interval_seconds"],
+        )
+        .expect("cadence_seconds/task_prompt aliases parse");
+        assert_eq!(timed_alias.prompt, "df -h");
+        assert_eq!(timed_alias.interval_seconds, Some(15));
+
+        let timed_alias_short = parse_normalized_loop_response::<NormalizedTimedLoop>(
+            r#"{"cadence":15,"task":"do a df -h command"}"#,
+            &["prompt", "interval_seconds"],
+        )
+        .expect("cadence/task aliases parse");
+        assert_eq!(timed_alias_short.prompt, "do a df -h command");
+        assert_eq!(timed_alias_short.interval_seconds, Some(15));
+
+        let ralph_alias = parse_normalized_loop_response::<NormalizedRalphLoop>(
+            r#"{"max_iterations":5,"completion_promise":null,"task_prompt":"do df -h"}"#,
+            &["prompt", "max_iterations", "completion_promise"],
+        )
+        .expect("ralph task_prompt alias parses");
+        assert_eq!(ralph_alias.prompt, "do df -h");
+        assert_eq!(ralph_alias.max_iterations, Some(5));
+        assert_eq!(ralph_alias.completion_promise, None);
+
         let explicit_interval = detect_timed_controls("[30s] check deploy");
         assert!(
             reconcile_normalized_numeric_control(

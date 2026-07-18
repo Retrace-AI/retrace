@@ -6,6 +6,112 @@
 use super::*;
 
 impl ChatWidget {
+    fn find_ascii_case_insensitive(haystack: &str, needle: &str) -> Option<usize> {
+        haystack
+            .to_ascii_lowercase()
+            .find(&needle.to_ascii_lowercase())
+    }
+
+    fn drain_prefix_on_char_boundary(value: &mut String, max_end: usize) -> String {
+        let end = (0..=max_end)
+            .rev()
+            .find(|index| value.is_char_boundary(*index))
+            .unwrap_or(0);
+        value.drain(..end).collect()
+    }
+
+    fn filter_assistant_thinking_delta(&mut self, delta: &str, final_flush: bool) -> String {
+        const OPEN: &str = "<think>";
+        const CLOSE: &str = "</think>";
+        // Longest tag length minus 1: the most trailing bytes that could be the
+        // start of a split `<think>`/`</think>` tag and must be retained across
+        // chunks. `usize::max` is not const-stable on this toolchain, so pick the
+        // larger length with a const `if` instead.
+        const KEEP: usize = {
+            let longest = if CLOSE.len() > OPEN.len() {
+                CLOSE.len()
+            } else {
+                OPEN.len()
+            };
+            longest.saturating_sub(1)
+        };
+
+        self.assistant_thinking_filter_buffer.push_str(delta);
+        let mut visible = String::new();
+
+        loop {
+            if self.assistant_thinking_filter_inside {
+                if let Some(close) =
+                    Self::find_ascii_case_insensitive(&self.assistant_thinking_filter_buffer, CLOSE)
+                {
+                    let thought = Self::drain_prefix_on_char_boundary(
+                        &mut self.assistant_thinking_filter_buffer,
+                        close,
+                    );
+                    self.assistant_inline_reasoning_buffer.push_str(&thought);
+                    self.assistant_inline_reasoning_buffer.push_str("\n\n");
+                    self.assistant_thinking_filter_buffer.drain(..CLOSE.len());
+                    self.assistant_thinking_filter_inside = false;
+                    continue;
+                }
+
+                if final_flush {
+                    self.assistant_inline_reasoning_buffer
+                        .push_str(&self.assistant_thinking_filter_buffer);
+                    self.assistant_thinking_filter_buffer.clear();
+                } else if self.assistant_thinking_filter_buffer.len() > KEEP {
+                    let drain_to = self.assistant_thinking_filter_buffer.len() - KEEP;
+                    let thought = Self::drain_prefix_on_char_boundary(
+                        &mut self.assistant_thinking_filter_buffer,
+                        drain_to,
+                    );
+                    self.assistant_inline_reasoning_buffer.push_str(&thought);
+                }
+                break;
+            }
+
+            if let Some(open) =
+                Self::find_ascii_case_insensitive(&self.assistant_thinking_filter_buffer, OPEN)
+            {
+                visible.push_str(&Self::drain_prefix_on_char_boundary(
+                    &mut self.assistant_thinking_filter_buffer,
+                    open,
+                ));
+                self.assistant_thinking_filter_buffer.drain(..OPEN.len());
+                self.assistant_thinking_filter_inside = true;
+                continue;
+            }
+
+            if final_flush {
+                visible.push_str(&self.assistant_thinking_filter_buffer);
+                self.assistant_thinking_filter_buffer.clear();
+            } else if self.assistant_thinking_filter_buffer.len() > KEEP {
+                let drain_to = self.assistant_thinking_filter_buffer.len() - KEEP;
+                visible.push_str(&Self::drain_prefix_on_char_boundary(
+                    &mut self.assistant_thinking_filter_buffer,
+                    drain_to,
+                ));
+            }
+            break;
+        }
+
+        visible
+    }
+
+    fn flush_inline_assistant_reasoning(&mut self) {
+        let reasoning = self.assistant_inline_reasoning_buffer.trim().to_string();
+        self.assistant_inline_reasoning_buffer.clear();
+        if reasoning.is_empty() {
+            return;
+        }
+        let cell = history_cell::new_reasoning_summary_block_with_visibility(
+            reasoning,
+            &self.config.cwd,
+            self.thinking_display_override,
+        );
+        self.add_boxed_history(cell);
+    }
+
     pub(super) fn restore_reasoning_status_header(&mut self) {
         if let Some(header) = extract_first_bold(&self.reasoning_buffer) {
             self.status_state.terminal_title_status_kind = TerminalTitleStatusKind::Thinking;
@@ -17,6 +123,17 @@ impl ChatWidget {
     }
 
     pub(super) fn flush_answer_stream_with_separator(&mut self) {
+        let trailing_visible = self.filter_assistant_thinking_delta("", /*final_flush*/ true);
+        if !trailing_visible.is_empty() {
+            let pushed = self
+                .stream_controller
+                .as_mut()
+                .is_some_and(|controller| controller.push(&trailing_visible));
+            if pushed {
+                self.app_event_tx.send(AppEvent::StartCommitAnimation);
+                self.run_catch_up_commit_tick();
+            }
+        }
         let had_stream_controller = self.stream_controller.is_some();
         if let Some(mut controller) = self.stream_controller.take() {
             let scrollback_reflow = if controller.has_live_tail() {
@@ -52,6 +169,7 @@ impl ChatWidget {
         if had_stream_controller && self.stream_controllers_idle() {
             self.app_event_tx.send(AppEvent::StopCommitAnimation);
         }
+        self.flush_inline_assistant_reasoning();
     }
 
     pub(super) fn stream_controllers_idle(&self) -> bool {
@@ -265,9 +383,18 @@ impl ChatWidget {
             }
         }
         let parsed = parse_assistant_markdown(&message, self.config.cwd.as_path());
+        let had_stream_controller = self.stream_controller.is_some();
         self.finalize_completed_assistant_message(
             (!parsed.visible_markdown.is_empty()).then_some(parsed.visible_markdown.as_str()),
         );
+        if !had_stream_controller && !parsed.hidden_reasoning.is_empty() {
+            let cell = history_cell::new_reasoning_summary_block_with_visibility(
+                parsed.hidden_reasoning.join("\n\n"),
+                &self.config.cwd,
+                self.thinking_display_override,
+            );
+            self.add_boxed_history(cell);
+        }
         if matches!(item.phase, Some(MessagePhase::FinalAnswer) | None)
             && !parsed.visible_markdown.is_empty()
         {
@@ -381,6 +508,11 @@ impl ChatWidget {
 
     #[inline]
     pub(super) fn handle_streaming_delta(&mut self, delta: String) {
+        let delta = self.filter_assistant_thinking_delta(&delta, /*final_flush*/ false);
+        if delta.is_empty() {
+            self.request_redraw();
+            return;
+        }
         if !delta.is_empty() {
             self.record_visible_turn_activity();
         }

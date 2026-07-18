@@ -72,7 +72,7 @@ impl ChatWidget {
                 self.on_agent_reasoning_delta(notification.delta);
             }
             ServerNotification::ReasoningTextDelta(notification) => {
-                if self.config.show_raw_agent_reasoning {
+                if self.raw_reasoning_visible() {
                     self.on_agent_reasoning_delta(notification.delta);
                 }
             }

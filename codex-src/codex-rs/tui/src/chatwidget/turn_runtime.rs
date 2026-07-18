@@ -74,6 +74,9 @@ impl ChatWidget {
         }
         self.full_reasoning_buffer.clear();
         self.reasoning_buffer.clear();
+        self.assistant_thinking_filter_buffer.clear();
+        self.assistant_thinking_filter_inside = false;
+        self.assistant_inline_reasoning_buffer.clear();
         self.set_ambient_pet_notification(
             crate::pets::PetNotificationKind::Running,
             /*body*/ None,

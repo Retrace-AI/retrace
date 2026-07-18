@@ -5,8 +5,8 @@ expression: popup
   Select Model and Effort
   /model add enables more models from your providers; /model probe re-detects
 
-  1. Add custom model   Connect a new provider: enter its URL and API key,
-                        then pick models
+  1. Add custom model   Open /model add: refresh provider models, enable
+                        models, or connect a new provider
   2. gpt-5.5 (default)  Frontier model for complex coding, research, and real-
                         world work.
   3. gpt-5.4            Strong model for everyday coding.

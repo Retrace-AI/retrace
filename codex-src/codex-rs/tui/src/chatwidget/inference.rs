@@ -123,7 +123,8 @@ impl InferenceTracker {
         self.output_chars += chars;
 
         // Maintain the trailing window for the current-rate calculation.
-        self.recent.push_back((now, u32::try_from(chars).unwrap_or(u32::MAX)));
+        self.recent
+            .push_back((now, u32::try_from(chars).unwrap_or(u32::MAX)));
         while let Some(&(t, _)) = self.recent.front() {
             if now.saturating_duration_since(t) > RECENT_WINDOW {
                 self.recent.pop_front();
@@ -148,7 +149,10 @@ impl InferenceTracker {
         if chars == 0 {
             return None;
         }
-        let span = now.saturating_duration_since(oldest?).as_secs_f64().max(0.25);
+        let span = now
+            .saturating_duration_since(oldest?)
+            .as_secs_f64()
+            .max(0.25);
         Some((chars as f64 / CHARS_PER_TOKEN) / span)
     }
 }
@@ -193,7 +197,10 @@ impl ChatWidget {
     fn exact_generated_tokens(&self) -> f64 {
         self.token_info
             .as_ref()
-            .map(|i| (i.last_token_usage.output_tokens + i.last_token_usage.reasoning_output_tokens) as f64)
+            .map(|i| {
+                (i.last_token_usage.output_tokens + i.last_token_usage.reasoning_output_tokens)
+                    as f64
+            })
             .unwrap_or(0.0)
     }
 
@@ -217,9 +224,9 @@ impl ChatWidget {
             };
         };
 
-        let ttft_ms = t
-            .first_token_at
-            .map(|f| u64::try_from(f.saturating_duration_since(start).as_millis()).unwrap_or(u64::MAX));
+        let ttft_ms = t.first_token_at.map(|f| {
+            u64::try_from(f.saturating_duration_since(start).as_millis()).unwrap_or(u64::MAX)
+        });
 
         // Exact generated tokens from usage — output PLUS reasoning, since the
         // char estimate counts reasoning deltas too (so both are consistent and
@@ -253,7 +260,10 @@ impl ChatWidget {
         let (avg_tokens, avg_time) = if t.turn_finalized {
             (t.session_tokens, t.session_decode)
         } else {
-            (t.session_tokens + out_tokens, t.session_decode + t.active_decode)
+            (
+                t.session_tokens + out_tokens,
+                t.session_decode + t.active_decode,
+            )
         };
         let avg_decode_tps = tps(avg_tokens, avg_time);
 

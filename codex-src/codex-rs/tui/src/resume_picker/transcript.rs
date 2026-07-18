@@ -74,6 +74,16 @@ pub(crate) fn thread_to_transcript_cells(
                         cwd,
                     )));
                 }
+                if matches!(raw_reasoning_visibility, RawReasoningVisibility::Visible)
+                    && !parsed.hidden_reasoning.is_empty()
+                {
+                    cells.push(Arc::new(ReasoningSummaryCell::new(
+                        "Reasoning".to_string(),
+                        parsed.hidden_reasoning.join("\n\n"),
+                        cwd,
+                        /*transcript_only*/ false,
+                    )));
+                }
             }
             ThreadItem::Plan { text, .. } => {
                 if !text.trim().is_empty() {

@@ -445,6 +445,7 @@ use self::user_messages::user_message_display_for_history;
 use self::user_messages::user_message_for_restore;
 use self::user_messages::user_message_preview_text;
 mod warnings;
+pub(crate) use self::slash_dispatch::SavedModelLimits;
 use self::warnings::WarningDisplayState;
 pub(crate) use crate::branch_summary::StatusLineGitSummary;
 use crate::streaming::chunking::AdaptiveChunkingPolicy;
@@ -559,6 +560,11 @@ pub(crate) struct ChatWidget {
     warning_display_state: WarningDisplayState,
     rate_limit_switch_prompt: RateLimitSwitchPromptState,
     add_credits_nudge_email_in_flight: Option<AddCreditsNudgeCreditType>,
+    /// Saved per-model context/output limits, prefetched when the `/model`
+    /// sizing flow begins so the context/output popups can pre-select the
+    /// value the user chose last time (they can then just press Enter). Keyed
+    /// by model id; cleared once the sizing flow completes.
+    pending_model_sizing_limits: HashMap<String, SavedModelLimits>,
     adaptive_chunking: AdaptiveChunkingPolicy,
     // Stream lifecycle controller
     stream_controller: Option<StreamController>,
@@ -608,6 +614,13 @@ pub(crate) struct ChatWidget {
     interrupts: InterruptManager,
     // Accumulates the current reasoning block text to extract a header
     reasoning_buffer: String,
+    // Streaming assistant text from local models can contain inline
+    // `<think>...</think>` blocks instead of proper reasoning items. These
+    // fields strip that text from visible assistant output while preserving it
+    // for /thinking show and transcript inspection.
+    assistant_thinking_filter_buffer: String,
+    assistant_thinking_filter_inside: bool,
+    assistant_inline_reasoning_buffer: String,
     // /thinking override: Some(true) always shows reasoning blocks in main
     // history, Some(false) records them transcript-only, None keeps the
     // header-based default.
@@ -1233,11 +1246,17 @@ impl ChatWidget {
             .on_history_entry_response(log_id, offset, entry);
     }
 
+    pub(super) fn raw_reasoning_visible(&self) -> bool {
+        self.thinking_display_override
+            .unwrap_or(self.config.show_raw_agent_reasoning)
+    }
+
     pub(crate) fn pre_draw_tick(&mut self) {
         self.update_due_hook_visibility();
         self.schedule_hook_timer_if_needed();
         // Refresh the inference-speed strip shown above the composer.
-        let inference_line = crate::inference_strip::inference_strip_line(&self.inference_metrics());
+        let inference_line =
+            crate::inference_strip::inference_strip_line(&self.inference_metrics());
         self.bottom_pane.set_inference_line(inference_line);
         self.bottom_pane.pre_draw_tick();
         if let Some(pet) = self.ambient_pet.as_ref() {
