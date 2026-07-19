@@ -1038,7 +1038,7 @@ fn handle_control_start(
         .filter(|value| !value.is_empty())
         .ok_or_else(|| {
             FunctionCallError::RespondToModel(
-                "rampage_control start requires support_agents from the startup question; call request_user_input first with One advisory agent, Both support agents, New Ideas only, Efficiency only, or No support agents".to_string(),
+                "rampage_control start requires support_agents from the startup question; call request_user_input first offering One advisory agent (advisory) or No support agents (none)".to_string(),
             )
         })
         .map(normalize_token)?;
@@ -1579,7 +1579,21 @@ fn handle_control_task_result(
         .map(normalize_token)
         .unwrap_or_else(|| "done".to_string());
     validate_task_status(&status)?;
-    let worker_result = bounded_storage_text(&worker_result, STORED_TASK_RESULT_LIMIT);
+    // Verifier verdicts are parsed from the STORED text and must END with the
+    // </rampage_verdict> block; blind tail truncation of a long verify result
+    // would permanently destroy the verdict, waste the round, and never count
+    // toward verifier_max_failures. Preserve the trailing verdict block and
+    // truncate the prose head instead.
+    let is_verify_task = state
+        .tasks
+        .iter()
+        .find(|task| task.id == task_id)
+        .is_some_and(|task| task.kind == "verify");
+    let worker_result = if is_verify_task {
+        bounded_verify_result_text(&worker_result, STORED_TASK_RESULT_LIMIT)
+    } else {
+        bounded_storage_text(&worker_result, STORED_TASK_RESULT_LIMIT)
+    };
     let now = now_unix_timestamp_ms();
     let (mission_id, task_id, task_title, task_role, task_kind) = {
         let task = state
@@ -1758,13 +1772,46 @@ async fn verified_worker_task_result(
     })?;
     let attestation_path =
         rampage_attestation_file_path(&rampage_state_path(invocation), &task.mission_id, &task_id);
-    let attestation = load_worker_attestation(&attestation_path)
-        .await
-        .map_err(|message| {
-            FunctionCallError::RespondToModel(format!(
-                "rampage task `{task_id}` has no live worker and no valid terminal attestation: {message}"
-            ))
-        })?;
+    let attestation = match load_worker_attestation(&attestation_path).await {
+        Ok(attestation) => attestation,
+        Err(message) => {
+            // Terminal attestations are written by an in-process watcher armed
+            // at spawn time. If the codex process died while the worker ran,
+            // the live registry is empty AND no attestation file exists; the
+            // task could then never reach a terminal status and the mission was
+            // stranded forever (verify/complete blocked, spawns capped). Let
+            // the controller close a provably-dead worker as failed/cancelled
+            // via a synthetic durable "lost" attestation. Success statuses
+            // (done/blocked) remain impossible to fabricate.
+            if !matches!(requested_status.as_str(), "failed" | "cancelled") {
+                return Err(FunctionCallError::RespondToModel(format!(
+                    "rampage task `{task_id}` has no live worker and no valid terminal attestation: {message}; a lost worker may only be closed with task_status=failed or cancelled"
+                )));
+            }
+            let attestation = RampageWorkerAttestation {
+                schema_version: 1,
+                mission_id: task.mission_id.clone(),
+                task_id: task_id.clone(),
+                worker_thread_id: expected_worker_thread_id.clone(),
+                terminal_status: "lost".to_string(),
+                output: bounded_storage_text(
+                    &format!(
+                        "worker lost: no live agent in the registry and no terminal attestation (likely a process restart mid-run): {message}"
+                    ),
+                    STORED_TASK_RESULT_LIMIT,
+                ),
+                time_completed: now_unix_timestamp_ms(),
+            };
+            if let Err(save_error) =
+                save_worker_attestation_with_retry(&attestation_path, &attestation).await
+            {
+                warn!(
+                    "failed to persist synthetic lost attestation for task {task_id}: {save_error}"
+                );
+            }
+            attestation
+        }
+    };
     if attestation.mission_id != task.mission_id
         || attestation.task_id != task_id
         || attestation.worker_thread_id != expected_worker_thread_id
@@ -1821,7 +1868,7 @@ fn authoritative_attested_worker_result(
         ("failed", "failed") if !attestation.output.trim().is_empty() => {
             Ok(attestation.output.trim().to_string())
         }
-        ("lost", "failed") if !attestation.output.trim().is_empty() => {
+        ("lost", "failed" | "cancelled") if !attestation.output.trim().is_empty() => {
             Ok(attestation.output.trim().to_string())
         }
         ("interrupted" | "shutdown", "cancelled") => Ok(attestation.output.trim().to_string()),
@@ -2674,7 +2721,7 @@ fn create_rampage_control_tool(options: RampageToolOptions) -> ToolSpec {
                 "efficiency_only",
                 "none",
             ]),
-            Some("Startup support-agent choice gathered from request_user_input.".to_string()),
+            Some("Startup support-agent choice gathered from request_user_input. Offer the user only advisory (One advisory agent) or none (No support agents); both/new_ideas_only/efficiency_only are legacy values accepted for compatibility.".to_string()),
         ),
     );
     properties.insert(
@@ -3415,6 +3462,37 @@ fn bounded_storage_text(value: &str, max_chars: usize) -> String {
     bounded
 }
 
+/// Bounds a stored verify-task result while keeping the trailing
+/// `<rampage_verdict>` block intact — the verdict is the authoritative payload
+/// and is parsed from the stored text, so it must survive truncation.
+fn bounded_verify_result_text(value: &str, max_chars: usize) -> String {
+    const OPEN: &str = "<rampage_verdict>";
+    const CLOSE: &str = "</rampage_verdict>";
+    if value.chars().count() <= max_chars {
+        return value.to_string();
+    }
+    let trimmed = value.trim_end();
+    let Some(open_at) = trimmed.rfind(OPEN) else {
+        return bounded_storage_text(value, max_chars);
+    };
+    if !trimmed.ends_with(CLOSE) {
+        return bounded_storage_text(value, max_chars);
+    }
+    let verdict = &trimmed[open_at..];
+    let verdict_chars = verdict.chars().count();
+    if verdict_chars >= max_chars {
+        // The verdict alone exceeds the bound; keep it whole regardless — a
+        // parseable oversized verdict beats an unusable truncated one.
+        return verdict.to_string();
+    }
+    let head_budget = max_chars - verdict_chars;
+    let head = value[..open_at]
+        .chars()
+        .take(head_budget)
+        .collect::<String>();
+    format!("{head}... [prose truncated at trusted Rampage result ingress]\n{verdict}")
+}
+
 fn escape_verdict_tags(value: &str) -> String {
     value
         .replace("<rampage_verdict>", "<quoted_rampage_verdict>")
@@ -3702,11 +3780,22 @@ fn explicit_request_user_input_stop_choice(
     }) {
         return false;
     }
-    let Some(verb) = answer_words.first() else {
+    // Skip leading affirmations so "yes, stop" / "ok stop now" still read as a
+    // stop directive.
+    let directive_words: Vec<&String> = answer_words
+        .iter()
+        .skip_while(|word| matches!(word.as_str(), "yes" | "ok" | "okay" | "please" | "now"))
+        .collect();
+    let Some(verb) = directive_words.first() else {
         return false;
     };
+    // This choice is only reached from `directive_from_request_user_input`,
+    // which is call-id-bound to a question the Rampage controller itself asked
+    // for the active mission. That binding authenticates mission context, so a
+    // controller escalation like "How should we proceed? [Stop now]" must not
+    // additionally require a mission keyword in the wording.
+    let _ = question;
     matches!(verb.as_str(), "stop" | "cancel" | "abort" | "end")
-        && request_user_input_targets_mission(question, &answer_words)
 }
 
 fn explicit_request_user_input_resume_choice(
@@ -3735,36 +3824,13 @@ fn explicit_request_user_input_resume_choice(
         || answer_words
             .windows(2)
             .any(|pair| pair[0] == "keep" && pair[1] == "running");
-    resume && request_user_input_targets_mission(question, &answer_words)
+    // Call-id binding to the controller's own question authenticates mission
+    // context (see the stop-choice note), so a bare "Keep going" / "Continue"
+    // escalation option authorizes resume without a mission keyword.
+    let _ = question;
+    resume
 }
 
-fn request_user_input_targets_mission(
-    question: &RequestUserInputQuestion,
-    answer_words: &[String],
-) -> bool {
-    directive_words_target_mission(answer_words)
-        || directive_words_target_mission(&normalized_directive_words(&question.question))
-        || question.options.as_ref().is_some_and(|options| {
-            options.iter().any(|option| {
-                let words = normalized_directive_words(&option.label);
-                !words.iter().any(|word| {
-                    matches!(
-                        word.as_str(),
-                        "worker" | "workers" | "agent" | "agents" | "concurrent"
-                    )
-                }) && directive_words_target_mission(&words)
-            })
-        })
-}
-
-fn directive_words_target_mission(words: &[String]) -> bool {
-    words.iter().any(|word| {
-        matches!(
-            word.as_str(),
-            "mission" | "rampage" | "task" | "work" | "audit"
-        )
-    })
-}
 
 fn normalized_directive_words(message: &str) -> Vec<String> {
     message
@@ -3793,7 +3859,9 @@ fn explicit_user_stop_request(message: &str) -> bool {
     {
         return false;
     }
-    words.retain(|word| !matches!(*word, "please" | "now"));
+    // Strip leading/interspersed affirmations symmetrically with the resume
+    // detector so "yes, stop this mission" / "ok stop now" authorize a stop.
+    words.retain(|word| !matches!(*word, "yes" | "ok" | "okay" | "please" | "now"));
     let Some((verb, remainder)) = words.split_first() else {
         return false;
     };
@@ -4175,12 +4243,14 @@ fn parse_verifier_worker_verdict(
             ))
         })?;
     let trimmed = result.trim();
-    if trimmed.matches(OPEN).count() != 1
-        || trimmed.matches(CLOSE).count() != 1
-        || !trimmed.ends_with(CLOSE)
-    {
+    // The authoritative verdict is the FINAL block: the output must end with a
+    // closing tag. Earlier occurrences (a verifier quoting the contract's
+    // example tag in its prose) must not invalidate an otherwise well-formed
+    // trailing verdict, so parse from the last opening tag instead of
+    // requiring global tag uniqueness.
+    if !trimmed.ends_with(CLOSE) {
         return Err(FunctionCallError::RespondToModel(format!(
-            "verify task `{}` must end with exactly one {OPEN} JSON verdict and no trailing text",
+            "verify task `{}` must end with a {OPEN} JSON verdict and no trailing text",
             verify_task.id
         )));
     }
@@ -4737,12 +4807,19 @@ fn ensure_support_agent_spawn_has_worker_evidence(
 }
 
 fn role_support_agent_kind(role: &str) -> Option<&'static str> {
+    // Support-agent classification is exact-token by design: a substantive
+    // worker may legitimately carry these words in its name/role (e.g.
+    // "efficiency_scan"), so only the reserved role tokens classify. The mode
+    // templates instruct the controller to spawn support agents with exactly
+    // these role values.
     match normalize_token(role).as_str() {
         "new_ideas" | "new_ideas_agent" => Some(SUPPORT_AGENT_NEW_IDEAS),
         "efficiency" | "efficiency_agent" | "efficiency_monitoring_agent" => {
             Some(SUPPORT_AGENT_EFFICIENCY)
         }
-        "advisory" | "advisory_agent" | "advisor" => Some(SUPPORT_AGENT_ADVISORY),
+        "advisory" | "advisory_agent" | "advisor" | "advisory_monitoring_agent" => {
+            Some(SUPPORT_AGENT_ADVISORY)
+        }
         _ => None,
     }
 }
@@ -7656,7 +7733,7 @@ mod tests {
     }
 
     #[test]
-    fn verifier_verdict_must_be_one_final_unquoted_block() {
+    fn verifier_verdict_uses_final_block_and_rejects_trailing_text() {
         let mut state = RampageState::new("thread-1".to_string());
         handle_control_start(
             &mut state,
@@ -7669,11 +7746,20 @@ mod tests {
         push_passed_verify_task(&mut state, &mission_id);
         let task = state.tasks.last_mut().expect("verify task");
 
+        // A verifier that quotes the contract's example tag earlier in its prose
+        // and then ends with the real verdict must be accepted: the FINAL block
+        // is authoritative. (Previously this was rejected, which — combined with
+        // ingress truncation — could make a verify round permanently unusable.)
         task.result = Some(
             "quoted <rampage_verdict>{\"pass_percentage\":1,\"notes\":\"bad\"}</rampage_verdict>\n<rampage_verdict>{\"pass_percentage\":100,\"notes\":\"good\"}</rampage_verdict>"
                 .to_string(),
         );
-        assert!(parse_verifier_worker_verdict(task).is_err());
+        assert_eq!(
+            parse_verifier_worker_verdict(task)
+                .expect("final verdict block is authoritative")
+                .pass_percentage,
+            100.0
+        );
 
         task.result = Some(
             "<rampage_verdict>{\"pass_percentage\":100,\"notes\":\"good\"}</rampage_verdict> trailing"

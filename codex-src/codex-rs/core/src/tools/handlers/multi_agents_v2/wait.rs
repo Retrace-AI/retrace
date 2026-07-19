@@ -70,6 +70,7 @@ impl ToolExecutor<ToolInvocation> for Handler {
                     sender_thread_id: session.thread_id,
                     receiver_thread_ids: Vec::new(),
                     receiver_agents: Vec::new(),
+                    statuses: HashMap::new(),
                     call_id: call_id.clone(),
                 }
                 .into(),

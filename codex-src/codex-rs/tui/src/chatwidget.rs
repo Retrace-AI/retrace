@@ -767,6 +767,10 @@ pub(crate) struct ChatWidget {
     last_non_retry_error: Option<(String, String)>,
     prompt_loop_generation: u64,
     prompt_loop: Option<PromptLoopState>,
+    /// Consecutive failed loop turns since the last successful completion.
+    /// Drives failure backoff and the stop-after-repeated-failures cap so a
+    /// persistently failing loop cannot resubmit every second forever.
+    prompt_loop_consecutive_failures: u32,
 }
 
 #[cfg_attr(not(test), allow(dead_code))]

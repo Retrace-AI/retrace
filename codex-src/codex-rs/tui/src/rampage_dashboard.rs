@@ -156,6 +156,13 @@ pub(crate) struct RampageDashboardPanel {
     state_path: Option<PathBuf>,
     frame_requester: FrameRequester,
     animations_enabled: bool,
+    /// Whether the active collaboration mode is a Rampage mode. Rampage workers
+    /// are in-process, so a mission's durable state file can outlive the process
+    /// (or the thread can be resumed in a non-rampage mode). Without this gate
+    /// the panel renders a phantom "🟢 RUNNING" mission with worker rows for
+    /// agents that no longer exist and can never be reconciled from the current
+    /// mode. Only show the dashboard while a rampage mode is active.
+    rampage_mode_active: bool,
 }
 
 impl RampageDashboardPanel {
@@ -164,6 +171,7 @@ impl RampageDashboardPanel {
             state_path: None,
             frame_requester,
             animations_enabled,
+            rampage_mode_active: false,
         }
     }
 
@@ -175,7 +183,15 @@ impl RampageDashboardPanel {
         self.state_path = Some(path);
     }
 
+    /// Records whether a Rampage collaboration mode is currently active.
+    pub(crate) fn set_rampage_mode_active(&mut self, active: bool) {
+        self.rampage_mode_active = active;
+    }
+
     fn load(&self) -> Option<(MissionRow, Vec<TaskRow>, Vec<BoardRow>)> {
+        if !self.rampage_mode_active {
+            return None;
+        }
         let path = self.state_path.as_ref()?;
         let contents = std::fs::read_to_string(path).ok()?;
         let state: RampageStateFile = serde_json::from_str(&contents).ok()?;

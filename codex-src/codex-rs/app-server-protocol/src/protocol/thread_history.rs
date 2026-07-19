@@ -712,6 +712,11 @@ impl ThreadHistoryBuilder {
         &mut self,
         payload: &codex_protocol::protocol::CollabWaitingBeginEvent,
     ) {
+        let agents_states = payload
+            .statuses
+            .iter()
+            .map(|(id, status)| (id.to_string(), CollabAgentState::from(status.clone())))
+            .collect();
         let item = ThreadItem::CollabAgentToolCall {
             id: payload.call_id.clone(),
             tool: CollabAgentTool::Wait,
@@ -725,7 +730,7 @@ impl ThreadHistoryBuilder {
             prompt: None,
             model: None,
             reasoning_effort: None,
-            agents_states: HashMap::new(),
+            agents_states,
         };
         self.upsert_item_in_current_turn(item);
     }

@@ -136,6 +136,15 @@ impl ChatWidget {
     /// When there are queued user messages, restore them into the composer
     /// separated by newlines rather than auto-submitting the next one.
     pub(super) fn on_interrupted_turn(&mut self, reason: TurnAbortReason) {
+        // A user Esc (or a budget stop) on the loop's own turn must stop the
+        // loop instead of being treated as a transient failure that silently
+        // resubmits the same prompt a second later.
+        if matches!(
+            reason,
+            TurnAbortReason::Interrupted | TurnAbortReason::BudgetLimited
+        ) {
+            self.stop_prompt_loop_on_user_interrupt();
+        }
         let cancelled_prompt = self.take_armed_cancel_edit_prompt(reason);
         // Finalize, log a gentle prompt, and clear running state.
         self.finalize_turn();

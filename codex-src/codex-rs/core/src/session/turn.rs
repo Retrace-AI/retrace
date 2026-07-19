@@ -233,6 +233,15 @@ pub(crate) async fn run_turn(
         rampage_preexisting_mission_id,
         rampage_controller_turn,
     );
+    // Recover any startup answers the user already gave in an earlier turn. Without
+    // this, a startup gate interrupted between answering the questions and a
+    // successful `rampage_control action=start` (an Esc, a 429/stream error, or an
+    // auto-compaction) rebuilds an empty guard on the next turn and re-asks the same
+    // questions the user just answered.
+    if rampage_startup_guard.is_required() {
+        let history_items = sess.clone_history().await.into_raw_items();
+        rampage_startup_guard.rehydrate_from_history(&history_items);
+    }
     // Although from the perspective of codex.rs, TurnDiffTracker has the lifecycle of a Task which contains
     // many turns, from the perspective of the user, it is a single turn.
     let turn_diff_tracker = Arc::new(tokio::sync::Mutex::new(
@@ -647,6 +656,24 @@ impl RampageStartupGuard {
         steps
     }
 
+    /// Replays prior-turn tool calls and outputs from conversation history so
+    /// startup answers (and a prior successful `rampage_control action=start`)
+    /// survive a turn boundary. The `observe_*` helpers are idempotent over paired
+    /// call/output items, so replaying history in chronological order reconstructs
+    /// the same answer state the live turn would have built.
+    fn rehydrate_from_history(&mut self, items: &[ResponseItem]) {
+        if !self.is_required() {
+            return;
+        }
+        for item in items {
+            if let Some(identity) = tool_call_identity(item) {
+                let arguments = tool_call_arguments(item);
+                self.observe_tool_call(&identity, arguments.as_deref());
+            }
+            self.observe_tool_output(item);
+        }
+    }
+
     fn observe_tool_call(&mut self, tool_name: &ToolCallIdentity, arguments: Option<&str>) {
         match tool_name.name.as_str() {
             "spawn_agent" => self.spawn_agent_calls += 1,
@@ -700,7 +727,15 @@ impl RampageStartupGuard {
             let Some(answer) = response.answers.get(&question.id) else {
                 continue;
             };
-            let [answer] = answer.answers.as_slice() else {
+            // The TUI appends an optional free-text note as a second entry
+            // ("user_note: ..."). Requiring exactly one entry silently discarded
+            // any answer that carried a note, leaving the question "unanswered"
+            // and forcing the model to re-ask it.
+            let Some(answer) = answer
+                .answers
+                .iter()
+                .find(|entry| !entry.trim_start().starts_with("user_note:"))
+            else {
                 continue;
             };
             match question.category {
@@ -886,6 +921,44 @@ fn rampage_startup_question_category(
         (true, false, false) => Some(RampageStartupQuestionCategory::SupportAgents),
         (false, true, false) => Some(RampageStartupQuestionCategory::VerifierPassThreshold),
         (false, false, true) => Some(RampageStartupQuestionCategory::VerifierMaxFailures),
+        // A verifier question whose wording spans both vocabularies (e.g. a
+        // pass-percentage question that mentions "max failed rounds") must not
+        // be dropped from tracking — an untracked question's answer is never
+        // recorded and gets re-asked forever. Disambiguate on the header, then
+        // on whichever vocabulary appears first in the combined text.
+        (false, true, true) => {
+            let header = question.header.to_ascii_lowercase();
+            let header_pass = header.contains("pass")
+                || header.contains("percent")
+                || header.contains("threshold");
+            let header_failures = header.contains("fail")
+                || header.contains("attempt")
+                || header.contains("round")
+                || header.contains("max");
+            if header_pass && !header_failures {
+                return Some(RampageStartupQuestionCategory::VerifierPassThreshold);
+            }
+            if header_failures && !header_pass {
+                return Some(RampageStartupQuestionCategory::VerifierMaxFailures);
+            }
+            let pass_position = ["pass", "percent", "threshold"]
+                .iter()
+                .filter_map(|keyword| text.find(keyword))
+                .min();
+            let failure_position = ["fail", "attempt", "round"]
+                .iter()
+                .filter_map(|keyword| text.find(keyword))
+                .min();
+            match (pass_position, failure_position) {
+                (Some(pass_at), Some(failures_at)) if pass_at <= failures_at => {
+                    Some(RampageStartupQuestionCategory::VerifierPassThreshold)
+                }
+                (Some(_), Some(_)) => Some(RampageStartupQuestionCategory::VerifierMaxFailures),
+                (Some(_), None) => Some(RampageStartupQuestionCategory::VerifierPassThreshold),
+                (None, Some(_)) => Some(RampageStartupQuestionCategory::VerifierMaxFailures),
+                (None, None) => None,
+            }
+        }
         _ => None,
     }
 }
@@ -918,7 +991,9 @@ fn parse_support_agents_answer(answer: &str) -> Option<String> {
         "efficiency_only" | "efficiency_monitoring_only" | "efficiency_monitoring_agent_only" => {
             Some("efficiency_only".to_string())
         }
-        "none" | "no_support_agents" => Some("none".to_string()),
+        // "None of the above" is the runtime-injected escape row; for an
+        // opt-in question, declining every option means no support agents.
+        "none" | "no_support_agents" | "none_of_the_above" | "no" => Some("none".to_string()),
         _ => None,
     }
 }
@@ -946,10 +1021,44 @@ fn parse_verifier_max_failures_value(value: &str) -> Option<RampageVerifierMaxFa
     if let Ok(value) = normalized.parse::<u64>() {
         return Some(RampageVerifierMaxFailures::Bounded(value));
     }
-    normalized
+    if let Some(value) = normalized
         .split('_')
         .find_map(|token| token.parse::<u64>().ok())
-        .map(RampageVerifierMaxFailures::Bounded)
+    {
+        return Some(RampageVerifierMaxFailures::Bounded(value));
+    }
+    // Accept spelled-out counts ("three", "five attempts") — users can type a
+    // free-form answer and a silently unparseable one forces a re-ask.
+    normalized.split('_').find_map(number_word_value).map(RampageVerifierMaxFailures::Bounded)
+}
+
+/// Maps a spelled-out English number word (zero..twenty) to its value.
+fn number_word_value(token: &str) -> Option<u64> {
+    let value = match token {
+        "zero" => 0,
+        "one" | "once" => 1,
+        "two" | "twice" => 2,
+        "three" => 3,
+        "four" => 4,
+        "five" => 5,
+        "six" => 6,
+        "seven" => 7,
+        "eight" => 8,
+        "nine" => 9,
+        "ten" => 10,
+        "eleven" => 11,
+        "twelve" => 12,
+        "thirteen" => 13,
+        "fourteen" => 14,
+        "fifteen" => 15,
+        "sixteen" => 16,
+        "seventeen" => 17,
+        "eighteen" => 18,
+        "nineteen" => 19,
+        "twenty" => 20,
+        _ => return None,
+    };
+    Some(value)
 }
 
 fn rampage_startup_configuration(arguments: &str) -> Option<RampageStartupConfiguration> {

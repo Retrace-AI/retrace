@@ -2374,8 +2374,11 @@
     "ModeKind": {
       "description": "Initial collaboration mode to use when the TUI starts.",
       "enum": [
+        "ask",
         "plan",
-        "default"
+        "default",
+        "absolute_rampage",
+        "readonly_research"
       ],
       "type": "string"
     },

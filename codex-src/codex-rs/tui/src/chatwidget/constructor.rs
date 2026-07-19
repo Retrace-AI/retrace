@@ -239,6 +239,7 @@ impl ChatWidget {
             last_non_retry_error: None,
             prompt_loop_generation: 0,
             prompt_loop: None,
+            prompt_loop_consecutive_failures: 0,
         };
 
         widget.prefetch_rate_limits();

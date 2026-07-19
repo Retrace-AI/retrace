@@ -3907,6 +3907,11 @@ pub struct CollabWaitingBeginEvent {
     /// Optional nicknames/roles for receivers.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub receiver_agents: Vec<CollabAgentRef>,
+    /// Last known status of each receiver at the moment the wait began, so the
+    /// live agent panel can render already-finished agents as done instead of
+    /// leaving them spinning until the wait returns.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub statuses: HashMap<ThreadId, AgentStatus>,
     /// ID of the waiting call.
     pub call_id: String,
 }

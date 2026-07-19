@@ -190,6 +190,11 @@ pub fn item_event_to_server_notification(
                 .iter()
                 .map(ToString::to_string)
                 .collect();
+            let agents_states = begin_event
+                .statuses
+                .iter()
+                .map(|(id, status)| (id.to_string(), CollabAgentState::from(status.clone())))
+                .collect();
             let item = ThreadItem::CollabAgentToolCall {
                 id: begin_event.call_id,
                 tool: CollabAgentTool::Wait,
@@ -199,7 +204,7 @@ pub fn item_event_to_server_notification(
                 prompt: None,
                 model: None,
                 reasoning_effort: None,
-                agents_states: HashMap::new(),
+                agents_states,
             };
             ServerNotification::ItemStarted(ItemStartedNotification {
                 thread_id,

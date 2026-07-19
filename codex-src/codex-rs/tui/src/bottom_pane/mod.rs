@@ -1274,6 +1274,14 @@ impl BottomPane {
         self.request_redraw();
     }
 
+    /// Gates the Rampage mission dashboard on whether a Rampage collaboration
+    /// mode is active, so a stale state file never renders a phantom running
+    /// mission after the process restarts or the thread switches modes.
+    pub(crate) fn set_rampage_dashboard_mode_active(&mut self, active: bool) {
+        self.rampage_dashboard.set_rampage_mode_active(active);
+        self.request_redraw();
+    }
+
     pub(crate) fn composer_is_empty(&self) -> bool {
         self.composer.is_empty()
     }

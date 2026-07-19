@@ -496,9 +496,31 @@ impl LiveAgentStatus {
             .and_then(|id| parse_thread_id(id));
         let index = match (pending_index, first_thread_id) {
             (Some(index), Some(thread_id)) => {
-                self.entries[index].thread_id = Some(thread_id);
-                self.thread_entries.insert(thread_id, index);
-                index
+                if let Some(existing) = self.thread_entries.get(&thread_id).copied()
+                    && existing != index
+                {
+                    // The child's own activity (ThreadStarted/deltas) can reach the
+                    // panel before this SpawnEnd and create a live entry for the
+                    // thread. Blindly remapping the thread to the pending spawn row
+                    // would orphan that live entry as a duplicate stuck on
+                    // "running". Keep the live entry and fold the pending spawn row
+                    // into it instead.
+                    if self.entries[existing].model.is_none() {
+                        self.entries[existing].model = self.entries[index].model.clone();
+                    }
+                    if self.entries[existing].reasoning_effort.is_none() {
+                        self.entries[existing].reasoning_effort =
+                            self.entries[index].reasoning_effort.clone();
+                    }
+                    self.remove_entry(index);
+                    let existing = if existing > index { existing - 1 } else { existing };
+                    self.entries[existing].thread_id = Some(thread_id);
+                    existing
+                } else {
+                    self.entries[index].thread_id = Some(thread_id);
+                    self.thread_entries.insert(thread_id, index);
+                    index
+                }
             }
             (Some(index), None) => index,
             (None, Some(thread_id)) => {
@@ -594,6 +616,25 @@ impl LiveAgentStatus {
         }
     }
 
+    /// Removes an entry and repairs every stored index in both lookup maps.
+    /// Entries are addressed by `Vec` position, so removal shifts everything
+    /// after `index` down by one.
+    fn remove_entry(&mut self, index: usize) {
+        self.entries.remove(index);
+        self.spawn_call_entries.retain(|_, i| *i != index);
+        for i in self.spawn_call_entries.values_mut() {
+            if *i > index {
+                *i -= 1;
+            }
+        }
+        self.thread_entries.retain(|_, i| *i != index);
+        for i in self.thread_entries.values_mut() {
+            if *i > index {
+                *i -= 1;
+            }
+        }
+    }
+
     fn ensure_thread_entry(
         &mut self,
         thread_id: ThreadId,
@@ -654,8 +695,18 @@ impl LiveAgentStatusPanel {
     fn lines(&self) -> Vec<Line<'static>> {
         let mut lines = Vec::new();
         if self.status.waiting {
+            // Only count agents that are still active. Completed/failed/closed agents
+            // remain listed (so their final state is visible) but must not inflate the
+            // "Waiting for N agents" headline — otherwise a wait on six agents where
+            // five have already finished still reads "Waiting for 6 agents".
+            let waiting_count = self
+                .status
+                .entries
+                .iter()
+                .filter(|entry| live_stage_is_active(entry.stage))
+                .count();
             lines.push(waiting_live_line(
-                self.status.entries.len(),
+                waiting_count,
                 self.animations_enabled,
                 self.animation_started_at,
             ));

@@ -28,15 +28,12 @@ Mandatory question 1 - support agents (optional agents, but the question is requ
 
 Enable optional support agents for this ABSOLUTE RAMPAGE MODE mission?
 
-Options:
+Options (offer exactly these two, in this order):
 
-- One advisory agent (Recommended): enable a single combined Advisory Agent that does both jobs (unstuck ideas AND efficiency/pruning review) and inspects the workers' actual output, checkpoints, and transcripts - not just their board summaries. This keeps one advisor instead of two competing monitors.
-- Both support agents: enable the separate New Ideas Agent and Efficiency Monitoring Agent.
-- New Ideas only: enable only New Ideas Agent.
-- Efficiency only: enable only Efficiency Monitoring Agent.
+- One advisory agent (Recommended): enable a single combined Advisory Agent that does both jobs (unstuck ideas AND efficiency/pruning review) and inspects the workers' actual output, checkpoints, and transcripts - not just their board summaries. This one advisor replaces the older separate New Ideas and Efficiency monitors.
 - No support agents: do not spawn any optional support agent.
 
-Map the selected answer into `rampage_control support_agents` as `advisory`, `both`, `new_ideas_only`, `efficiency_only`, or `none`.
+Map the selected answer into `rampage_control support_agents` as `advisory` or `none`. (The legacy `both`, `new_ideas_only`, and `efficiency_only` values are still accepted for backward compatibility if a user explicitly types one, but do not offer them as choices.)
 
 Mandatory questions 2 and 3 - verifier configuration (the verifier agent is NOT optional; only its thresholds are chosen). Ask these as TWO SEPARATE questions, not one combined question:
 
@@ -139,7 +136,7 @@ The verifier is not optional. Before completion you MUST:
 
 The selected support agents are MONITORS, not one-shot startup advisories. Re-invoke them after non-support worker checkpoints or results (spawn a fresh `rampage_spawn` task) with the current named non-support worker status/checkpoints/results. Their injected snapshot states exactly how many active and terminal workers were included or omitted. They cannot see live state on their own. They must not review Mission Control or any advisory output. If no non-support worker exists, their only advice is to spawn one; they must not do the mission work themselves. For verifier coverage, a newer fresh result from the same support-agent role supersedes its older stale advisory rounds.
 
-Advisory Agent (recommended; spawn with "advisory" in the task name/role):
+Advisory Agent (recommended; spawn with `rampage_spawn` role set to exactly `advisory` — a role like "advisory review" is treated as an ordinary write-capable worker, not the advisor):
 
 - is the single combined advisor that replaces the separate New Ideas and Efficiency agents,
 - inspects the workers' ACTUAL output, checkpoints, and transcripts — not just their board summaries,
@@ -149,14 +146,14 @@ Advisory Agent (recommended; spawn with "advisory" in the task name/role):
 
 The legacy split monitors remain available when the user selects them:
 
-New Ideas Agent (spawn with "new_ideas" in the task name/role):
+New Ideas Agent (spawn with `rampage_spawn` role set to exactly `new_ideas`):
 
 - watches for workers that are lingering or stuck on the same task across rounds,
 - proposes concrete ideas to hand to that specific worker to unstick it,
 - proposes alternate strategies, shortcuts, and existing tools/docs/repos/APIs/local artifacts,
 - suggests better worker prompts and access workarounds before escalating to the user.
 
-Efficiency Monitoring Agent (spawn with "efficiency" in the task name/role):
+Efficiency Monitoring Agent (spawn with `rampage_spawn` role set to exactly `efficiency`):
 
 - reviews each worker's actual output for duplicate work, vague tasks, and idle/unnecessary workers,
 - flags workers that have run too long without progress,

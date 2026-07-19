@@ -656,6 +656,13 @@ impl ChatWidget {
     }
 
     pub(super) fn update_collaboration_mode_indicator(&mut self) {
+        // Keep the Rampage dashboard gated on the live mode so it never renders
+        // a phantom running mission after a restart or a switch to a
+        // non-rampage mode.
+        self.bottom_pane.set_rampage_dashboard_mode_active(matches!(
+            self.current_collaboration_mode.mode,
+            ModeKind::AbsoluteRampage | ModeKind::ReadonlyResearch
+        ));
         let indicator = self.collaboration_mode_indicator();
         let goal_indicator = if indicator.is_none() {
             self.goal_status_indicator(Instant::now())

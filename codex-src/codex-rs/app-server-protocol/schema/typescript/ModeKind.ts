@@ -5,4 +5,4 @@
 /**
  * Initial collaboration mode to use when the TUI starts.
  */
-export type ModeKind = "plan" | "default";
+export type ModeKind = "ask" | "plan" | "default" | "absolute_rampage" | "readonly_research";

@@ -3,6 +3,13 @@
 use super::*;
 
 const BUSY_LOOP_RETRY: Duration = Duration::from_secs(1);
+/// Stop a loop outright after this many consecutive failed turns; a persistent
+/// failure (revoked key, dead endpoint, exhausted budget) must not resubmit
+/// forever, and a bounded RalphLoop must not burn its whole iteration budget
+/// on instantly-failing turns.
+const MAX_CONSECUTIVE_LOOP_FAILURES: u32 = 5;
+/// Ceiling for the exponential failure backoff between retried loop turns.
+const MAX_LOOP_FAILURE_BACKOFF: Duration = Duration::from_secs(60);
 const LOOP_USAGE: &str = "Usage: /loop <prompt with optional interval, such as 15s or every 15 seconds> | /loop status | /loop stop";
 const RALPH_LOOP_USAGE: &str = concat!(
     "Usage: /ralphloop <prompt> [N times | for N iterations | --max-iterations N] ",
@@ -276,6 +283,8 @@ impl ChatWidget {
         let Some(mut state) = self.prompt_loop.take() else {
             return;
         };
+        // A completed turn proves the loop can make progress again.
+        self.prompt_loop_consecutive_failures = 0;
 
         let normalization_target = match (&state.kind, state.phase) {
             (
@@ -415,6 +424,21 @@ impl ChatWidget {
         let Some(mut state) = self.prompt_loop.take() else {
             return;
         };
+        // Count only failures of the loop's own running turn; busy-wait retries
+        // (phase `Due`) are not turn failures.
+        if state.phase == PromptLoopPhase::Running {
+            self.prompt_loop_consecutive_failures =
+                self.prompt_loop_consecutive_failures.saturating_add(1);
+            if self.prompt_loop_consecutive_failures >= MAX_CONSECUTIVE_LOOP_FAILURES {
+                self.prompt_loop = Some(state);
+                let message = format!(
+                    "Loop stopped after {MAX_CONSECUTIVE_LOOP_FAILURES} consecutive failed turns. Fix the underlying error and run the command again."
+                );
+                self.invalidate_prompt_loop();
+                self.add_error_message(message);
+                return;
+            }
+        }
         let action = match (&state.kind, state.phase) {
             (PromptLoopKind::Normalizing { .. }, PromptLoopPhase::Running) => {
                 LoopTurnAction::Stop(
@@ -584,10 +608,17 @@ impl ChatWidget {
         state.retry_scheduled = true;
         let thread_id = state.thread_id;
         let generation = state.generation;
+        // Exponential backoff after failed turns (1s, 2s, 4s, ... capped) so a
+        // failing loop does not hammer the endpoint every second; a healthy loop
+        // (no recent failures) keeps the fast 1s busy-wait retry.
+        let failures = self.prompt_loop_consecutive_failures.min(16);
+        let delay = BUSY_LOOP_RETRY
+            .saturating_mul(1u32 << failures)
+            .min(MAX_LOOP_FAILURE_BACKOFF);
         self.schedule_prompt_loop_wakeup(
             thread_id,
             generation,
-            BUSY_LOOP_RETRY,
+            delay,
             PromptLoopWakeupReason::Retry,
         );
     }
@@ -708,6 +739,30 @@ impl ChatWidget {
     fn invalidate_prompt_loop(&mut self) {
         self.prompt_loop_generation = self.prompt_loop_generation.wrapping_add(1);
         self.prompt_loop = None;
+        self.prompt_loop_consecutive_failures = 0;
+    }
+
+    /// Stops the active prompt loop when the user interrupts (Esc) the loop's
+    /// own running turn. Without this, an interrupt is indistinguishable from an
+    /// infrastructure failure and the loop resubmits the same prompt one second
+    /// later — making Esc useless against a runaway loop. Loops that are merely
+    /// scheduled (phase `Waiting`/`Due`) are left alone so interrupting an
+    /// unrelated manual turn does not kill a pending timed loop.
+    pub(super) fn stop_prompt_loop_on_user_interrupt(&mut self) {
+        let Some(state) = self.prompt_loop.as_ref() else {
+            return;
+        };
+        if state.phase != PromptLoopPhase::Running {
+            return;
+        }
+        let was_normalizing = matches!(state.kind, PromptLoopKind::Normalizing { .. });
+        self.invalidate_prompt_loop();
+        let message = if was_normalizing {
+            "Loop setup cancelled by the interrupt. Run the command again to restart it."
+        } else {
+            "Prompt loop stopped by the interrupt. Run /loop or /ralphloop again to restart it."
+        };
+        self.add_info_message(message.to_string(), /*hint*/ None);
     }
 }
 
@@ -1341,7 +1396,20 @@ struct CompletionPromiseDetection {
 }
 
 fn detect_ralph_completion_promise(value: &str) -> Result<CompletionPromiseDetection, String> {
-    let tokens = raw_argument_tokens(value)?;
+    let tokens = match raw_argument_tokens(value) {
+        Ok(tokens) => tokens,
+        // Ordinary prose ("don't", "user's") leaves an apostrophe unbalanced and
+        // the strict tokenizer errors. Only treat that as a real quoting problem
+        // when the --completion-promise flag is actually present (its value can
+        // genuinely need quoting); otherwise fall back to whitespace tokens so
+        // natural-language prompts never hard-fail the whole /ralphloop.
+        Err(err) => {
+            if value.contains("--completion-promise") {
+                return Err(err);
+            }
+            whitespace_argument_tokens(value)
+        }
+    };
     let mut detected = CompletionPromiseDetection::default();
     let mut index = 0;
     while index < tokens.len() {
@@ -1387,19 +1455,54 @@ fn detect_ralph_completion_promise(value: &str) -> Result<CompletionPromiseDetec
 
 fn has_natural_ralph_completion_promise_intent(value: &str) -> bool {
     let lower = value.to_ascii_lowercase();
-    let natural_markers = [
-        "completion promise is",
-        "completion promise:",
-        "completion promise=",
-        "completeion promise is",
-        "completeion promise:",
-        "completeion promise=",
-        "is completion promise",
-        "is the completion promise",
-        "is completeion promise",
-        "is the completeion promise",
+    // Any mention of a promise alongside completion vocabulary counts as
+    // intent ("the completion promise should be X", "set a completion
+    // promise", ...). A narrow phrase list here made legitimate requests
+    // hard-fail as "invented" promises, leaving the loop unstartable.
+    if lower.contains("promise")
+        && (lower.contains("complet")
+            || lower.contains("finish")
+            || lower.contains("done")
+            || lower.contains("promise:")
+            || lower.contains("promise="))
+    {
+        return true;
+    }
+    // "say/print/output <MARKER> when done/finished/complete" style requests.
+    let say_verbs = [
+        "say ",
+        "says ",
+        "saying ",
+        "print ",
+        "prints ",
+        "output ",
+        "outputs ",
+        "emit ",
+        "emits ",
+        "respond with",
+        "reply with",
+        "announce ",
+        "declare ",
     ];
-    natural_markers.iter().any(|marker| lower.contains(marker))
+    let done_markers = [
+        "when done",
+        "when finished",
+        "when complete",
+        "when it's done",
+        "when its done",
+        "when everything is done",
+        "once done",
+        "once finished",
+        "once complete",
+        "until done",
+        "until finished",
+        "until complete",
+        "when the task is done",
+        "when the task is complete",
+        "when all tests pass",
+    ];
+    say_verbs.iter().any(|verb| lower.contains(verb))
+        && done_markers.iter().any(|marker| lower.contains(marker))
 }
 
 fn reconcile_ralph_completion_promise(
@@ -1472,7 +1575,12 @@ fn detect_ralph_iteration_controls(value: &str) -> Result<NumericControlDetectio
     }
 
     for (index, token) in task_tokens.iter().enumerate() {
-        if let Some(raw) = token.strip_suffix('x')
+        // "5x" only counts as an iteration control in the trailing position
+        // ("fix the tests 5x"). Mid-sentence multipliers like "make it 10x
+        // faster" are task wording, not loop controls, and must not set an
+        // iteration count (or conflict with a real one).
+        if index + 1 == task_tokens.len()
+            && let Some(raw) = token.strip_suffix('x')
             && !raw.is_empty()
             && let Some(value) = parse_count_value(raw)
         {
@@ -1741,6 +1849,33 @@ fn parse_natural_ralph_iteration_limit<'a>(
 struct RawArgumentToken {
     start: usize,
     end: usize,
+}
+
+/// Lossy fallback tokenizer: split on whitespace, ignoring quote semantics.
+/// Used when the strict tokenizer rejects prose containing unbalanced quotes
+/// (apostrophes in contractions) and no flag value actually needs quoting.
+fn whitespace_argument_tokens(value: &str) -> Vec<RawArgumentToken> {
+    let mut tokens = Vec::new();
+    let mut start = None;
+    for (index, character) in value.char_indices() {
+        if character.is_whitespace() {
+            if let Some(token_start) = start.take() {
+                tokens.push(RawArgumentToken {
+                    start: token_start,
+                    end: index,
+                });
+            }
+        } else if start.is_none() {
+            start = Some(index);
+        }
+    }
+    if let Some(token_start) = start {
+        tokens.push(RawArgumentToken {
+            start: token_start,
+            end: value.len(),
+        });
+    }
+    tokens
 }
 
 fn raw_argument_tokens(value: &str) -> Result<Vec<RawArgumentToken>, String> {

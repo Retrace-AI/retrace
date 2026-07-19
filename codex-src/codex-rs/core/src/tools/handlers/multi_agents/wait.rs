@@ -91,6 +91,14 @@ impl ToolExecutor<ToolInvocation> for Handler {
             ms => ms.clamp(MIN_WAIT_TIMEOUT_MS, MAX_WAIT_TIMEOUT_MS),
         };
 
+        // Capture each target's current status up front so the live agent panel can
+        // render agents that are already finished as done immediately, instead of
+        // leaving them spinning until this wait call returns.
+        let mut initial_statuses = HashMap::with_capacity(receiver_thread_ids.len());
+        for id in &receiver_thread_ids {
+            initial_statuses.insert(*id, session.services.agent_control.get_status(*id).await);
+        }
+
         session
             .send_event(
                 &turn,
@@ -99,6 +107,7 @@ impl ToolExecutor<ToolInvocation> for Handler {
                     sender_thread_id: session.thread_id,
                     receiver_thread_ids: receiver_thread_ids.clone(),
                     receiver_agents: receiver_agents.clone(),
+                    statuses: initial_statuses,
                     call_id: call_id.clone(),
                 }
                 .into(),
