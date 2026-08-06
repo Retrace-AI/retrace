@@ -1204,10 +1204,35 @@ function finishMessage(state, res) {
 // and the follow-up request (the gateway re-parses the replayed tool_call and
 // returns "Expecting ',' delimiter"). Repair to valid JSON when we can; only
 // return the repaired string if it actually parses, so we never make it worse.
+function normalizeIntFloatsJson(s) {
+  // Fix for strict u64/i32 schemas in the Codex fork: model emits
+  // integer-valued floats like 130000.0 / 24579.0 which JSON allows but
+  // serde_json rejects for integer types ("expected u64, got floating point").
+  // JSON.parse + JSON.stringify collapses 130000.0 → 130000 while preserving
+  // real floats (123.45) and strings containing "1.0".
+  if (typeof s !== "string" || !s.includes(".0")) return null;
+  try {
+    const parsed = JSON.parse(s);
+    const normalized = JSON.stringify(parsed);
+    if (normalized !== s) {
+      JSON.parse(normalized);
+      return normalized;
+    }
+  } catch {}
+  return null;
+}
+
 function repairJsonArgs(s) {
   if (typeof s !== "string") return "{}";
   let t = s.trim();
   if (!t) return "{}";
+  // Fast path: originally valid JSON but contains integer-floats — normalize
+  // before the early return that previously preserved the buggy ".0" suffix.
+  const earlyNorm = normalizeIntFloatsJson(t);
+  if (earlyNorm !== null) {
+    console.error(`[toolrepair] normalized int-floats ${JSON.stringify(s).slice(0, 120)} -> ${earlyNorm.slice(0, 120)}`);
+    return earlyNorm;
+  }
   try { JSON.parse(t); return t; } catch {}
   // Strip code fences / prose around the JSON object or array.
   const start = t.search(/[{[]/);
@@ -1227,8 +1252,17 @@ function repairJsonArgs(s) {
   // All single quotes and no doubles -> swap (Python-dict style).
   if (!t.includes('"') && t.includes("'")) candidates.push(commas(pyLit(t.replace(/'/g, '"'))));
   for (const c of candidates) {
-    try { JSON.parse(c); if (c !== s) console.error(`[toolrepair] fixed ${JSON.stringify(s).slice(0, 120)} -> ${c.slice(0, 120)}`); return c; }
-    catch {}
+    const n = normalizeIntFloatsJson(c);
+    const toTest = n !== null ? n : c;
+    try {
+      JSON.parse(toTest);
+      if (toTest !== s) console.error(`[toolrepair] fixed ${JSON.stringify(s).slice(0, 120)} -> ${toTest.slice(0, 120)}`);
+      return toTest;
+    } catch {}
+  }
+  const fallbackNorm = normalizeIntFloatsJson(t);
+  if (fallbackNorm !== null) {
+    try { JSON.parse(fallbackNorm); console.error(`[toolrepair] normalized fallback ${JSON.stringify(s).slice(0, 120)} -> ${fallbackNorm.slice(0, 120)}`); return fallbackNorm; } catch {}
   }
   console.error(`[toolrepair] UNREPAIRABLE tool args: ${JSON.stringify(s).slice(0, 200)}`);
   return t;
