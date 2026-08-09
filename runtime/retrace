@@ -108,6 +108,20 @@ fi
 RETRACE_PINNED_PROVIDER="$(sed -nE 's/^[[:space:]]*model_provider[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p' "$RETRACE_HOME/config.toml" 2>/dev/null | head -1)"
 [[ -z "$RETRACE_PINNED_PROVIDER" ]] && RETRACE_PINNED_PROVIDER="lumenatech"
 
+if [[ "${RETRACE_ARGS[1]:-}" == "exec" ]]; then
+  RETRACE_EXEC_ARGS=("${RETRACE_ARGS[@]:1}")
+  "$RETRACE_BIN" exec \
+    --sandbox "$RETRACE_SANDBOX" \
+    -c "model=\"$RETRACE_PINNED_MODEL\"" \
+    -c "model_provider=\"$RETRACE_PINNED_PROVIDER\"" \
+    -c "mcp_servers.supabase.url=\"https://mcp.supabase.com/mcp\"" \
+    -c "mcp_servers.supabase.enabled=false" \
+    -c "model_catalog_json=\"$RETRACE_HOME/models.json\"" \
+    -c "model_providers.lumenatech.base_url=\"http://127.0.0.1:${RETRACE_PORT}/v1\"" \
+    "${RETRACE_EXEC_ARGS[@]}"
+  exit $?
+fi
+
 "$RETRACE_BIN" \
   --sandbox "$RETRACE_SANDBOX" \
   -c "model=\"$RETRACE_PINNED_MODEL\"" \
