@@ -5,9 +5,16 @@ export FLYCTL_INSTALL="${FLYCTL_INSTALL:-$HOME/.fly}"
 export PATH="$FLYCTL_INSTALL/bin:$PATH"
 
 RETRACE_HOME="${RETRACE_HOME:-$HOME/.retrace}"
+export RETRACE_HOME
 if [[ -f "$RETRACE_HOME/env.zsh" ]]; then
   source "$RETRACE_HOME/env.zsh"
 fi
+
+# Keep the TUI's in-process hot reload on the same files as retrace-admin and
+# the proxy. Without these exports, a custom RETRACE_HOME can be written
+# correctly by retrace-admin while /model reloads the default ~/.retrace file.
+export RETRACE_MODEL_CATALOG_JSON="${RETRACE_MODEL_CATALOG_JSON:-$RETRACE_HOME/models.json}"
+export RETRACE_REGISTRY_JSON="${RETRACE_REGISTRY_JSON:-$RETRACE_HOME/registry.json}"
 
 # Product/company brand shown in the agent's base prompt. Asked once on first
 # run (default "Retrace"); the private/company build pre-writes this file so
@@ -69,8 +76,8 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 RETRACE_API_KEY_FILE="$RETRACE_HOME/api_key" \
-RETRACE_MODEL_CATALOG_JSON="$RETRACE_HOME/models.json" \
-RETRACE_REGISTRY_JSON="$RETRACE_HOME/registry.json" \
+RETRACE_MODEL_CATALOG_JSON="$RETRACE_MODEL_CATALOG_JSON" \
+RETRACE_REGISTRY_JSON="$RETRACE_REGISTRY_JSON" \
 RETRACE_READY_FILE="$RETRACE_READY_FILE" \
 RETRACE_PROXY_PORT=0 \
 RETRACE_SERPER_SEARCH="$RETRACE_SERPER_SEARCH" \
@@ -116,7 +123,7 @@ if [[ "${RETRACE_ARGS[1]:-}" == "exec" ]]; then
     -c "model_provider=\"$RETRACE_PINNED_PROVIDER\"" \
     -c "mcp_servers.supabase.url=\"https://mcp.supabase.com/mcp\"" \
     -c "mcp_servers.supabase.enabled=false" \
-    -c "model_catalog_json=\"$RETRACE_HOME/models.json\"" \
+    -c "model_catalog_json=\"$RETRACE_MODEL_CATALOG_JSON\"" \
     -c "model_providers.lumenatech.base_url=\"http://127.0.0.1:${RETRACE_PORT}/v1\"" \
     "${RETRACE_EXEC_ARGS[@]}"
   exit $?
@@ -128,6 +135,6 @@ fi
   -c "model_provider=\"$RETRACE_PINNED_PROVIDER\"" \
   -c "mcp_servers.supabase.url=\"https://mcp.supabase.com/mcp\"" \
   -c "mcp_servers.supabase.enabled=false" \
-  -c "model_catalog_json=\"$RETRACE_HOME/models.json\"" \
+  -c "model_catalog_json=\"$RETRACE_MODEL_CATALOG_JSON\"" \
   -c "model_providers.lumenatech.base_url=\"http://127.0.0.1:${RETRACE_PORT}/v1\"" \
   "${RETRACE_ARGS[@]}"

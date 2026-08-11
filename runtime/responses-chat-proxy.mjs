@@ -399,6 +399,9 @@ function thinkingBodyForSelection(method, selection) {
     if (body.reasoning && typeof body.reasoning === "object" && Object.prototype.hasOwnProperty.call(body.reasoning, "effort")) {
       body.reasoning.effort = level;
     }
+    if (body.output_config && typeof body.output_config === "object" && Object.prototype.hasOwnProperty.call(body.output_config, "effort")) {
+      body.output_config.effort = level;
+    }
     if (body.thinking && typeof body.thinking === "object"
       && Object.prototype.hasOwnProperty.call(body.thinking, "budget_tokens")
       && anthropicBudgetForLevel[level]) {

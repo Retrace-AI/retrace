@@ -279,33 +279,55 @@ const requestRecipes = [
   { tokenParam: "max_completion_tokens", temperature: false },
 ];
 
-// Thinking-activation formats across providers. Coverage map:
-//   ctk_enable_thinking / enable_thinking  -> vLLM/SGLang local models, Qwen, DashScope
-//   reasoning_effort                       -> OpenAI (gpt-5*/o-series), Grok, Gemini-openai-compat, MiniMax
-//   reasoning_effort_obj                   -> OpenAI Responses-style routers, OpenRouter `reasoning: {effort}`
-//   thinking_enabled                       -> Zhipu GLM-4.5+ (`thinking: {type: enabled|disabled}`)
-//   reasoning_enabled                      -> generic routers (`reasoning: {enabled}`)
-//   reasoning_max_tokens                   -> OpenRouter/gateway budget style (`reasoning: {max_tokens}`)
-//   anthropic_thinking                     -> Anthropic Messages API (budget_tokens tiers = effort levels)
-// DeepSeek (deepseek-reasoner), Kimi (kimi-*-thinking), MiniMax M-series and other
-// always-thinking models are detected by the intrinsic pass (reasoning_content /
-// <think> / reasoning_tokens in the base response) before these are tried.
-const thinkMethods = [
-  { id: "ctk_enable_thinking", body: { chat_template_kwargs: { enable_thinking: true } }, offBody: { chat_template_kwargs: { enable_thinking: false } }, levels: ["on"], dialect: "openai" },
-  { id: "enable_thinking", body: { enable_thinking: true }, offBody: { enable_thinking: false }, levels: ["on"], dialect: "openai" },
-  { id: "reasoning_effort", body: { reasoning_effort: "medium" }, offBody: { reasoning_effort: "none" }, levels: ["low", "medium", "high"], dialect: "openai" },
-  { id: "reasoning_effort_obj", body: { reasoning: { effort: "medium" } }, offBody: { reasoning: { enabled: false } }, levels: ["low", "medium", "high"], dialect: "openai" },
-  { id: "thinking_enabled", body: { thinking: { type: "enabled" } }, offBody: { thinking: { type: "disabled" } }, levels: ["on"], dialect: "openai" },
-  { id: "reasoning_enabled", body: { reasoning: { enabled: true } }, offBody: { reasoning: { enabled: false } }, levels: ["on"], dialect: "openai" },
-  { id: "reasoning_max_tokens", body: { reasoning: { max_tokens: 4096 } }, offBody: { reasoning: { enabled: false } }, levels: ["on"], dialect: "openai" },
-  { id: "anthropic_thinking", body: { thinking: { type: "enabled", budget_tokens: 8192 } }, levels: ["low", "medium", "high"], dialect: "anthropic" },
-];
-
 // Effort strings worth testing when a method advertises graded levels. Every
 // level the endpoint actually accepts AND that demonstrably produces reasoning
 // gets stored; silently-ignored or rejected levels are dropped so /model only
 // offers efforts that do something.
-const effortLevelCandidates = ["minimal", "low", "medium", "high", "xhigh"];
+const effortLevelCandidates = ["minimal", "low", "medium", "high", "xhigh", "max"];
+
+// Thinking-activation formats across providers. Graded mechanisms deliberately
+// precede binary toggles: many gateways accept both, and first-match-wins used to
+// collapse models such as DeepSeek to a single `on` choice. DeepSeek V4's native
+// API exposes exactly high/max, so its combined toggle+effort form is ranked
+// first for DeepSeek-named models while every generic effort value is still
+// probed for other providers.
+const deepseekThinkMethod = {
+  id: "deepseek_reasoning_effort",
+  body: { thinking: { type: "enabled" }, reasoning_effort: "high" },
+  offBody: { thinking: { type: "disabled" } },
+  levels: ["high", "max"],
+  dialect: "openai",
+};
+const fuguThinkMethod = {
+  id: "fugu_effort",
+  body: { reasoning: { effort: "high" } },
+  offBody: { reasoning: { enabled: false } },
+  levels: ["high", "xhigh", "max"],
+  dialect: "openai",
+};
+const thinkMethods = [
+  { id: "reasoning_effort", body: { reasoning_effort: "medium" }, offBody: { reasoning_effort: "none" }, levels: effortLevelCandidates, dialect: "openai" },
+  { id: "reasoning_effort_obj", body: { reasoning: { effort: "medium" } }, offBody: { reasoning: { enabled: false } }, levels: effortLevelCandidates, dialect: "openai" },
+  { id: "reasoning_enabled", body: { reasoning: { enabled: true } }, offBody: { reasoning: { enabled: false } }, levels: ["on"], dialect: "openai" },
+  { id: "thinking_enabled", body: { thinking: { type: "enabled" } }, offBody: { thinking: { type: "disabled" } }, levels: ["on"], dialect: "openai" },
+  { id: "enable_thinking", body: { enable_thinking: true }, offBody: { enable_thinking: false }, levels: ["on"], dialect: "openai" },
+  { id: "ctk_enable_thinking", body: { chat_template_kwargs: { enable_thinking: true } }, offBody: { chat_template_kwargs: { enable_thinking: false } }, levels: ["on"], dialect: "openai" },
+  { id: "ctk_thinking", body: { chat_template_kwargs: { thinking: true } }, offBody: { chat_template_kwargs: { thinking: false } }, levels: ["on"], dialect: "openai" },
+  { id: "extra_body_enable_thinking", body: { extra_body: { enable_thinking: true } }, offBody: { extra_body: { enable_thinking: false } }, levels: ["on"], dialect: "openai" },
+  { id: "reasoning_max_tokens", body: { reasoning: { max_tokens: 4096 } }, offBody: { reasoning: { enabled: false } }, levels: ["on"], dialect: "openai" },
+  { id: "anthropic_adaptive", body: { thinking: { type: "adaptive" }, output_config: { effort: "high" } }, levels: ["low", "medium", "high"], dialect: "anthropic" },
+  { id: "anthropic_thinking", body: { thinking: { type: "enabled", budget_tokens: 8192 } }, levels: ["low", "medium", "high"], dialect: "anthropic" },
+];
+
+const ctkThinkMethod = thinkMethods.find((method) => method.id === "ctk_enable_thinking");
+
+function thinkingMethodsForModel(modelId, dialect) {
+  const methods = [];
+  if (/deepseek/i.test(modelId || "")) methods.push(deepseekThinkMethod);
+  if (/fugu/i.test(modelId || "")) methods.push(fuguThinkMethod);
+  methods.push(...thinkMethods);
+  return methods.filter((method) => method.dialect === "any" || method.dialect === dialect);
+}
 
 // Anthropic expresses effort as a thinking budget; these tiers map the TUI's
 // low/medium/high onto budget_tokens (max_tokens must exceed the budget).
@@ -358,7 +380,7 @@ function buildProbeBody(dialect, modelId, prompt, maxTokens, recipe, extra = {})
   return deepMerge(deepMerge(body, defaultRequestBody(modelId)), extra);
 }
 
-async function callChat(provider, key, modelId, prompt, maxTokens, recipe, extra = {}, timeoutMs = 20000) {
+async function callChat(provider, key, modelId, prompt, maxTokens, recipe, extra = {}, timeoutMs = 120000) {
   const dialect = provider.dialect || "openai";
   const body = buildProbeBody(dialect, modelId, prompt, maxTokens, recipe, extra);
   const response = await fetchJson(chatEndpoint(normalizeBaseUrl(provider.baseUrl), dialect), {
@@ -432,7 +454,7 @@ function capabilityFallback(modelId, usable = true) {
     requestRecipe: { tokenParam: "max_tokens", temperature: true },
     acceptsTemperature: true,
     thinking: isThink,
-    thinkingMethod: isThink ? thinkMethods[0] : null,
+    thinkingMethod: isThink ? ctkThinkMethod : null,
     thinkingLevels: isThink ? ["off", "on"] : [],
     cache: { read: false, write: false, method: "none" },
     streaming: { supported: false, reasoningDelta: "none" },
@@ -448,6 +470,9 @@ function effortBodyForMethod(method, level) {
   if (body.reasoning && typeof body.reasoning === "object" && Object.prototype.hasOwnProperty.call(body.reasoning, "effort")) {
     body.reasoning.effort = level;
   }
+  if (body.output_config && typeof body.output_config === "object" && Object.prototype.hasOwnProperty.call(body.output_config, "effort")) {
+    body.output_config.effort = level;
+  }
   return body;
 }
 
@@ -456,25 +481,25 @@ function effortBodyForMethod(method, level) {
 async function validateEffortLevels(provider, key, modelId, recipe, method, thinkingPrompt) {
   if (!method) return [];
   const dialect = provider.dialect || "openai";
-  if (dialect === "anthropic" || method.id === "anthropic_thinking") {
+  if (method.id === "anthropic_thinking") {
     const entries = Object.entries(anthropicBudgetForLevel);
     const results = await Promise.all(entries.map(async ([level, budget]) => {
       const body = { thinking: { type: "enabled", budget_tokens: budget } };
       const response = await callChat(provider, key, modelId, thinkingPrompt, budget + 1024, recipe, body).catch(() => null);
       return response?.ok && reasoningSignal(response.data) ? level : null;
     }));
-    const validated = results.filter(Boolean);
-    return validated.length ? validated : method.levels || [];
+    return results.filter(Boolean);
   }
-  const graded = (method.levels || []).some((level) => ["low", "medium", "high"].includes(level));
-  if (!graded) return method.levels || [];
-  const results = await Promise.all(effortLevelCandidates.map(async (level) => {
+  const levels = method.levels || [];
+  const graded = levels.some((level) => !["on", "off"].includes(level));
+  if (!graded) return levels;
+  const results = await Promise.all(levels.map(async (level) => {
     const body = effortBodyForMethod(method, level);
-    const response = await callChat(provider, key, modelId, thinkingPrompt, 768, recipe, body).catch(() => null);
+    const maxTokens = dialect === "anthropic" ? 1536 : 768;
+    const response = await callChat(provider, key, modelId, thinkingPrompt, maxTokens, recipe, body).catch(() => null);
     return response?.ok && reasoningSignal(response.data) ? level : null;
   }));
-  const validated = results.filter(Boolean);
-  return validated.length ? validated : method.levels || [];
+  return results.filter(Boolean);
 }
 
 // Stable filler well past typical 1024-token cache minimums, so an identical
@@ -631,7 +656,7 @@ async function detectModelCapability(provider, key, modelId) {
   capability.usageSample = usageSample(found.json);
 
   probeProgress(`▸ ${modelId}: reasoning / effort levels…`);
-  const thinkingPrompt = "A bat and a ball cost $1.10 total. The bat costs $1 more than the ball. What does the ball cost? Reason briefly, then answer.";
+  const thinkingPrompt = "Using each of the numbers 3, 5, 7, and 11 exactly once, with + - * / and parentheses, write an expression equal to 24. Think through the combinations carefully first, then answer with just the expression.";
   const base = await callChat(provider, key, modelId, thinkingPrompt, 256, found.recipe).catch(() => null);
   if (base?.ok && reasoningSignal(base.data)) {
     capability.thinking = true;
@@ -651,7 +676,8 @@ async function detectModelCapability(provider, key, modelId) {
     // reasoning_effort. If two or more levels validate, upgrade from a binary
     // on/off to real effort levels.
     if ((provider.dialect || "openai") !== "anthropic") {
-      const effortMethod = thinkMethods.find((method) => method.id === "reasoning_effort");
+      const effortMethod = thinkingMethodsForModel(modelId, provider.dialect || "openai")
+        .find((method) => (method.levels || []).some((level) => !["on", "off"].includes(level)));
       const validated = await validateEffortLevels(provider, key, modelId, found.recipe, effortMethod, thinkingPrompt);
       const gradedLevels = validated.filter((level) => effortLevelCandidates.includes(level));
       if (gradedLevels.length >= 2) {
@@ -660,7 +686,7 @@ async function detectModelCapability(provider, key, modelId) {
       }
     }
   } else {
-    const candidates = thinkMethods.filter((method) => method.dialect === "any" || method.dialect === (provider.dialect || "openai"));
+    const candidates = thinkingMethodsForModel(modelId, provider.dialect || "openai");
     const results = await Promise.all(candidates.map(async (method) => {
       const response = await callChat(provider, key, modelId, thinkingPrompt, 512, found.recipe, method.body).catch(() => null);
       return { method, response };
@@ -670,8 +696,9 @@ async function detectModelCapability(provider, key, modelId) {
       capability.thinking = true;
       capability.usageSample = usageSample(hit.response.data);
       const validated = await validateEffortLevels(provider, key, modelId, found.recipe, hit.method, thinkingPrompt);
-      capability.thinkingMethod = { ...hit.method, levels: validated };
-      capability.thinkingLevels = ["off", ...validated];
+      const levels = validated.length ? validated : ["on"];
+      capability.thinkingMethod = { ...hit.method, levels };
+      capability.thinkingLevels = ["off", ...levels];
     }
   }
 
@@ -704,7 +731,7 @@ function applyCapability(config, capability) {
     thinkingMethod?.id === "intrinsic" &&
     defaultRequestBody(config.upstreamModel || "").chat_template_kwargs?.enable_thinking === true
   ) {
-    thinkingMethod = thinkMethods[0];
+    thinkingMethod = ctkThinkMethod;
   }
 
   config.capabilities = {
@@ -741,7 +768,7 @@ function defaultModelConfig(providerId, modelId, provider) {
     effectiveContextWindowPercent: isFast ? 83 : 95,
     outputTokenLimit: isFast ? 16384 : null,
     thinking: isThink ? "on" : "off",
-    thinkingMethod: isThink ? thinkMethods[0] : null,
+    thinkingMethod: isThink ? ctkThinkMethod : null,
     thinkingLevels: isThink ? ["off", "on"] : [],
     requestRecipe: { tokenParam: "max_tokens", temperature: true },
     capabilities: {
@@ -836,6 +863,8 @@ function reasoningDescription(effort) {
       return "Disable provider thinking";
     case "on":
       return "Enable provider thinking";
+    case "minimal":
+      return "Use minimal provider reasoning effort";
     case "low":
       return "Use low provider reasoning effort";
     case "medium":
@@ -844,6 +873,8 @@ function reasoningDescription(effort) {
       return "Use high provider reasoning effort";
     case "xhigh":
       return "Use extra high provider reasoning effort";
+    case "max":
+      return "Use maximum provider reasoning effort";
     default:
       return `Use provider reasoning level ${effort}`;
   }
@@ -1280,7 +1311,7 @@ async function commandModels(registry, subcommand, args) {
     }
     if (opts.thinking) {
       const value = String(opts.thinking).toLowerCase();
-      const allowed = new Set(["on", "off", "auto", "low", "medium", "high", ...(config.thinkingLevels || []).map((level) => String(level).toLowerCase())]);
+      const allowed = new Set(["on", "off", "auto", ...effortLevelCandidates, ...(config.thinkingLevels || []).map((level) => String(level).toLowerCase())]);
       if (!allowed.has(value)) throw new Error(`--thinking must be one of: ${Array.from(allowed).join(", ")}`);
       config.thinking = value;
     }
