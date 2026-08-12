@@ -15,6 +15,12 @@ const MAX_IMAGES = Math.max(1, Number(process.env.RETRACE_MAX_IMAGES) || 2);
 const upstreamTimeoutMs = Number((process.env.RETRACE_UPSTREAM_TIMEOUT_MS || process.env.CODEXOS_UPSTREAM_TIMEOUT_MS) || "90000");
 const streamInactivityTimeoutMs = Number((process.env.RETRACE_STREAM_INACTIVITY_TIMEOUT_MS || process.env.CODEXOS_STREAM_INACTIVITY_TIMEOUT_MS) || "90000");
 const serperSearchMode = (process.env.RETRACE_SERPER_SEARCH || process.env.CODEXOS_SERPER_SEARCH) === "1";
+const clientToolAllowlist = parseNameAllowlist(process.env.RETRACE_CLIENT_TOOL_ALLOWLIST);
+const clientToolRequired = parseOnOff(process.env.RETRACE_REQUIRE_CLIENT_TOOL, false);
+const clientToolMaxContinues = Math.max(
+  1,
+  Number(process.env.RETRACE_CLIENT_TOOL_MAX_CONTINUES || "1") || 1,
+);
 const openRouterApiBase = ((process.env.RETRACE_OPENROUTER_BASE || process.env.CODEXOS_OPENROUTER_BASE) || "https://openrouter.ai/api/v1").replace(/\/+$/, "");
 const openRouterApiKeyFile = (process.env.RETRACE_OPENROUTER_API_KEY_FILE || process.env.CODEXOS_OPENROUTER_API_KEY_FILE) || `${process.env.HOME}/.openrouter_api_key`;
 const openRouterModelAliases = {
@@ -327,7 +333,9 @@ function responsesToolsToChatTools(tools) {
     // Other types (e.g. freeform "custom" tools like apply_patch) are described
     // in the base instructions and intentionally not sent as chat tools.
   }
-  return chatTools;
+  return clientToolAllowlist.size
+    ? chatTools.filter((tool) => clientToolAllowlist.has(tool?.function?.name))
+    : chatTools;
 }
 
 function expandHome(file) {
@@ -998,6 +1006,12 @@ function emitMessageStart(state, res) {
 
 function emitTextDelta(state, res, delta) {
   if (!delta) return;
+  // Transactional tool sessions buffer accidental prose until the bounded
+  // correction below either produces a real client tool call or falls back.
+  if (state.suppressVisibleText) {
+    state.retryText += delta;
+    return;
+  }
   emitMessageStart(state, res);
   state.text += delta;
   sendSse(res, "response.output_text.delta", {
@@ -1141,6 +1155,15 @@ function buildToolNamespaceMap(tools) {
 function ensureToolCall(state, res, toolDelta) {
   finishReasoning(state, res);
   const index = toolDelta.index ?? 0;
+  const toolName = toolDelta.function?.name;
+  if (state.blockedClientToolIndexes.has(index)) return null;
+  if (clientToolAllowlist.size && toolName && !clientToolAllowlist.has(toolName)) {
+    state.blockedClientToolIndexes.add(index);
+    return null;
+  }
+  if (clientToolAllowlist.size && !toolName && !state.toolCalls.has(index)) {
+    return null;
+  }
   if (!state.toolCalls.has(index)) {
     const item = {
       id: `fc_${Date.now()}_${index}`,
@@ -1168,6 +1191,7 @@ function ensureToolCall(state, res, toolDelta) {
 
 function emitToolDelta(state, res, toolDelta) {
   const item = ensureToolCall(state, res, toolDelta);
+  if (!item) return;
   const delta = toolDelta.function?.arguments || "";
   if (!delta) return;
   item.arguments += delta;
@@ -1225,6 +1249,47 @@ function normalizeIntFloatsJson(s) {
   return null;
 }
 
+// Some providers occasionally finish a complete tool payload but omit only
+// the final JSON quote/braces. Close open strings and containers without
+// changing any emitted content, and accept the candidate only if JSON.parse
+// verifies it. This deliberately refuses dangling escapes and mismatched
+// delimiters.
+function closeTruncatedJson(s) {
+  if (typeof s !== "string" || !s.trim()) return null;
+  const stack = [];
+  let inString = false;
+  let escaped = false;
+  for (const ch of s) {
+    if (inString) {
+      if (escaped) {
+        escaped = false;
+      } else if (ch === "\\") {
+        escaped = true;
+      } else if (ch === '"') {
+        inString = false;
+      }
+      continue;
+    }
+    if (ch === '"') {
+      inString = true;
+    } else if (ch === "{") {
+      stack.push("}");
+    } else if (ch === "[") {
+      stack.push("]");
+    } else if (ch === "}" || ch === "]") {
+      if (stack.pop() !== ch) return null;
+    }
+  }
+  if (escaped || (!inString && stack.length === 0)) return null;
+  const candidate = s + (inString ? '"' : "") + stack.reverse().join("");
+  try {
+    JSON.parse(candidate);
+    return candidate;
+  } catch {
+    return null;
+  }
+}
+
 function repairJsonArgs(s) {
   if (typeof s !== "string") return "{}";
   let t = s.trim();
@@ -1262,6 +1327,12 @@ function repairJsonArgs(s) {
       if (toTest !== s) console.error(`[toolrepair] fixed ${JSON.stringify(s).slice(0, 120)} -> ${toTest.slice(0, 120)}`);
       return toTest;
     } catch {}
+  }
+  for (const c of candidates) {
+    const closed = closeTruncatedJson(c);
+    if (closed === null) continue;
+    console.error(`[toolrepair] closed truncated JSON ${JSON.stringify(s).slice(0, 120)} -> ${closed.slice(0, 120)}`);
+    return closed;
   }
   const fallbackNorm = normalizeIntFloatsJson(t);
   if (fallbackNorm !== null) {
@@ -1305,6 +1376,9 @@ function newResponseState(model) {
     reasoningStarted: false,
     reasoningFinished: false,
     reasoningText: "",
+    suppressVisibleText: false,
+    retryText: "",
+    blockedClientToolIndexes: new Set(),
   };
 }
 
@@ -1787,6 +1861,41 @@ function bodyWithAgentCheckFeedback(body, state, check) {
   };
 }
 
+function parseNameAllowlist(value) {
+  const raw = String(value || "").trim();
+  if (!raw) return new Set();
+  let values;
+  try {
+    const parsed = JSON.parse(raw);
+    values = Array.isArray(parsed) ? parsed : [];
+  } catch {
+    values = raw.split(",");
+  }
+  return new Set(
+    values
+      .map((name) => String(name || "").trim())
+      .filter((name) => /^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$/.test(name)),
+  );
+}
+
+function bodyWithClientToolNudge(body, state) {
+  const draft = (state.retryText || state.text || "").trim();
+  const input = [...(body.input || [])];
+  if (draft) input.push({ type: "message", role: "assistant", content: draft });
+  input.push({
+    type: "message",
+    role: "user",
+    content: [
+      "The workflow is still open because the previous response was plain text, not a real client tool call.",
+      "Use the operator contract to choose the exact required client tool now.",
+      "If the draft fully answers a leased job, place that complete draft in the terminal tool's argument.",
+      "If no job is leased, call the required queue/wait tool instead.",
+      "Do not emit more prose and do not call an internal completion tool.",
+    ].join(" "),
+  });
+  return { ...body, input };
+}
+
 function prependAgentCheckRetryNote(state, direction) {
   const note = `Agent Check: retrying because the previous answer was incomplete. Direction: ${direction || "Use a new approach and provide the missing answer."}\n\n`;
   state.text = note + state.text;
@@ -1849,12 +1958,46 @@ async function handleResponses(req, res, body) {
   // retry budget is exhausted.
   const state = newResponseState(body.model);
   state.toolNamespaces = buildToolNamespaceMap(body.tools);
+  state.suppressVisibleText = clientToolRequired;
   sseHeaders(res);
   sendSse(res, "response.created", {
     type: "response.created",
     response: responseShell(state.responseId, state.model),
   });
   await streamUpstreamIntoState(upstream.response, res, state);
+
+  // Opt-in transaction guard: give a model one bounded correction turn when it
+  // writes prose instead of invoking a real client tool. Ordinary ReTrace
+  // sessions never enter this path.
+  let clientToolContinues = 0;
+  let clientToolFallback = (state.retryText || state.text || "").trim();
+  while (
+    clientToolRequired
+    && state.toolCalls.size === 0
+    && (state.text.trim() || state.retryText.trim() || state.blockedClientToolIndexes.size > 0)
+    && clientToolContinues < clientToolMaxContinues
+  ) {
+    clientToolContinues++;
+    const retryBody = bodyWithClientToolNudge(body, state);
+    state.suppressVisibleText = true;
+    state.retryText = "";
+    state.blockedClientToolIndexes = new Set();
+    let retry = await upstreamChat(retryBody, true);
+    if (!retry.response.ok && hasRequestTools(retryBody)) {
+      retry = await upstreamChat(retryBody, false);
+    }
+    if (!retry.response.ok) {
+      state.suppressVisibleText = false;
+      break;
+    }
+    await streamUpstreamIntoState(retry.response, res, state);
+    if (state.retryText.trim()) clientToolFallback = state.retryText.trim();
+  }
+  state.suppressVisibleText = false;
+  if (clientToolRequired && state.toolCalls.size === 0 && clientToolFallback) {
+    state.retryText = "";
+    emitTextDelta(state, res, clientToolFallback);
+  }
 
   const maxAgentCheckRetries = agentCheckEnabled()
     ? Number((process.env.RETRACE_AGENT_CHECK_RETRIES || process.env.CODEXOS_AGENT_CHECK_RETRIES) || "50")
