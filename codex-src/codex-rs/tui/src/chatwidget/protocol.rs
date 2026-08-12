@@ -21,9 +21,11 @@ impl ChatWidget {
         }
         match notification {
             ServerNotification::ThreadTokenUsageUpdated(notification) => {
-                self.set_token_info(Some(token_usage_info_from_app_server(
-                    notification.token_usage,
-                )));
+                let info = token_usage_info_from_app_server(notification.token_usage);
+                if !from_replay {
+                    self.record_inference_usage(&info);
+                }
+                self.set_token_info(Some(info));
             }
             ServerNotification::ThreadNameUpdated(notification) => {
                 match ThreadId::from_string(&notification.thread_id) {
